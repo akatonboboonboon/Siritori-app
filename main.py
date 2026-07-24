@@ -82,6 +82,8 @@ register_auth_pages(
         games=SERVICES.games,
         settings=SETTINGS,
         solo=SOLO,
+        rooms=ROOMS,
+        room_words=ROOM_WORDS,
     )
 )
 app.on_startup(SERVICES.start)
