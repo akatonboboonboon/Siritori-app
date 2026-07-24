@@ -10,12 +10,14 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import hmac
 from html import escape
+import logging
 from pathlib import Path
 import secrets
 from threading import Lock
 import time
 from typing import TypeVar
 from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import uuid4
 
 from fastapi import HTTPException, Request
 from nicegui import app, ui
@@ -31,8 +33,21 @@ from .auth import (
     canonicalize_username,
 )
 from .database import GameRepository
+from .room_runtime import RoomRuntimeCapabilityError
+from .rooms import (
+    LexiconRoomService,
+    RoomCoordinator,
+    RoomError,
+    RoomEvent,
+    RoomEventKind,
+    RoomSnapshot,
+    RoomStatus,
+    RoomVersionConflict,
+    SeatController,
+    WordSubmissionStatus,
+)
 from .settings import Settings
-from .solo import SoloGameService
+from .solo import SoloGameAuthorizationError, SoloGameService
 
 
 _PLATFORM_CSS = (
@@ -40,6 +55,7 @@ _PLATFORM_CSS = (
 ).read_text(encoding="utf-8")
 _MAX_FORM_BYTES = 8_192
 _PasswordResult = TypeVar("_PasswordResult")
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +64,8 @@ class AuthWebServices:
     games: GameRepository
     settings: Settings
     solo: SoloGameService | None = None
+    rooms: RoomCoordinator | None = None
+    room_words: LexiconRoomService | None = None
 
 
 class CsrfProtector:
@@ -407,6 +425,8 @@ def register_auth_pages(
     settings = services.settings
     solo = services.solo
     csrf = CsrfProtector(settings.session_secret)
+    rooms = services.rooms
+    room_words = services.room_words
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
@@ -621,6 +641,489 @@ def register_auth_pages(
                             value="all",
                             label="テーマ",
                         ).props("outlined options-dense").classes("w-full")
+                        bot_count_select = ui.select(
+                            options={
+                                number: f"{number}体"
+                                for number in range(1, 8)
+                            },
+                            value=1,
+                            label="Botの数",
+                        ).props("outlined options-dense").classes("w-full")
+                        difficulty_select = ui.select(
+                            options={
+                                "normal": "ふつう",
+                                "hard": "むずかしい",
+                            },
+                            value="normal",
+                            label="難易度",
+                        ).props("outlined options-dense").classes("w-full")
+                        timer_select = ui.select(
+                            options={
+                                "unlimited": "無制限",
+                                "3": "3秒",
+                                "10": "10秒",
+                                "30": "30秒",
+                                "60": "1分",
+                                "180": "3分",
+                            },
+                            value="unlimited",
+                            label="1手の制限時間",
+                        ).props("outlined options-dense").classes("w-full")
+                        create_error = ui.label("").classes(
+                            "platform-muted"
+                        ).props("role='alert' aria-live='assertive'")
+                        creating = False
+
+                        async def create_solo_game() -> None:
+                            nonlocal creating
+                            if creating:
+                                return
+                            creating = True
+                            create_button.disable()
+                            create_error.set_text("")
+                            try:
+                                current_principal = await principal_for(
+                                    request
+                                )
+                                if current_principal is None:
+                                    ui.navigate.to(
+                                        "/login?next=/lobby"
+                                    )
+                                    return
+                                if solo is None:
+                                    raise RuntimeError(
+                                        "solo service is unavailable"
+                                    )
+                                theme_key = theme_select.value
+                                bot_count = bot_count_select.value
+                                difficulty = difficulty_select.value
+                                timer_value = timer_select.value
+                                if not isinstance(theme_key, str):
+                                    raise ValueError("theme is required")
+                                if (
+                                    type(bot_count) is not int
+                                    or not 1 <= bot_count <= 7
+                                ):
+                                    raise ValueError("invalid bot count")
+                                if difficulty not in {"normal", "hard"}:
+                                    raise ValueError("invalid difficulty")
+                                if timer_value == "unlimited":
+                                    turn_seconds = None
+                                elif (
+                                    isinstance(timer_value, str)
+                                    and timer_value.isdigit()
+                                ):
+                                    turn_seconds = int(timer_value)
+                                    if not 3 <= turn_seconds <= 180:
+                                        raise ValueError("invalid timer")
+                                else:
+                                    raise ValueError("invalid timer")
+                                snapshot = await solo.create(
+                                    current_principal.account.id,
+                                    bot_count=bot_count,
+                                    bot_difficulty=difficulty,
+                                    theme_key=theme_key,
+                                    turn_seconds=turn_seconds,
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                                KeyError,
+                                RoomRuntimeCapabilityError,
+                            ):
+                                LOGGER.exception("invalid solo setup")
+                                create_error.set_text(
+                                    "設定を確認してください。"
+                                )
+                            except Exception:
+                                LOGGER.exception(
+                                    "failed to create solo game"
+                                )
+                                create_error.set_text(
+                                    "Bot戦を開始できませんでした。"
+                                )
+                            else:
+                                ui.navigate.to(
+                                    f"/play/{snapshot.room_id}"
+                                )
+                            finally:
+                                creating = False
+                                create_button.enable()
+
+                        create_button = ui.button(
+                            "Bot戦を始める",
+                            icon="play_arrow",
+                            on_click=create_solo_game,
+                        ).props("unelevated no-caps").classes("w-full")
+
+    @ui.page("/play/{game_id}")
+    async def solo_play_page(game_id: str, request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            next_path = f"/play/{game_id}"
+            return RedirectResponse(
+                f"/login?next={next_path}", status_code=303
+            )
+        if solo is None or rooms is None or room_words is None:
+            return RedirectResponse("/lobby", status_code=303)
+
+        _page_shell()
+        user_id = principal.account.id
+        client = ui.context.client
+        current_snapshot: RoomSnapshot | None = None
+        pending_submission: tuple[str, int, str] | None = None
+        attaching = False
+        submitting = False
+
+        def can_submit(snapshot: RoomSnapshot) -> bool:
+            seat = snapshot.seat_for_user(user_id)
+            return (
+                snapshot.status is RoomStatus.ACTIVE
+                and seat is not None
+                and snapshot.current_turn == seat.index
+                and seat.controller is SeatController.HUMAN
+            )
+
+        def render(snapshot: RoomSnapshot) -> None:
+            nonlocal current_snapshot
+            if (
+                current_snapshot is not None
+                and snapshot.state_version < current_snapshot.state_version
+            ):
+                return
+            current_snapshot = snapshot
+            try:
+                theme_label = solo.themes.get(
+                    snapshot.theme_key
+                ).label
+            except KeyError:
+                theme_label = snapshot.theme_key
+            theme_label_element.set_text(f"テーマ: {theme_label}")
+            timer = (
+                "無制限"
+                if snapshot.turn_seconds is None
+                else f"{snapshot.turn_seconds}秒"
+            )
+            settings_label.set_text(
+                f"Bot {len(snapshot.players) - 1}体・"
+                f"{snapshot.bot_difficulty}・{timer}"
+            )
+            status_names = {
+                RoomStatus.ACTIVE: "対局中",
+                RoomStatus.PAUSED: "中断中",
+                RoomStatus.FINISHED: "終了",
+            }
+            status_label.set_text(status_names[snapshot.status])
+            expected_label.set_text(
+                snapshot.expected_kana or "自由"
+            )
+            current_seat = snapshot.players[snapshot.current_turn]
+            if current_seat.owner_user_id == user_id:
+                turn_label.set_text("あなたの番です")
+            else:
+                turn_label.set_text(
+                    f"Bot {current_seat.index + 1} の番です"
+                )
+            if snapshot.deadline_at is None:
+                deadline_label.set_text("残り時間: 無制限")
+            else:
+                remaining = max(
+                    0,
+                    int(
+                        (
+                            snapshot.deadline_at
+                            - datetime.now(timezone.utc)
+                        ).total_seconds()
+                    ),
+                )
+                deadline_label.set_text(f"残り時間: 約{remaining}秒")
+
+            history_box.clear()
+            with history_box:
+                if not snapshot.history:
+                    ui.label(
+                        "先攻は好きな辞書単語から始められます。"
+                    ).classes("platform-muted")
+                for index, record in enumerate(
+                    snapshot.history, start=1
+                ):
+                    actor = (
+                        f"Bot {record.seat_index + 1}"
+                        if record.by_bot
+                        else "あなた"
+                    )
+                    with ui.row().classes(
+                        "w-full items-center justify-between gap-3"
+                    ):
+                        ui.label(
+                            f"{index}. {record.surface}"
+                        ).classes("aside-title")
+                        ui.label(
+                            f"{actor}・よみ: {record.reading}"
+                        ).classes("platform-muted")
+
+            allowed = can_submit(snapshot) and not submitting
+            if allowed:
+                word_input.enable()
+                submit_button.enable()
+            else:
+                word_input.disable()
+                submit_button.disable()
+
+            if snapshot.status is RoomStatus.FINISHED:
+                reasons = {
+                    "ends_with_n": "「ん」で終わったため終了しました。",
+                    "duplicate": "同じ読みを使ったため終了しました。",
+                    "timeout": "時間切れで終了しました。",
+                    "no_legal_move": "出せる単語がなく終了しました。",
+                }
+                feedback_label.set_text(
+                    reasons.get(
+                        snapshot.end_reason,
+                        "対局が終了しました。",
+                    )
+                )
+            elif allowed:
+                feedback_label.set_text(
+                    "辞書にある単語を入力してください。"
+                )
+            else:
+                feedback_label.set_text(
+                    "Botの手を待っています。"
+                )
+
+        async def on_room_event(event: RoomEvent) -> None:
+            if (
+                event.kind is not RoomEventKind.SNAPSHOT
+                or event.snapshot is None
+                or client.is_deleted()
+            ):
+                return
+            try:
+                with client:
+                    render(event.snapshot)
+            except Exception:
+                LOGGER.exception("failed to render room event")
+
+        async def attach() -> None:
+            nonlocal attaching
+            if attaching:
+                return
+            attaching = True
+            try:
+                snapshot = await solo.connect(
+                    user_id,
+                    game_id,
+                    client.id,
+                    on_room_event,
+                )
+            except (SoloGameAuthorizationError, RoomError):
+                LOGGER.exception("failed to open solo game")
+                feedback_label.set_text(
+                    "この対局を開けません。"
+                )
+                word_input.disable()
+                submit_button.disable()
+            except Exception:
+                LOGGER.exception("failed to connect solo game")
+                feedback_label.set_text(
+                    "対局へ接続できませんでした。"
+                )
+            else:
+                render(snapshot)
+            finally:
+                attaching = False
+
+        async def detach() -> None:
+            try:
+                await rooms.disconnect_client(game_id, client.id)
+            except Exception:
+                LOGGER.exception("failed to disconnect solo client")
+
+        async def perform_submission(
+            surface: str,
+            *,
+            chosen_reading: str | None,
+            expected_version: int,
+            operation_id: str,
+        ) -> None:
+            nonlocal pending_submission, submitting
+            if submitting:
+                return
+            submitting = True
+            submit_button.disable()
+            try:
+                result = await room_words.submit_user_word(
+                    game_id,
+                    user_id,
+                    surface,
+                    chosen_reading=chosen_reading,
+                    expected_version=expected_version,
+                    operation_id=operation_id,
+                )
+            except RoomVersionConflict as error:
+                pending_submission = None
+                reading_dialog.close()
+                if error.current_snapshot is not None:
+                    render(error.current_snapshot)
+                feedback_label.set_text(
+                    "状態が更新されました。もう一度お試しください。"
+                )
+            except RoomError:
+                LOGGER.exception("solo word submission failed")
+                pending_submission = None
+                reading_dialog.close()
+                feedback_label.set_text(
+                    "今はその単語を送信できません。"
+                )
+            except Exception:
+                LOGGER.exception("unexpected solo submission failure")
+                feedback_label.set_text(
+                    "単語を確認できませんでした。"
+                )
+            else:
+                if (
+                    result.status
+                    is WordSubmissionStatus.READING_REQUIRED
+                ):
+                    pending_submission = (
+                        surface,
+                        expected_version,
+                        operation_id,
+                    )
+                    reading_choices.clear()
+                    with reading_choices:
+                        for reading in result.reading_choices:
+                            ui.button(
+                                reading,
+                                on_click=lambda _event=None,
+                                value=reading: choose_reading(value),
+                            ).props("outline no-caps").classes("w-full")
+                    feedback_label.set_text(result.message)
+                    reading_dialog.open()
+                elif (
+                    result.status
+                    is WordSubmissionStatus.COMMITTED
+                ):
+                    pending_submission = None
+                    reading_dialog.close()
+                    word_input.set_value("")
+                    if (
+                        result.outcome is not None
+                        and result.outcome.snapshot is not None
+                    ):
+                        render(result.outcome.snapshot)
+                    feedback_label.set_text(result.message)
+                else:
+                    pending_submission = None
+                    reading_dialog.close()
+                    feedback_label.set_text(result.message)
+            finally:
+                submitting = False
+                if current_snapshot is not None:
+                    render(current_snapshot)
+
+        async def submit_word(
+            _event: object | None = None,
+        ) -> None:
+            snapshot = current_snapshot
+            if snapshot is None or not can_submit(snapshot):
+                return
+            await perform_submission(
+                str(word_input.value or ""),
+                chosen_reading=None,
+                expected_version=snapshot.state_version,
+                operation_id=uuid4().hex,
+            )
+
+        async def choose_reading(reading: str) -> None:
+            pending = pending_submission
+            if pending is None:
+                reading_dialog.close()
+                return
+            surface, version, operation_id = pending
+            await perform_submission(
+                surface,
+                chosen_reading=reading,
+                expected_version=version,
+                operation_id=operation_id,
+            )
+
+        def cancel_reading() -> None:
+            nonlocal pending_submission
+            pending_submission = None
+            reading_dialog.close()
+            feedback_label.set_text("読みの選択を取り消しました。")
+
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                with ui.row().classes(
+                    "w-full items-center justify-between gap-3"
+                ):
+                    with ui.column():
+                        ui.label("1人でBot戦").classes("auth-title")
+                        theme_label_element = ui.label(
+                            "テーマ: 読み込み中"
+                        ).classes("platform-muted")
+                        settings_label = ui.label("").classes(
+                            "platform-muted"
+                        )
+                    ui.link("ロビーへ", "/lobby").classes(
+                        "platform-link"
+                    )
+                with ui.element("section").classes("dashboard-grid"):
+                    with ui.column().classes("dashboard-card"):
+                        status_label = ui.label("接続中").classes(
+                            "aside-title"
+                        )
+                        turn_label = ui.label("").classes("aside-title")
+                        with ui.row().classes(
+                            "w-full items-center gap-3"
+                        ):
+                            ui.label("次の文字")
+                            expected_label = ui.label("自由").classes(
+                                "aside-title"
+                            )
+                        deadline_label = ui.label("").classes(
+                            "platform-muted"
+                        )
+                        word_input = ui.input(
+                            label="次のことば",
+                            placeholder="漢字・ひらがな・カタカナ",
+                        ).props(
+                            "outlined clearable maxlength=30 autocomplete=off"
+                        ).classes("w-full")
+                        submit_button = ui.button(
+                            "つなぐ",
+                            icon="arrow_forward",
+                            on_click=submit_word,
+                        ).props("unelevated no-caps").classes("w-full")
+                        word_input.on("keydown.enter", submit_word)
+                        feedback_label = ui.label(
+                            "対局へ接続しています。"
+                        ).classes("platform-muted").props(
+                            "role='status' aria-live='polite'"
+                        )
+                    with ui.column().classes("dashboard-card"):
+                        ui.label("ことばの履歴").classes("aside-title")
+                        history_box = ui.column().classes(
+                            "w-full gap-2"
+                        )
+
+                with ui.dialog() as reading_dialog, ui.card():
+                    ui.label("読みを選んでください").classes(
+                        "aside-title"
+                    )
+                    reading_choices = ui.column().classes("w-full gap-2")
+                    ui.button(
+                        "取り消す",
+                        on_click=cancel_reading,
+                    ).props("flat no-caps")
+
+        word_input.disable()
+        submit_button.disable()
+        client.on_connect(attach)
+        client.on_disconnect(detach)
 
     @ui.page("/saved-games")
     async def saved_games_page(request: Request):
@@ -666,6 +1169,9 @@ def register_auth_pages(
                             ui.label(
                                 f"対局ID: {save.game_id}"
                             ).classes("platform-muted")
+                            ui.link(
+                                "この対局を再開", f"/play/{save.game_id}"
+                            ).classes("platform-link")
                         ui.label(
                             f"保存日時: {save.updated_at.astimezone(timezone.utc).isoformat()}"
                         ).classes("platform-muted")
