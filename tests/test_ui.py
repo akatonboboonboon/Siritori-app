@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import unittest
 
+from nicegui.slot import Slot
 from nicegui.testing import user_simulation
 
 from shiritori.page import register_pages
 
 
 class UserInterfaceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        # NiceGUI 3.14 can retain a slot stack under a reused asyncio task ID
+        # between IsolatedAsyncioTestCase methods (notably on Python 3.13).
+        Slot.stacks.clear()
+
     async def test_valid_word_and_chain_error_are_shown(self) -> None:
         async with user_simulation() as user:
             register_pages()
