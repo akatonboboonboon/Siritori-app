@@ -26,9 +26,9 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 | 2026-07-24 | OpenAI Codex | NiceGUI / Render の設計 | NiceGUIでの画面・ゲーム状態の分離、Renderでの起動方法、GitHubを介した共同作業の構成案を作成し、初期実装へ反映した | 完了 | 応募者本人が構成、UI、追加機能、Render設定を読み、採用・修正を判断する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 | 2026-07-24 | OpenAI Codex | プロジェクト基盤 | `main.py`、`shiritori/`、`assets/styles.css`、Render設定、README、自動テストを実装した | 完了 | Codexが13件のルールテストと3件のNiceGUI操作シミュレーションを実行済み。応募者本人によるコードレビューと実ブラウザ確認は未実施 | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 | 2026-07-24 | OpenAI Codex | 共同開発文書 | `CONTRIBUTING.md` と本ファイルを作成し、ブランチ、Draft PR、担当宣言、秘密情報、AI記録の運用を文書化した | 完了 | 応募者本人が運用内容を読み、自分の作業方法に合うか確認する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
-| 2026-07-24 | OpenAI Codex | ルール・ロードマップ | 応募者本人が決めた単語規則、Neon採用、PC・スマートフォン対応を、画面別の合格条件と段階的PRへ整理して `docs/RULES.md` と `docs/ROADMAP.md` に記録した | 完了（本人レビュー待ち） | 応募者本人が一文字、同音語、Bot、切断時の規則と、自分が実装する担当範囲を最終確認する | このブランチ |
-| 2026-07-24 | OpenAI Codex | 無料構成 | Render Free＋Neon Free PostgreSQL、DBを正本にするRoomHub、認証、再接続、環境変数を `docs/ARCHITECTURE.md` に設計した | 完了（設計のみ） | 実装前に応募者本人がNeonプロジェクトを作り、無料枠の最新条件を確認する | このブランチ |
-| 2026-07-24 | OpenAI Codex | 実在語判定 | `shiritori/lexicon.py`、固定版Sudachi依存、`tests/test_lexicon.py`、第三者ソフトウェア表記を作成した。完全一致の名詞、漢字読み、複数読み、一文字、絵文字、未知語を検証する | 基盤完了・画面接続は未実装 | 実データ15件を含むテストはCodexが実行済み。応募者本人はコードと辞書判定例を確認する | このブランチ |
+| 2026-07-24 | OpenAI Codex | ルール・ロードマップ | 応募者本人が決めた単語規則、Neon採用、PC・スマートフォン対応を、画面別の合格条件と段階的PRへ整理して `docs/RULES.md` と `docs/ROADMAP.md` に記録した | 完了（本人レビュー待ち） | 応募者本人が一文字、同音語、Bot、切断時の規則と、自分が実装する担当範囲を最終確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
+| 2026-07-24 | OpenAI Codex | 無料構成 | Render Free＋Neon Free PostgreSQL、DBを正本にするRoomHub、認証、再接続、環境変数を `docs/ARCHITECTURE.md` に設計した | 完了（設計のみ） | 実装前に応募者本人がNeonプロジェクトを作り、無料枠の最新条件を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
+| 2026-07-24 | OpenAI Codex | 実在語判定 | `shiritori/lexicon.py`、固定版Sudachi依存、`tests/test_lexicon.py`、第三者ソフトウェア表記を作成した。完全一致の名詞、漢字読み、複数読み、一文字、絵文字、未知語を検証する | 基盤完了・画面接続は未実装 | 実データ15件を含むテストはCodexが実行済み。応募者本人はコードと辞書判定例を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
 
 ### 完了した確認
 
