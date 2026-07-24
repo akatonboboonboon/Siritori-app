@@ -42,8 +42,9 @@ RenderとNeonの無料枠を使う設計です。公開アカウントの作成�
 - 暗号学的に安全なランダム先攻、自由初手、3〜180秒または無制限
 - Normal / Hard Botと、辞書で検証してから構築する単語索引
 - 選択テーマを「表記＋読み」で照合するサーバー側テーマ制約
+- 日本語WordNet 1.1から開発時に候補を抽出し、Sudachiで実在語と読みを検査した9テーマ（アプリ実行時の外部通信なし）
 
-オンライン部屋の画面、テーマデータ、Easy Bot、タイマーの最終UIは、応募者本人の
+オンライン部屋の画面、Easy Bot、タイマーの最終UIは、応募者本人の
 実装領域として意図的に残しています。バックエンドAPIとテストを先に用意し、本人の
 コードを別PRで共有・レビューできる構成です。
 
@@ -158,7 +159,7 @@ Codexからの実ブラウザ表示確認も未実施です。秘密情報は受
 AIが安全性・同時実行制御の基盤を担当し、次は応募者本人が実装・判断します。
 
 - ロビー、部屋カード、対戦・観戦画面、履歴行の見た目
-- テーマ分類データの選定、追加、誤分類の修正
+- 9テーマに収録した単語の目視レビューと誤分類修正
 - `BotStrategy`を使ったEasy Botの候補選択
 - テーマ、Bot数、難易度、制限時間の設定UIとタイマー警告表示
 - PC・実スマートフォンでの操作確認と、本人のデザイン調整
@@ -187,6 +188,8 @@ PR、`AI_USAGE.md`、本人のレビュー・手動確認によって区別し�
 - [NiceGUI Documentation](https://nicegui.io/documentation/)
 - [SudachiPy 0.6.11](https://pypi.org/project/SudachiPy/0.6.11/)
 - [SudachiDict](https://github.com/WorksApplications/SudachiDict)
+- [日本語WordNet 1.1](https://bond-lab.github.io/wnja/eng/downloads.html)
+- [テーマ単語データの出典と作成方法](docs/THEME_DATA_SOURCES.md)
 - [SQLAlchemy Documentation](https://docs.sqlalchemy.org/en/20/)
 - [Alembic Documentation](https://alembic.sqlalchemy.org/en/latest/)
 - [Render: Deploy for Free](https://render.com/docs/free)

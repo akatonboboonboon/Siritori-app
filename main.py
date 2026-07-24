@@ -12,11 +12,14 @@ from shiritori.application import ApplicationServices
 from shiritori.customize import APP_TITLE
 from shiritori.page import register_pages
 from shiritori.settings import Settings
+from shiritori.user_themes import USER_THEMES
 from shiritori.web_auth import AuthWebServices, register_auth_pages
 
 
 SETTINGS = Settings.from_environment()
 SERVICES = ApplicationServices.build(SETTINGS)
+for theme in USER_THEMES:
+    SERVICES.register_theme(theme)
 DATABASE = SERVICES.database
 AUTH = SERVICES.auth
 LOBBY = SERVICES.lobby
