@@ -38,6 +38,17 @@ jig.jp サマーインターンシップ2026 Webコースの選考課題仕様�
 - PCとスマートフォンの両方で使えるレスポンシブ表示
 - ブラウザごとに独立したゲーム状態（他のプレイヤーの操作と混ざらない）
 
+## 次の段階として実装中の機能
+
+採用ルール、PC・スマートフォンの画面別合格条件、Render＋Neonの無料構成を
+[`docs/RULES.md`](docs/RULES.md)、[`docs/ROADMAP.md`](docs/ROADMAP.md)、
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) に固定しました。
+
+現在の開発ブランチには、SudachiDict coreの完全一致項目から普通名詞・固有名詞だけを調べ、
+漢字・カタカナの読み、複数の読み候補、表記違いの共通キーを返す辞書判定基盤があります。
+現行のゲーム画面はまだ従来のひらがな判定を使っており、画面への接続と読み選択UIは
+次の小さなPRで実装します。
+
 ## デザイン
 
 入力すべき文字を迷わないように、現在のことばと次の先頭文字を画面の中心に大きく表示しています。
@@ -51,6 +62,8 @@ jig.jp サマーインターンシップ2026 Webコースの選考課題仕様�
 
 - Python 3.13
 - NiceGUI 3.14.0
+- SudachiPy 0.6.11（辞書判定基盤）
+- SudachiDict core 20260428（固定した日本語辞書）
 - Python 標準ライブラリ `unittest`
 - Render Web Service
 
@@ -77,6 +90,8 @@ Windows PowerShell:
 python -m pip install -r requirements.txt
 python main.py
 ```
+
+初回の依存関係インストールでは、SudachiDict core（約70MB）も取得するため時間がかかることがあります。
 
 起動後、<http://localhost:8080> を開きます。
 
@@ -111,6 +126,7 @@ python -m unittest discover -s tests -v
 このリポジトリは、ユーザーとAIの担当範囲が分かるように短いブランチとDraft PRで作業します。
 同じファイルを同時に編集しないためのルールは [`CONTRIBUTING.md`](CONTRIBUTING.md)、
 AIの利用履歴は [`AI_USAGE.md`](AI_USAGE.md) を参照してください。
+辞書依存関係の出典とライセンスは [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) に記録しています。
 
 ### リポジトリ所有者が次に担当する部分
 
@@ -130,6 +146,8 @@ AIの利用履歴は [`AI_USAGE.md`](AI_USAGE.md) を参照してください。
 - Unicode正規化、小書きかな、重複、「ん」終了を扱うゲームロジックを実装
 - 自動テストの初期ケースを作成
 - 共同作業用のファイル分割とドキュメントを作成
+- 採用ルール、段階的ロードマップ、Render＋Neonの無料構成を文書化
+- SudachiDictを用いる辞書判定基盤と境界テストを実装
 
 AIが生成した内容は、そのまま提出せず、コードを読み、手動テストと自動テストを行い、
 採用・修正した内容を [`AI_USAGE.md`](AI_USAGE.md) に追記します。
@@ -154,3 +172,9 @@ AIが生成した内容は、そのまま提出せず、コードを読み、手
   - `render.yaml` のサービス設定を確認
 - [Render: Setting Your Python Version](https://render.com/docs/python-version)
   - `.python-version` によるPythonバージョン指定を確認
+- [SudachiPy 0.6.11](https://pypi.org/project/SudachiPy/0.6.11/)
+  - 完全一致辞書検索、対応Python、配布サイズ、ライセンスを確認
+- [SudachiDict](https://github.com/WorksApplications/SudachiDict)
+  - core辞書の由来とライセンス情報を確認
+- [Neon: Connection pooling](https://neon.com/docs/connect/connection-pooling)
+  - 無料PostgreSQLの実行時接続設計を確認

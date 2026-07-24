@@ -1,1 +1,3 @@
 nicegui==3.14.0
+sudachipy==0.6.11
+sudachidict-core==20260428
