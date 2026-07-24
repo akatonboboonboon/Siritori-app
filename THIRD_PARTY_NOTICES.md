@@ -24,26 +24,3 @@
 SudachiDictは複数の辞書素材を基に構築されています。再配布方法を変更したり、
 独自辞書をリポジトリへ含めたりする場合は、上記の `LEGAL` と各素材の条件を
 あらためて確認します。
-## SQLAlchemy 2.0.51
-
-- 用途: PostgreSQL / SQLite のトランザクションとORM
-- ライセンス: MIT
-- PyPI: <https://pypi.org/project/SQLAlchemy/2.0.51/>
-
-## Alembic 1.18.5
-
-- 用途: PostgreSQLスキーマのマイグレーション
-- ライセンス: MIT
-- PyPI: <https://pypi.org/project/alembic/1.18.5/>
-
-## argon2-cffi 25.1.0
-
-- 用途: Argon2idによるパスワードハッシュ
-- ライセンス: MIT
-- PyPI: <https://pypi.org/project/argon2-cffi/25.1.0/>
-
-## Psycopg 3.3.4
-
-- 用途: Neon PostgreSQLへの接続
-- ライセンス: GNU Lesser General Public License v3
-- PyPI: <https://pypi.org/project/psycopg/3.3.4/>

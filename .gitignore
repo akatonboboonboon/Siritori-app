@@ -10,10 +10,6 @@ venv/
 .env.*
 !.env.example
 .nicegui/
-*.db
-*.db-journal
-*.sqlite
-*.sqlite3
 .coverage
 htmlcov/
 dist/

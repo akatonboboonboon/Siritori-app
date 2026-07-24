@@ -26,16 +26,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Verify dependency consistency
-        run: python -m pip check
-
-      - name: Verify database migration
-        env:
-          DIRECT_DATABASE_URL: sqlite+pysqlite:///./ci-migrations.db
-        run: |
-          python -m alembic upgrade head
-          python -m alembic check
-
       - name: Compile Python files
         run: python -m compileall -q .
 
