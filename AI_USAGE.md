@@ -22,10 +22,10 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 
 | 日付 | ツール | 対象 | AIの利用内容 | 状態 | 人が確認・判断すること | 関連PR / commit |
 |---|---|---|---|---|---|---|
-| 2026-07-24 | OpenAI Codex | 課題仕様 | 提示された画像と課題ページを調査し、必須のしりとり仕様、追加機能、READMEに必要な説明項目を整理した | 完了 | 実装前と提出前に、応募者本人が課題ページ原文と照合する | 未作成 |
-| 2026-07-24 | OpenAI Codex | NiceGUI / Render の設計 | NiceGUIでの画面・ゲーム状態の分離、Renderでの起動方法、GitHubを介した共同作業の構成案を作成し、初期実装へ反映した | 完了 | 応募者本人が構成、UI、追加機能、Render設定を読み、採用・修正を判断する | Draft PR作成待ち |
-| 2026-07-24 | OpenAI Codex | プロジェクト基盤 | `main.py`、`shiritori/`、`assets/styles.css`、Render設定、README、自動テストを実装した | 完了 | Codexが13件のルールテストと3件のNiceGUI操作シミュレーションを実行済み。応募者本人によるコードレビューと実ブラウザ確認は未実施 | Draft PR作成待ち |
-| 2026-07-24 | OpenAI Codex | 共同開発文書 | `CONTRIBUTING.md` と本ファイルを作成し、ブランチ、Draft PR、担当宣言、秘密情報、AI記録の運用を文書化した | 完了 | 応募者本人が運用内容を読み、自分の作業方法に合うか確認する | 未作成 |
+| 2026-07-24 | OpenAI Codex | 課題仕様 | 提示された画像と課題ページを調査し、必須のしりとり仕様、追加機能、READMEに必要な説明項目を整理した | 完了 | 実装前と提出前に、応募者本人が課題ページ原文と照合する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
+| 2026-07-24 | OpenAI Codex | NiceGUI / Render の設計 | NiceGUIでの画面・ゲーム状態の分離、Renderでの起動方法、GitHubを介した共同作業の構成案を作成し、初期実装へ反映した | 完了 | 応募者本人が構成、UI、追加機能、Render設定を読み、採用・修正を判断する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
+| 2026-07-24 | OpenAI Codex | プロジェクト基盤 | `main.py`、`shiritori/`、`assets/styles.css`、Render設定、README、自動テストを実装した | 完了 | Codexが13件のルールテストと3件のNiceGUI操作シミュレーションを実行済み。応募者本人によるコードレビューと実ブラウザ確認は未実施 | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
+| 2026-07-24 | OpenAI Codex | 共同開発文書 | `CONTRIBUTING.md` と本ファイルを作成し、ブランチ、Draft PR、担当宣言、秘密情報、AI記録の運用を文書化した | 完了 | 応募者本人が運用内容を読み、自分の作業方法に合うか確認する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 
 ### 完了した確認
 
