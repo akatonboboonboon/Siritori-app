@@ -33,6 +33,8 @@ from .auth import (
     canonicalize_username,
 )
 from .database import GameRepository
+from .lobby import LobbyError, LobbyService
+from .models import RoomRole, RoomStatus as StoredRoomStatus
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
     LexiconRoomService,
@@ -66,6 +68,7 @@ class AuthWebServices:
     solo: SoloGameService | None = None
     rooms: RoomCoordinator | None = None
     room_words: LexiconRoomService | None = None
+    lobby: LobbyService | None = None
 
 
 class CsrfProtector:
@@ -427,6 +430,7 @@ def register_auth_pages(
     csrf = CsrfProtector(settings.session_secret)
     rooms = services.rooms
     room_words = services.room_words
+    lobby = services.lobby
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
@@ -623,9 +627,191 @@ def register_auth_pages(
                 with ui.element("section").classes("dashboard-grid"):
                     with ui.column().classes("dashboard-card"):
                         ui.label("部屋を作る・参加する").classes("aside-title")
-                        ui.label(
-                            "部屋UIは、認証済みサービスAPIへ接続して実装します。"
-                        ).classes("platform-muted")
+                        room_name_input = ui.input(
+                            label="部屋名",
+                            value=f"{principal.account.display_name}の部屋",
+                        ).props("outlined maxlength=64").classes("w-full")
+                        room_theme_select = ui.select(
+                            options=theme_options,
+                            value="all",
+                            label="テーマ",
+                        ).props("outlined options-dense").classes("w-full")
+                        room_players_select = ui.select(
+                            options={
+                                number: f"{number}人"
+                                for number in range(2, 9)
+                            },
+                            value=2,
+                            label="最大人数",
+                        ).props("outlined options-dense").classes("w-full")
+                        room_timer_select = ui.select(
+                            options={
+                                "unlimited": "無制限",
+                                "3": "3秒",
+                                "10": "10秒",
+                                "30": "30秒",
+                                "60": "1分",
+                                "180": "3分",
+                            },
+                            value="unlimited",
+                            label="1手の制限時間",
+                        ).props("outlined options-dense").classes("w-full")
+                        spectator_switch = ui.switch(
+                            "観戦を許可する", value=True
+                        )
+                        room_code_input = ui.input(
+                            label="参加コード",
+                            placeholder="例: ABC234",
+                        ).props(
+                            "outlined maxlength=12 autocomplete=off"
+                        ).classes("w-full")
+                        room_error = ui.label("").classes(
+                            "platform-muted"
+                        ).props("role='alert' aria-live='assertive'")
+                        room_busy = False
+
+                        def room_turn_seconds() -> int | None:
+                            value = room_timer_select.value
+                            if value == "unlimited":
+                                return None
+                            if (
+                                isinstance(value, str)
+                                and value.isdigit()
+                            ):
+                                seconds = int(value)
+                                if 3 <= seconds <= 180:
+                                    return seconds
+                            raise ValueError("invalid room timer")
+
+                        async def create_room() -> None:
+                            nonlocal room_busy
+                            if room_busy:
+                                return
+                            room_busy = True
+                            create_room_button.disable()
+                            room_error.set_text("")
+                            try:
+                                current_principal = await principal_for(
+                                    request
+                                )
+                                if current_principal is None:
+                                    ui.navigate.to(
+                                        "/login?next=/lobby"
+                                    )
+                                    return
+                                if lobby is None:
+                                    raise RuntimeError(
+                                        "lobby service is unavailable"
+                                    )
+                                theme_key = room_theme_select.value
+                                max_players = room_players_select.value
+                                if not isinstance(theme_key, str):
+                                    raise ValueError("invalid theme")
+                                if (
+                                    type(max_players) is not int
+                                    or not 2 <= max_players <= 8
+                                ):
+                                    raise ValueError("invalid player count")
+                                room = await asyncio.to_thread(
+                                    lobby.create_pvp_room,
+                                    current_principal.account.id,
+                                    name=str(
+                                        room_name_input.value or ""
+                                    ),
+                                    max_players=max_players,
+                                    allow_spectators=bool(
+                                        spectator_switch.value
+                                    ),
+                                    theme_key=theme_key,
+                                    turn_seconds=room_turn_seconds(),
+                                )
+                            except (LobbyError, TypeError, ValueError):
+                                LOGGER.exception("invalid room setup")
+                                room_error.set_text(
+                                    "部屋の設定を確認してください。"
+                                )
+                            except Exception:
+                                LOGGER.exception("failed to create room")
+                                room_error.set_text(
+                                    "部屋を作成できませんでした。"
+                                )
+                            else:
+                                ui.navigate.to(
+                                    f"/room/{room.room_code}"
+                                )
+                            finally:
+                                room_busy = False
+                                create_room_button.enable()
+
+                        async def join_room(
+                            *,
+                            as_spectator: bool,
+                        ) -> None:
+                            nonlocal room_busy
+                            if room_busy:
+                                return
+                            room_busy = True
+                            room_error.set_text("")
+                            try:
+                                current_principal = await principal_for(
+                                    request
+                                )
+                                if current_principal is None:
+                                    ui.navigate.to(
+                                        "/login?next=/lobby"
+                                    )
+                                    return
+                                if lobby is None:
+                                    raise RuntimeError(
+                                        "lobby service is unavailable"
+                                    )
+                                join_method = (
+                                    lobby.join_as_spectator
+                                    if as_spectator
+                                    else lobby.join_as_player
+                                )
+                                room = await asyncio.to_thread(
+                                    join_method,
+                                    current_principal.account.id,
+                                    str(room_code_input.value or ""),
+                                )
+                            except (LobbyError, TypeError, ValueError):
+                                LOGGER.exception("failed to join room")
+                                room_error.set_text(
+                                    "参加コードまたは部屋の状態を確認してください。"
+                                )
+                            except Exception:
+                                LOGGER.exception(
+                                    "unexpected room join failure"
+                                )
+                                room_error.set_text(
+                                    "部屋へ参加できませんでした。"
+                                )
+                            else:
+                                ui.navigate.to(
+                                    f"/room/{room.room_code}"
+                                )
+                            finally:
+                                room_busy = False
+
+                        create_room_button = ui.button(
+                            "部屋を作る",
+                            icon="add",
+                            on_click=create_room,
+                        ).props("unelevated no-caps").classes("w-full")
+                        with ui.row().classes("w-full gap-2"):
+                            ui.button(
+                                "対戦参加",
+                                on_click=lambda: join_room(
+                                    as_spectator=False
+                                ),
+                            ).props("outline no-caps").classes("grow")
+                            ui.button(
+                                "観戦参加",
+                                on_click=lambda: join_room(
+                                    as_spectator=True
+                                ),
+                            ).props("outline no-caps").classes("grow")
                     with ui.column().classes("dashboard-card"):
                         ui.label("保存したBot戦").classes("aside-title")
                         ui.link("保存一覧を開く", "/saved-games").classes(
@@ -756,6 +942,264 @@ def register_auth_pages(
                             on_click=create_solo_game,
                         ).props("unelevated no-caps").classes("w-full")
 
+    @ui.page("/room/{room_code}")
+    async def waiting_room_page(room_code: str, request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            next_path = f"/room/{room_code}"
+            return RedirectResponse(
+                f"/login?next={next_path}", status_code=303
+            )
+        if lobby is None or rooms is None:
+            return RedirectResponse("/lobby", status_code=303)
+
+        user_id = principal.account.id
+        try:
+            initial_room = await asyncio.to_thread(
+                lobby.get_room, room_code
+            )
+        except (LobbyError, ValueError):
+            return RedirectResponse("/lobby", status_code=303)
+        if initial_room.member_for(user_id) is None:
+            return RedirectResponse("/lobby", status_code=303)
+        if initial_room.status is StoredRoomStatus.ACTIVE:
+            try:
+                game_id = await asyncio.to_thread(
+                    lobby.active_game_id,
+                    user_id,
+                    initial_room.room_code,
+                )
+            except LobbyError:
+                return RedirectResponse("/lobby", status_code=303)
+            await rooms.recover_after_restart(game_id)
+            return RedirectResponse(
+                f"/play/{game_id}", status_code=303
+            )
+
+        _page_shell()
+        current_room = initial_room
+        refreshing = False
+
+        def render_room(room) -> None:
+            nonlocal current_room
+            current_room = room
+            room_name_label.set_text(room.name)
+            room_code_label.set_text(
+                f"参加コード: {room.room_code}"
+            )
+            theme = (
+                solo.themes.get(room.theme_key).label
+                if solo is not None
+                else room.theme_key
+            )
+            timer_text = (
+                "無制限"
+                if room.turn_seconds is None
+                else f"{room.turn_seconds}秒"
+            )
+            settings_label.set_text(
+                f"テーマ: {theme}・制限時間: {timer_text}・"
+                f"最大{room.max_players}人"
+            )
+            members_box.clear()
+            with members_box:
+                ui.label("対戦参加者").classes("aside-title")
+                for index, member in enumerate(room.players, start=1):
+                    name = (
+                        "あなた"
+                        if member.user_id == user_id
+                        else f"参加者 {index}"
+                    )
+                    ready = "準備OK" if member.ready else "準備中"
+                    with ui.row().classes(
+                        "w-full items-center justify-between"
+                    ):
+                        ui.label(name)
+                        ui.label(ready).classes("platform-muted")
+                ui.label(
+                    f"観戦者: {len(room.spectators)}人"
+                ).classes("platform-muted")
+
+            member = room.member_for(user_id)
+            is_player = (
+                member is not None
+                and member.role is RoomRole.PLAYER
+            )
+            ready_button.set_visibility(is_player)
+            if is_player:
+                ready_button.enable()
+                ready_button.set_text(
+                    "準備を取り消す"
+                    if member.ready
+                    else "準備OKにする"
+                )
+            is_owner = room.owner_user_id == user_id
+            start_button.set_visibility(is_owner)
+            if is_owner and room.all_players_ready:
+                start_button.enable()
+                message_label.set_text(
+                    "全員の準備が完了しました。"
+                )
+            elif is_owner:
+                start_button.disable()
+                message_label.set_text(
+                    "2人以上が準備OKになると開始できます。"
+                )
+            elif is_player:
+                message_label.set_text(
+                    "部屋の作成者が開始するまでお待ちください。"
+                )
+            else:
+                message_label.set_text(
+                    "観戦者として参加しています。"
+                )
+
+        async def waiting_session_is_valid() -> bool:
+            current_principal = await principal_for(request)
+            if (
+                current_principal is not None
+                and current_principal.account.id == user_id
+            ):
+                return True
+            poll_timer.deactivate()
+            ui.navigate.to(
+                f"/login?next=/room/{current_room.room_code}"
+            )
+            return False
+
+        async def refresh_room() -> None:
+            nonlocal refreshing
+            if refreshing or not await waiting_session_is_valid():
+                return
+            refreshing = True
+            try:
+                room = await asyncio.to_thread(
+                    lobby.get_room, room_code
+                )
+                if room.status is StoredRoomStatus.ACTIVE:
+                    game_id = await asyncio.to_thread(
+                        lobby.active_game_id,
+                        user_id,
+                        room.room_code,
+                    )
+                    poll_timer.deactivate()
+                    ui.navigate.to(f"/play/{game_id}")
+                    return
+                if room.member_for(user_id) is None:
+                    poll_timer.deactivate()
+                    ui.navigate.to("/lobby")
+                    return
+                render_room(room)
+            except (LobbyError, ValueError):
+                poll_timer.deactivate()
+                message_label.set_text(
+                    "部屋が終了しました。ロビーへ戻ってください。"
+                )
+            except Exception:
+                LOGGER.exception("failed to refresh waiting room")
+            finally:
+                refreshing = False
+
+        async def toggle_ready() -> None:
+            if not await waiting_session_is_valid():
+                return
+            member = current_room.member_for(user_id)
+            if member is None or member.role is not RoomRole.PLAYER:
+                return
+            ready_button.disable()
+            try:
+                room = await asyncio.to_thread(
+                    lobby.set_ready,
+                    user_id,
+                    current_room.room_code,
+                    ready=not member.ready,
+                )
+            except LobbyError:
+                message_label.set_text(
+                    "準備状態を変更できませんでした。"
+                )
+            else:
+                render_room(room)
+
+        async def start_match() -> None:
+            if not await waiting_session_is_valid():
+                return
+            start_button.disable()
+            try:
+                result = await asyncio.to_thread(
+                    lobby.start,
+                    user_id,
+                    current_room.room_code,
+                )
+                await rooms.recover_after_restart(result.game_id)
+            except (LobbyError, RoomError):
+                message_label.set_text(
+                    "全員の準備を確認してください。"
+                )
+                await refresh_room()
+            else:
+                poll_timer.deactivate()
+                ui.navigate.to(f"/play/{result.game_id}")
+
+        async def leave_room() -> None:
+            if not await waiting_session_is_valid():
+                return
+            try:
+                await asyncio.to_thread(
+                    lobby.leave,
+                    user_id,
+                    current_room.room_code,
+                )
+            except LobbyError:
+                message_label.set_text(
+                    "現在は退出できません。"
+                )
+            else:
+                poll_timer.deactivate()
+                ui.navigate.to("/lobby")
+
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                with ui.row().classes(
+                    "w-full items-center justify-between gap-3"
+                ):
+                    with ui.column():
+                        room_name_label = ui.label(
+                            initial_room.name
+                        ).classes("auth-title")
+                        room_code_label = ui.label("").classes(
+                            "aside-title"
+                        )
+                        settings_label = ui.label("").classes(
+                            "platform-muted"
+                        )
+                    ui.link("ロビーへ", "/lobby").classes(
+                        "platform-link"
+                    )
+                with ui.element("section").classes("dashboard-grid"):
+                    with ui.column().classes("dashboard-card"):
+                        members_box = ui.column().classes("w-full gap-2")
+                    with ui.column().classes("dashboard-card"):
+                        message_label = ui.label("").classes(
+                            "platform-muted"
+                        ).props("role='status' aria-live='polite'")
+                        ready_button = ui.button(
+                            "準備OKにする",
+                            on_click=toggle_ready,
+                        ).props("outline no-caps").classes("w-full")
+                        start_button = ui.button(
+                            "対戦を始める",
+                            icon="play_arrow",
+                            on_click=start_match,
+                        ).props("unelevated no-caps").classes("w-full")
+                        ui.button(
+                            "部屋から退出",
+                            on_click=leave_room,
+                        ).props("flat no-caps").classes("w-full")
+
+        render_room(initial_room)
+        poll_timer = ui.timer(1.5, refresh_room)
+
     @ui.page("/play/{game_id}")
     async def solo_play_page(game_id: str, request: Request):
         principal = await principal_for(request)
@@ -774,6 +1218,7 @@ def register_auth_pages(
         pending_submission: tuple[str, int, str] | None = None
         attaching = False
         submitting = False
+        polling = False
 
         def can_submit(snapshot: RoomSnapshot) -> bool:
             seat = snapshot.seat_for_user(user_id)
@@ -804,10 +1249,17 @@ def register_auth_pages(
                 if snapshot.turn_seconds is None
                 else f"{snapshot.turn_seconds}秒"
             )
-            settings_label.set_text(
-                f"Bot {len(snapshot.players) - 1}体・"
-                f"{snapshot.bot_difficulty}・{timer}"
-            )
+            if snapshot.mode.value == "solo_bot":
+                game_title.set_text("1人でBot戦")
+                settings_label.set_text(
+                    f"Bot {len(snapshot.players) - 1}体・"
+                    f"{snapshot.bot_difficulty}・{timer}"
+                )
+            else:
+                game_title.set_text("オンライン対戦")
+                settings_label.set_text(
+                    f"{len(snapshot.players)}人対戦・{timer}"
+                )
             status_names = {
                 RoomStatus.ACTIVE: "対局中",
                 RoomStatus.PAUSED: "中断中",
@@ -818,12 +1270,19 @@ def register_auth_pages(
                 snapshot.expected_kana or "自由"
             )
             current_seat = snapshot.players[snapshot.current_turn]
-            if current_seat.owner_user_id == user_id:
+            if current_seat.controller is SeatController.BOT:
+                bot_label = (
+                    "代行Bot"
+                    if current_seat.owner_user_id == user_id
+                    else f"Bot {current_seat.index + 1}"
+                )
+                turn_label.set_text(
+                    f"{bot_label} の番です"
+                )
+            elif current_seat.owner_user_id == user_id:
                 turn_label.set_text("あなたの番です")
             else:
-                turn_label.set_text(
-                    f"Bot {current_seat.index + 1} の番です"
-                )
+                turn_label.set_text("相手の番です")
             if snapshot.deadline_at is None:
                 deadline_label.set_text("残り時間: 無制限")
             else:
@@ -847,11 +1306,12 @@ def register_auth_pages(
                 for index, record in enumerate(
                     snapshot.history, start=1
                 ):
-                    actor = (
-                        f"Bot {record.seat_index + 1}"
-                        if record.by_bot
-                        else "あなた"
-                    )
+                    if record.by_bot:
+                        actor = f"Bot {record.seat_index + 1}"
+                    elif record.actor_user_id == user_id:
+                        actor = "あなた"
+                    else:
+                        actor = "相手"
                     with ui.row().classes(
                         "w-full items-center justify-between gap-3"
                     ):
@@ -889,14 +1349,18 @@ def register_auth_pages(
                 )
             else:
                 feedback_label.set_text(
-                    "Botの手を待っています。"
+                    (
+                        "Botの手を待っています。"
+                        if snapshot.mode.value == "solo_bot"
+                        else "相手の手を待っています。"
+                    )
                 )
 
         async def on_room_event(event: RoomEvent) -> None:
             if (
                 event.kind is not RoomEventKind.SNAPSHOT
                 or event.snapshot is None
-                or client.is_deleted()
+                or client.is_deleted
             ):
                 return
             try:
@@ -911,9 +1375,9 @@ def register_auth_pages(
                 return
             attaching = True
             try:
-                snapshot = await solo.connect(
-                    user_id,
+                snapshot = await rooms.connect_client(
                     game_id,
+                    user_id,
                     client.id,
                     on_room_event,
                 )
@@ -933,6 +1397,36 @@ def register_auth_pages(
                 render(snapshot)
             finally:
                 attaching = False
+
+        async def refresh_snapshot() -> None:
+            """Keep clients in sync even across multiple server workers."""
+
+            nonlocal polling
+            if polling or client.is_deleted:
+                return
+            polling = True
+            try:
+                snapshot = await rooms.load_snapshot(game_id)
+                if snapshot.role_for_user(user_id) is None:
+                    feedback_label.set_text(
+                        "この対局を開けません。"
+                    )
+                    word_input.disable()
+                    submit_button.disable()
+                    return
+                render(snapshot)
+            except RoomError:
+                feedback_label.set_text(
+                    "対局が終了しました。"
+                )
+                word_input.disable()
+                submit_button.disable()
+            except Exception:
+                LOGGER.exception(
+                    "failed to refresh game snapshot"
+                )
+            finally:
+                polling = False
 
         async def detach() -> None:
             try:
@@ -1061,7 +1555,7 @@ def register_auth_pages(
                     "w-full items-center justify-between gap-3"
                 ):
                     with ui.column():
-                        ui.label("1人でBot戦").classes("auth-title")
+                        game_title = ui.label("対局").classes("auth-title")
                         theme_label_element = ui.label(
                             "テーマ: 読み込み中"
                         ).classes("platform-muted")
@@ -1124,6 +1618,7 @@ def register_auth_pages(
         submit_button.disable()
         client.on_connect(attach)
         client.on_disconnect(detach)
+        ui.timer(1.0, refresh_snapshot)
 
     @ui.page("/saved-games")
     async def saved_games_page(request: Request):
