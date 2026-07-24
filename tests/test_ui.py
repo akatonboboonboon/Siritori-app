@@ -14,41 +14,48 @@ class UserInterfaceTests(unittest.IsolatedAsyncioTestCase):
         # between IsolatedAsyncioTestCase methods (notably on Python 3.13).
         Slot.stacks.clear()
 
-    async def test_valid_word_and_chain_error_are_shown(self) -> None:
+    async def test_free_first_word_and_reading_chain_are_shown(self) -> None:
         async with user_simulation() as user:
             register_pages()
             await user.open("/")
             await user.should_see("いまのことば")
-            await user.should_see("しりとり")
+            await user.should_see("最初のことばは自由です")
             await user.should_see("次のことば")
 
-            user.find("次のことば").type("すいか").trigger("keydown.enter")
-            await user.should_see("「り」から始まることばを入力してください。")
-            await user.should_see("しりとり")
+            user.find("次のことば").type("林檎").trigger("keydown.enter")
+            await user.should_see("「林檎」を受け付けました。")
+            await user.should_see("よみ: りんご")
 
-            user.find("次のことば").clear().type("りんご").trigger(
-                "keydown.enter"
-            )
-            await user.should_see("「りんご」をつなぎました。次は「ご」です。")
-            await user.should_see("りんご")
+            user.find("次のことば").type("すいか").trigger("keydown.enter")
+            await user.should_see("「ご」から始まる単語を入力してください。")
+            await user.should_see("林檎")
+
+    async def test_dictionary_errors_are_visible_without_advancing(self) -> None:
+        async with user_simulation() as user:
+            register_pages()
+            await user.open("/")
+
+            user.find("次のことば").type("あ").trigger("keydown.enter")
+            await user.should_see("ひらがな1文字だけの単語は使用できません。")
+            await user.should_see("最初のことばは自由です")
 
     async def test_game_over_can_be_reset(self) -> None:
         async with user_simulation() as user:
             register_pages()
             await user.open("/")
 
-            user.find("次のことば").type("りぼん").trigger("keydown.enter")
-            await user.should_see("「りぼん」は「ん」で終わるため、ゲーム終了です。")
+            user.find("次のことば").type("リボン").trigger("keydown.enter")
+            await user.should_see("「リボン」は「ん」で終わります。 ゲーム終了です。")
             await user.should_see("ゲーム終了")
 
             user.find("もう一度").click()
-            await user.should_see("最初のことばは「しりとり」。")
+            await user.should_see("先攻は、辞書にある好きなことばから始められます。")
             await user.should_see("プレイ中")
 
-            user.find("次のことば").type("りす").trigger("keydown.enter")
-            await user.should_see("「りす」をつなぎました。次は「す」です。")
+            user.find("次のことば").type("林檎").trigger("keydown.enter")
+            await user.should_see("「林檎」を受け付けました。")
 
-    async def test_duplicate_word_ends_the_game(self) -> None:
+    async def test_duplicate_reading_ends_the_game(self) -> None:
         async with user_simulation() as user:
             register_pages()
             await user.open("/")
@@ -56,7 +63,7 @@ class UserInterfaceTests(unittest.IsolatedAsyncioTestCase):
             for word in ("りす", "すり", "りす"):
                 user.find("次のことば").type(word).trigger("keydown.enter")
 
-            await user.should_see("「りす」はすでに使われています。ゲーム終了です。")
+            await user.should_see("「りす」と同じ読みは使用済みです。 ゲーム終了です。")
             await user.should_see("ゲーム終了")
 
 
