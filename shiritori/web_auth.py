@@ -575,6 +575,12 @@ def register_auth_pages(
             return RedirectResponse("/login?next=/lobby", status_code=303)
         _page_shell()
         logout_token = csrf.issue(principal.session_id)
+        theme_options = {"all": "すべて"}
+        if solo is not None:
+            theme_options = {
+                theme.theme_id: theme.label
+                for theme in solo.themes.themes
+            }
         with ui.element("main").classes("platform-shell"):
             with ui.column().classes("platform-wrap"):
                 with ui.element("header").classes("platform-header"):
@@ -606,10 +612,15 @@ def register_auth_pages(
                             "platform-link"
                         )
                     with ui.column().classes("dashboard-card"):
-                        ui.label("1人で練習").classes("aside-title")
-                        ui.link("辞書対応ゲームを開く", "/").classes(
-                            "platform-link"
-                        )
+                        ui.label("1人でBot戦").classes("aside-title")
+                        ui.label(
+                            "遊ぶ単語のテーマを選びます。"
+                        ).classes("platform-muted")
+                        theme_select = ui.select(
+                            options=theme_options,
+                            value="all",
+                            label="テーマ",
+                        ).props("outlined options-dense").classes("w-full")
 
     @ui.page("/saved-games")
     async def saved_games_page(request: Request):
