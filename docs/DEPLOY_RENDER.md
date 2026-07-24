@@ -26,8 +26,8 @@ python -m unittest discover -s tests -v
 python -m compileall -q .
 ```
 
-AI担当範囲は最終統合後の全227件の自動テストが成功しています。
-同じテストをDraft PRのGitHub Actionsでも再実行します。
+最終統合後の全240件の自動テストが成功しています。
+同じテストを各PRとmainのGitHub Actionsでも再実行します。
 
 ローカル起動:
 
