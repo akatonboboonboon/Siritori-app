@@ -1,180 +1,194 @@
 # しりとり
 
-Python と [NiceGUI](https://nicegui.io/) で作る、ブラウザで遊べるしりとりアプリです。
-jig.jp サマーインターンシップ2026 Webコースの選考課題仕様に沿って実装しています。
+Pythonと[NiceGUI](https://nicegui.io/)で作る、PC・スマートフォン対応のしりとりアプリです。
+[jig.jp サマーインターンシップ2026 Webコースの選考課題](https://jigintern.github.io/summer-2026-assignment/)
+を土台に、辞書判定、ログイン、オンライン部屋、観戦、Bot対戦のサーバー基盤を実装しています。
 
 ## 公開URL
 
-- Render: デプロイ完了後に、実在するURLをここへ追記します
+- Render: 未公開（デプロイ後に、本人が確認した実在URLだけを追記します）
 
-> Render の無料インスタンスは、しばらくアクセスがないと停止します。最初の表示に時間がかかる場合があります。
+RenderとNeonの無料枠を使う設計です。公開アカウントの作成と秘密情報の登録は、
+リポジトリ所有者が行います。
 
-## 遊び方
+## 現在できること
 
-1. 画面に表示されている「いまのことば」の最後のひらがなを確認します。
-2. そのひらがなから始まる、2文字以上のことばを入力します。
-3. Enter キーまたは「つなぐ」ボタンで送信します。
-4. 「ん」で終わることば、または一度使ったことばを入力するとゲーム終了です。
-5. ゲーム中も終了後も「もう一度」からリセットできます。
+### 画面から確認できる機能
 
-## 実装した機能
+- 最初の単語を自由に入力
+- SudachiDictによる実在する名詞の完全一致判定
+- 漢字・カタカナを辞書のひらがな読みに変換して接続判定
+- 絵文字、未知語、不正な文字、ひらがな・カタカナ1文字の拒否
+- 複数読みを自動決定せず、読み選択ダイアログを表示
+- 表記と読みを含む履歴
+- 「ん」と同じ読みの再使用によるゲーム終了
+- 新規登録、ログイン、ログアウト、一時停止したBot戦一覧の保護画面
+- PCと幅320px以上のスマートフォン向けレスポンシブ表示
 
-### 必須機能
+### テスト済みのサーバー基盤
 
-- 直前のことばを表示
-- 任意のことばを入力
-- 前のことばの末尾と、入力したことばの先頭が一致した場合だけ更新
-- 一致しない場合に、必要な先頭文字を含むエラーを表示
-- 「ん」で終わることばでゲーム終了
-- 使用済みのことばでゲーム終了
-- ゲーム中・終了後の両方で使えるリセット
+- Argon2idパスワードハッシュと、DBにSHA-256だけを保存する不透明セッション
+- HttpOnly / SameSite Cookie、CSRF署名、Origin検証
+- 正規化ユーザー名とIPの両方に対する、有効期限付き・上限付きの登録／ログイン回数制限
+- リクエスト本文の上限とArgon2id処理の同時実行数制限
+- PostgreSQL/SQLiteスキーマとAlembicマイグレーション
+- Neon PostgreSQLを正本にするユーザー、部屋、役割、対局、履歴のSQL永続化
+- ソロBot戦を対局と同じ厳密な`Game`スナップショットで保存・一時停止・再開
+- 部屋コード、定員、準備、所有者移譲、観戦、開始済み対局検索を扱うロビーAPI
+- 部屋単位ロック、状態バージョン、操作IDと意味的フィンガープリントによる再送対策
+- プレイヤー・観戦者権限、複数タブpresence、15秒の再接続猶予
+- 切断・プロセス再起動後の不在猶予、Bot引継ぎ、安全な手番境界での本人復帰
+- 人間が0人の対人部屋削除、Bot戦の一時停止・復元
+- 暗号学的に安全なランダム先攻、自由初手、3〜180秒または無制限
+- Normal / Hard Botと、辞書で検証してから構築する単語索引
+- 選択テーマを「表記＋読み」で照合するサーバー側テーマ制約
 
-### 追加機能
+オンライン部屋の画面、テーマデータ、Easy Bot、タイマーの最終UIは、応募者本人の
+実装領域として意図的に残しています。バックエンドAPIとテストを先に用意し、本人の
+コードを別PRで共有・レビューできる構成です。
 
-- ひらがな以外を受け付けない入力チェック
-- 1文字だけの入力を受け付けない入力チェック
-- ことばの履歴と、つないだ回数を表示
-- 「ゃ・ゅ・ょ・っ」などで終わった場合、通常の大きさのかなとして次の文字を判定
-- PCとスマートフォンの両方で使えるレスポンシブ表示
-- ブラウザごとに独立したゲーム状態（他のプレイヤーの操作と混ざらない）
+## ルール
 
-## 次の段階として実装中の機能
+採用ルールの正本は[`docs/RULES.md`](docs/RULES.md)です。主なルールは次のとおりです。
 
-採用ルール、PC・スマートフォンの画面別合格条件、Render＋Neonの無料構成を
-[`docs/RULES.md`](docs/RULES.md)、[`docs/ROADMAP.md`](docs/ROADMAP.md)、
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) に固定しました。
+1. ランダムに選ばれた先攻が、辞書にある好きな単語から開始する
+2. 2手目以降は、直前の単語の「読み」の末尾からつなぐ
+3. 小書きかなは通常サイズ、長音は直前の母音として扱う
+4. 末尾が「ん」なら、その単語を履歴に残して送信者の負け
+5. 同じ正規化読みを再使用したら、重複語を履歴へ足さず送信者の負け
+6. 読みが複数ある場合は、プレイヤーが明示的に選ぶ
 
-現在の開発ブランチには、SudachiDict coreの完全一致項目から普通名詞・固有名詞だけを調べ、
-漢字・カタカナの読み、複数の読み候補、表記違いの共通キーを返す辞書判定基盤があります。
-現行のゲーム画面はまだ従来のひらがな判定を使っており、画面への接続と読み選択UIは
-次の小さなPRで実装します。
+## 構成
 
-## デザイン
+```text
+NiceGUI / FastAPI
+├─ public game + authentication pages
+├─ LexiconValidator / GameSession
+├─ Lobby / RoomCoordinator / RoomHub / Bot strategies
+└─ SQLAlchemy repositories / Alembic
+             │
+             └─ Neon PostgreSQL（本番の正本）
+```
 
-入力すべき文字を迷わないように、現在のことばと次の先頭文字を画面の中心に大きく表示しています。
-成功・入力エラー・ゲーム終了は、色だけに頼らず記号と文章でも伝えます。
-
-配色、文言、最初のことばは [`shiritori/customize.py`](shiritori/customize.py)、
-見た目は [`assets/styles.css`](assets/styles.css) から変更できます。
-この2ファイルは、リポジトリ所有者が自分のデザインへ育てるための担当領域として分離しています。
+詳しい設計は[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、実装順と担当境界は
+[`docs/ROADMAP.md`](docs/ROADMAP.md)を参照してください。
 
 ## 使用技術
 
 - Python 3.13
 - NiceGUI 3.14.0
-- SudachiPy 0.6.11（辞書判定基盤）
-- SudachiDict core 20260428（固定した日本語辞書）
-- Python 標準ライブラリ `unittest`
-- Render Web Service
+- SudachiPy 0.6.11 / SudachiDict-core 20260428
+- SQLAlchemy 2.0.51 / Alembic 1.18.5
+- Argon2-cffi 25.1.0
+- Psycopg 3.3.4
+- Neon PostgreSQL / Render Web Service
+- Python標準ライブラリ`unittest`
 
-## ローカルでの実行方法
+依存関係のライセンスと出典は[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)に
+記録しています。
 
-Python 3.10 以上を用意し、リポジトリのルートで次を実行します。
+## ローカル実行
 
-```bash
-python -m venv .venv
+Python 3.13を用意し、リポジトリのルートで仮想環境を作ります。
+
+Windows PowerShell:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m scripts.start
 ```
 
 macOS / Linux:
 
 ```bash
+python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python main.py
+python -m scripts.start
 ```
 
-Windows PowerShell:
+`python -m scripts.start`は、Alembicを最新版へ上げてからNiceGUIを起動します。
+開発時は、Git対象外の`./siritori-dev.db`を自動的な接続先として使えます。起動後に
+<http://localhost:8080>を開いてください。
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python main.py
-```
-
-初回の依存関係インストールでは、SudachiDict core（約70MB）も取得するため時間がかかることがあります。
-
-起動後、<http://localhost:8080> を開きます。
+SudachiDict-coreの初回ダウンロードは約70MBあるため、インストールに時間がかかる場合があります。
 
 ## テスト
 
-ゲームルールは画面から分離しているため、ブラウザを起動せずにテストできます。
-
 ```bash
+python -m pip check
 python -m unittest discover -s tests -v
+python -m compileall -q .
 ```
 
-手動確認では、少なくとも次を試します。
+マイグレーションだけを確認する場合:
 
-- `しりとり → りんご → ごりら` と正しくつながる
-- `しりとり` に `すいか` を入力すると更新されずエラーになる
-- `しりとり` に `りぼん` を入力するとゲーム終了になる
-- 一度使ったことばを再入力するとゲーム終了になる
-- ゲーム中とゲーム終了後の両方でリセットできる
-- カタカナ、英数字、空入力、1文字入力が拒否される
+```powershell
+$env:DIRECT_DATABASE_URL = 'sqlite+pysqlite:///./migration-check.db'
+python -m alembic upgrade head
+python -m alembic check
+```
 
-## Renderへのデプロイ
+GitHub Actionsでも依存整合性、Alembic、構文、全テストをPython 3.13で確認します。
+AI担当範囲は、最終統合後の全227件の自動テストを通過しています。
+同じテストはDraft PRのGitHub Actionsでも再実行します。
 
-`render.yaml` を含めているため、Render の **Web Service** として GitHub リポジトリを接続できます。
-詳しい手順は [`docs/DEPLOY_RENDER.md`](docs/DEPLOY_RENDER.md) に記載します。
+## Render + Neonへの公開
 
-- Build Command: `pip install -r requirements.txt`
-- Start Command: `python main.py`
-- Health Check Path: `/healthz`
+リポジトリには`render.yaml`とマイグレーション起動処理を含めていますが、本番デプロイと
+Dashboard上の設定確認はまだ行っていません。Windows sandboxのACLエラーにより、
+Codexからの実ブラウザ表示確認も未実施です。秘密情報は受領・記録していません。
+必要な値は次の4つです。
 
-## 共同開発
+| 環境変数 | 値 |
+|---|---|
+| `DATABASE_URL` | Neonのpooled connection string |
+| `DIRECT_DATABASE_URL` | Neonのdirect connection string |
+| `NICEGUI_STORAGE_SECRET` | 32文字以上のランダム値 |
+| `SESSION_SECRET` | 上とは別の32文字以上のランダム値 |
 
-このリポジトリは、ユーザーとAIの担当範囲が分かるように短いブランチとDraft PRで作業します。
-同じファイルを同時に編集しないためのルールは [`CONTRIBUTING.md`](CONTRIBUTING.md)、
-AIの利用履歴は [`AI_USAGE.md`](AI_USAGE.md) を参照してください。
-辞書依存関係の出典とライセンスは [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) に記録しています。
+`render.yaml`の起動コマンドは`python -m scripts.start`、ヘルスチェックはDB接続も確認する
+`/readyz`です。実際のNeon/Render設定手順と公開後チェックは
+[`docs/DEPLOY_RENDER.md`](docs/DEPLOY_RENDER.md)を参照してください。
 
-### リポジトリ所有者が次に担当する部分
+## 応募者本人が仕上げる部分
 
-- `shiritori/customize.py` のタイトル、説明、最初のことば
-- `assets/styles.css` の配色・余白・文字サイズなどのデザイン
-- 自分で考えた追加機能を最低1つ
-- スマートフォン幅を含む手動テスト
-- このREADMEの「デザイン」「工夫した点」「学んだこと」を自分の言葉で更新
-- 公開後のURLとスクリーンショット
+AIが安全性・同時実行制御の基盤を担当し、次は応募者本人が実装・判断します。
+
+- ロビー、部屋カード、対戦・観戦画面、履歴行の見た目
+- テーマ分類データの選定、追加、誤分類の修正
+- `BotStrategy`を使ったEasy Botの候補選択
+- テーマ、Bot数、難易度、制限時間の設定UIとタイマー警告表示
+- PC・実スマートフォンでの操作確認と、本人のデザイン調整
+- NeonとRenderの設定確認、秘密情報登録、公開URLでの2ブラウザ対戦
+- READMEの「工夫した点」「学んだこと」「AIを使わず実装した範囲」
+
+共同作業手順は[`CONTRIBUTING.md`](CONTRIBUTING.md)、AIが実装した範囲は
+[`AI_USAGE.md`](AI_USAGE.md)に記録します。本人の変更は`user/...`ブランチの小さな
+Draft PRにすると、双方の変更をGitHub上で共有できます。
 
 ## AIの活用方法
 
-初期基盤の作成に OpenAI Codex を使用しました。今回AIを利用した範囲は次のとおりです。
-
-- 課題ページから必須仕様とREADME要件を整理
-- NiceGUIの画面構成、ゲーム状態の分離、Render向け起動設定を提案・実装
-- Unicode正規化、小書きかな、重複、「ん」終了を扱うゲームロジックを実装
-- 自動テストの初期ケースを作成
-- 共同作業用のファイル分割とドキュメントを作成
-- 採用ルール、段階的ロードマップ、Render＋Neonの無料構成を文書化
-- SudachiDictを用いる辞書判定基盤と境界テストを実装
-
-AIが生成した内容は、そのまま提出せず、コードを読み、手動テストと自動テストを行い、
-採用・修正した内容を [`AI_USAGE.md`](AI_USAGE.md) に追記します。
+OpenAI Codexを、仕様整理、辞書・状態機械、認証、DB、同時実行制御、テスト、
+Render設定の下書きと検証に使用しました。AIが生成したコードをそのまま本人実装とせず、
+PR、`AI_USAGE.md`、本人のレビュー・手動確認によって区別します。
 
 ### AIを使わず自分で実装・判断した部分
 
-共同作業を始めるための欄です。実際に自分で行った内容だけを、作業後に追記してください。
+ここには、実際に本人が作業した内容だけを後から追記します。
 
-- （これから追記）
+- （本人の作業後に追記）
 
-## 参考にしたWebサイト
+## 参考資料
 
 - [jig.jp サマーインターンシップ2026 選考課題](https://jigintern.github.io/summer-2026-assignment/)
-  - 必須仕様、追加機能数、提出READMEの要件を確認
 - [NiceGUI Documentation](https://nicegui.io/documentation/)
-  - UI部品、ページ、`ui.run` の設定を確認
-- [NiceGUI: ui.run](https://nicegui.io/documentation/run)
-  - ホスト、ポート、本番起動オプションを確認
-- [Render: Web Services](https://render.com/docs/web-services)
-  - `0.0.0.0` と環境変数 `PORT` へのバインドを確認
-- [Render: Blueprint YAML Reference](https://render.com/docs/blueprint-spec)
-  - `render.yaml` のサービス設定を確認
-- [Render: Setting Your Python Version](https://render.com/docs/python-version)
-  - `.python-version` によるPythonバージョン指定を確認
 - [SudachiPy 0.6.11](https://pypi.org/project/SudachiPy/0.6.11/)
-  - 完全一致辞書検索、対応Python、配布サイズ、ライセンスを確認
 - [SudachiDict](https://github.com/WorksApplications/SudachiDict)
-  - core辞書の由来とライセンス情報を確認
+- [SQLAlchemy Documentation](https://docs.sqlalchemy.org/en/20/)
+- [Alembic Documentation](https://alembic.sqlalchemy.org/en/latest/)
+- [Render: Deploy for Free](https://render.com/docs/free)
+- [Render: WebSockets](https://render.com/docs/websocket)
 - [Neon: Connection pooling](https://neon.com/docs/connect/connection-pooling)
-  - 無料PostgreSQLの実行時接続設計を確認

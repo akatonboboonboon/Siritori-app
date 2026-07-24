@@ -27,26 +27,30 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 | 2026-07-24 | OpenAI Codex | プロジェクト基盤 | `main.py`、`shiritori/`、`assets/styles.css`、Render設定、README、自動テストを実装した | 完了 | Codexが13件のルールテストと3件のNiceGUI操作シミュレーションを実行済み。応募者本人によるコードレビューと実ブラウザ確認は未実施 | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 | 2026-07-24 | OpenAI Codex | 共同開発文書 | `CONTRIBUTING.md` と本ファイルを作成し、ブランチ、Draft PR、担当宣言、秘密情報、AI記録の運用を文書化した | 完了 | 応募者本人が運用内容を読み、自分の作業方法に合うか確認する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 | 2026-07-24 | OpenAI Codex | ルール・ロードマップ | 応募者本人が決めた単語規則、Neon採用、PC・スマートフォン対応を、画面別の合格条件と段階的PRへ整理して `docs/RULES.md` と `docs/ROADMAP.md` に記録した | 完了（本人レビュー待ち） | 応募者本人が一文字、同音語、Bot、切断時の規則と、自分が実装する担当範囲を最終確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
-| 2026-07-24 | OpenAI Codex | 無料構成 | Render Free＋Neon Free PostgreSQL、DBを正本にするRoomHub、認証、再接続、環境変数を `docs/ARCHITECTURE.md` に設計した | 完了（設計のみ） | 実装前に応募者本人がNeonプロジェクトを作り、無料枠の最新条件を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
-| 2026-07-24 | OpenAI Codex | 実在語判定 | `shiritori/lexicon.py`、固定版Sudachi依存、`tests/test_lexicon.py`、第三者ソフトウェア表記を作成した。完全一致の名詞、漢字読み、複数読み、一文字、絵文字、未知語を検証する | 基盤完了・画面接続は未実装 | 実データ15件を含むテストはCodexが実行済み。応募者本人はコードと辞書判定例を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
+| 2026-07-24 | OpenAI Codex | 無料構成 | Render Free＋Neon PostgreSQL、DBを正本にするRoomHub、認証、再接続、環境変数を設計し、SQLリポジトリと起動処理へ反映した | AI担当基盤完了 | 応募者本人が無料枠の最新条件、Dashboard設定、実デプロイを確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | 実在語判定 | `shiritori/lexicon.py`、固定版Sudachi依存、辞書テスト、第三者ソフトウェア表記を作成した。完全一致の名詞、漢字読み、複数読み、一文字、絵文字、未知語を検証する | 完了・ゲーム状態と公開画面へ接続済み | 応募者本人はコード、辞書判定例、読み選択操作を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | 認証・永続化 | Argon2id、不透明セッション、CSRF／Origin検証、正規化ユーザー名＋IPの登録・ログイン制限、本文サイズ制限、Argon2同時実行制限、AlembicとNeon向けSQLリポジトリを実装した | AI担当完了・最終統合中 | 応募者本人が登録・ログイン・ログアウト、再起動後の保持、エラー文を確認する | 最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | ロビー・オンライン対局 | 部屋作成、準備、所有者移譲、観戦、開始済み対局検索、権限、複数タブpresence、切断と再起動後の猶予、Bot引継ぎ・本人復帰を実装した。操作IDは意味的フィンガープリントと組み合わせ、別操作への再利用を拒否する | AI担当完了・最終統合中 | 応募者本人が最終UIを実装し、2ブラウザ以上で競合・切断を確認する | 最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | ソロBot戦・テーマ | ソロ戦を対局と同じ厳密な`Game`スナップショットで保存・一時停止・再開し、Normal／Hard Botとサーバー側テーマ制約を実装した | AI担当完了・最終統合中 | 応募者本人がEasy Bot、テーマ分類データ、設定画面、タイマー表示を実装・確認する | 最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | Render準備・検証 | `render.yaml`、起動時Alembic、health/readiness、公開手順を整備した。公式仕様は確認したが、本番デプロイとDashboard表示は確認していない | 準備完了・本番未確認 | Windows sandboxのACLエラーで実ブラウザ確認ができなかったため、応募者本人がDashboardと公開URLを確認する。秘密情報はCodexへ渡さず記録しない | 最終Draft PRへ追記予定 |
 
 ### 完了した確認
 
-- しりとり必須6機能と追加機能を実装
-- 13件のルール単体テストと3件のNiceGUI操作シミュレーションが成功
-- SudachiDict core 20260428の実データを使う辞書判定テスト15件が成功
-- 既存テストを含む全31件とPython構文確認が成功
-- ローカルサーバーのトップページと `/healthz` がHTTP 200を返すことを確認
-- Render用 `PORT` / `0.0.0.0` / Blueprint設定を公式資料と照合
+- 自由初手、辞書判定、ひらがな読み、複数読み選択、表記＋読み履歴をゲーム状態と公開NiceGUI画面へ接続
+- 認証、SQL永続化、ロビー、部屋、観戦、Bot引継ぎ、ソロ戦保存、サーバー側テーマ制約の自動テストを追加
+- 同じ操作IDの安全な再送と、内容が異なる操作ID再利用の拒否をテスト
+- AI担当範囲は最終統合後の全227件の自動テストが成功。Draft PRのGitHub Actionsでも再実行する
+- Render用の`PORT`、`0.0.0.0`、Blueprint、WebSocket、health/readiness設定を公式資料と照合
+- リポジトリと文書へ接続文字列、パスワード、セッション秘密値を記録していない
 
 ### 現時点で完了していないこと
 
-- 辞書判定を既存のゲーム状態とNiceGUI画面へ接続する作業
-- 複数読みを選ぶレスポンシブ画面の実装
-- Render へのデプロイ
-- 公開URLでの動作確認
-- Windowsのブラウザ接続機能が権限エラーになったため、実ブラウザでの見た目とスクリーンショット確認
-- 応募者本人によるコードレビュー、デザイン変更、追加機能、READMEの最終記載
+- ロビー、部屋、対戦・観戦、設定の最終NiceGUI画面
+- テーマ分類データ、Easy Bot、タイマー警告表示
+- PCと実スマートフォンでの最終操作・レイアウト確認
+- Renderへの本番デプロイ、Dashboard設定、公開URLでの動作確認
+- Windows sandboxのACLエラーで実行できなかった実ブラウザの見た目とスクリーンショット確認
+- 応募者本人によるコードレビュー、本人担当機能、READMEの工夫・学び・振り返り
 
 これらは実際に完了した時点で、関連PR、変更ファイル、確認結果とともに更新します。
 
