@@ -121,6 +121,7 @@ class RoomSnapshot:
     theme_key: str = "all"
     bot_difficulty: str = "normal"
     spectators: tuple[str, ...] = ()
+    eliminated_seats: tuple[int, ...] = ()
     history: tuple[TurnRecord, ...] = ()
     expected_kana: str | None = None
     turn_seconds: int | None = None
@@ -179,10 +180,48 @@ class RoomSnapshot:
             raise ValueError("one user cannot own multiple seats")
         if set(owners).intersection(self.spectators):
             raise ValueError("a player cannot also be a spectator")
+        if (
+            len(self.eliminated_seats) != len(set(self.eliminated_seats))
+            or any(
+                type(index) is not int
+                or not 0 <= index < len(self.players)
+                for index in self.eliminated_seats
+            )
+        ):
+            raise ValueError("eliminated seat indexes must be unique and valid")
+        active_seat_count = len(self.players) - len(self.eliminated_seats)
+        if (
+            self.status in {RoomStatus.ACTIVE, RoomStatus.PAUSED}
+            and self.current_turn in self.eliminated_seats
+        ):
+            raise ValueError("an eliminated seat cannot hold the current turn")
+        if (
+            self.status in {RoomStatus.ACTIVE, RoomStatus.PAUSED}
+            and active_seat_count < 2
+        ):
+            raise ValueError(
+                "an active or paused room needs at least two active seats"
+            )
+        if (
+            self.status is RoomStatus.FINISHED
+            and self.eliminated_seats
+            and active_seat_count != 1
+        ):
+            raise ValueError(
+                "a finished elimination room must have exactly one survivor"
+            )
 
     @property
     def used_canonical_keys(self) -> frozenset[str]:
         return frozenset(turn.canonical_key for turn in self.history)
+
+    @property
+    def active_seat_indexes(self) -> tuple[int, ...]:
+        eliminated = frozenset(self.eliminated_seats)
+        return tuple(
+            seat.index for seat in self.players
+            if seat.index not in eliminated
+        )
 
     def seat_for_user(self, user_id: str) -> PlayerSeat | None:
         return next(
@@ -195,7 +234,10 @@ class RoomSnapshot:
         )
 
     def role_for_user(self, user_id: str) -> Role | None:
-        if self.seat_for_user(user_id) is not None:
+        seat = self.seat_for_user(user_id)
+        if seat is not None and seat.index in self.eliminated_seats:
+            return Role.SPECTATOR
+        if seat is not None:
             return Role.PLAYER
         if user_id in self.spectators:
             return Role.SPECTATOR
@@ -1061,14 +1103,12 @@ class RoomCoordinator:
             ):
                 raise TurnDeadlineNotReached("turn deadline is not due")
 
-            next_snapshot = replace(
+            next_snapshot = self._eliminate_current_seat(
                 snapshot,
-                status=RoomStatus.FINISHED,
-                deadline_at=None,
-                timed_out_seat=snapshot.current_turn,
-                losing_seat=snapshot.current_turn,
-                end_reason="timeout",
-                state_version=snapshot.state_version + 1,
+                reason="timeout",
+                now=current_time,
+                expected_kana=snapshot.expected_kana,
+                timed_out=True,
             )
             outcome = await self._store_snapshot(
                 snapshot,
@@ -1126,13 +1166,11 @@ class RoomCoordinator:
                 raise RoomAuthorizationError(
                     "only the current Bot seat can have no legal move"
                 )
-            next_snapshot = replace(
+            next_snapshot = self._eliminate_current_seat(
                 snapshot,
-                status=RoomStatus.FINISHED,
-                deadline_at=None,
-                losing_seat=seat.index,
-                end_reason="no_legal_move",
-                state_version=snapshot.state_version + 1,
+                reason="no_legal_move",
+                now=current_time,
+                expected_kana=snapshot.expected_kana,
             )
             outcome = await self._store_snapshot(
                 snapshot,
@@ -1223,16 +1261,13 @@ class RoomCoordinator:
             next_players = self._complete_pending_handbacks(snapshot.players)
             if canonical_key in snapshot.used_canonical_keys:
                 # Repeating a normalized reading is a losing move. It ends the
-                # match but is deliberately not appended to accepted history.
-                next_snapshot = replace(
+                # player's run but is deliberately not appended to history.
+                next_snapshot = self._eliminate_current_seat(
                     snapshot,
-                    status=RoomStatus.FINISHED,
                     players=next_players,
-                    expected_kana=None,
-                    deadline_at=None,
-                    losing_seat=seat.index,
-                    end_reason="duplicate",
-                    state_version=snapshot.state_version + 1,
+                    reason="duplicate",
+                    now=current_time,
+                    expected_kana=snapshot.expected_kana,
                 )
             else:
                 last_kana = final_kana(reading)
@@ -1246,21 +1281,21 @@ class RoomCoordinator:
                     submitted_at=current_time,
                 )
                 if last_kana == "ん":
-                    next_snapshot = replace(
+                    next_snapshot = self._eliminate_current_seat(
                         snapshot,
-                        status=RoomStatus.FINISHED,
                         players=next_players,
                         history=(*snapshot.history, record),
+                        reason="ends_with_n",
+                        now=current_time,
+                        # A word ending in ん cannot continue the chain, so the
+                        # next surviving player receives a free opening.
                         expected_kana=None,
-                        deadline_at=None,
-                        losing_seat=seat.index,
-                        end_reason="ends_with_n",
-                        state_version=snapshot.state_version + 1,
                     )
                 else:
-                    next_turn = (
-                        snapshot.current_turn + 1
-                    ) % len(snapshot.players)
+                    next_turn = self._next_active_turn(
+                        snapshot,
+                        after=snapshot.current_turn,
+                    )
                     deadline = (
                         current_time + timedelta(seconds=snapshot.turn_seconds)
                         if snapshot.turn_seconds is not None
@@ -1284,6 +1319,64 @@ class RoomCoordinator:
 
         await self._publish_outcome(room_id, outcome)
         return outcome
+
+    @staticmethod
+    def _next_active_turn(
+        snapshot: RoomSnapshot,
+        *,
+        after: int,
+        eliminated_seats: tuple[int, ...] | None = None,
+    ) -> int:
+        eliminated = frozenset(
+            snapshot.eliminated_seats
+            if eliminated_seats is None
+            else eliminated_seats
+        )
+        for offset in range(1, len(snapshot.players) + 1):
+            candidate = (after + offset) % len(snapshot.players)
+            if candidate not in eliminated:
+                return candidate
+        raise ValueError("a room must retain at least one active seat")
+
+    def _eliminate_current_seat(
+        self,
+        snapshot: RoomSnapshot,
+        *,
+        reason: str,
+        now: datetime,
+        expected_kana: str | None,
+        players: tuple[PlayerSeat, ...] | None = None,
+        history: tuple[TurnRecord, ...] | None = None,
+        timed_out: bool = False,
+    ) -> RoomSnapshot:
+        losing_seat = snapshot.current_turn
+        eliminated = (*snapshot.eliminated_seats, losing_seat)
+        next_turn = self._next_active_turn(
+            snapshot,
+            after=losing_seat,
+            eliminated_seats=eliminated,
+        )
+        remaining = len(snapshot.players) - len(eliminated)
+        finished = remaining == 1
+        deadline = (
+            now + timedelta(seconds=snapshot.turn_seconds)
+            if not finished and snapshot.turn_seconds is not None
+            else None
+        )
+        return replace(
+            snapshot,
+            status=RoomStatus.FINISHED if finished else RoomStatus.ACTIVE,
+            players=snapshot.players if players is None else players,
+            current_turn=next_turn,
+            eliminated_seats=eliminated,
+            history=snapshot.history if history is None else history,
+            expected_kana=None if finished else expected_kana,
+            deadline_at=deadline,
+            timed_out_seat=losing_seat if timed_out else None,
+            losing_seat=losing_seat,
+            end_reason=reason,
+            state_version=snapshot.state_version + 1,
+        )
 
     async def _disconnect_after_grace(
         self, room_id: str, user_id: str

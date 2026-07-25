@@ -44,7 +44,9 @@ from .rooms import (
 )
 
 
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
+_LEGACY_SNAPSHOT_SCHEMA_VERSION = 2
+_SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({2, 3})
 _SQLITE_LOCKS_GUARD = Lock()
 _SQLITE_LOCKS: dict[str, RLock] = {}
 _SCHEMA_KEY = "room_repository_schema"
@@ -52,10 +54,11 @@ _ROOT_KEYS = {_SCHEMA_KEY, "deleted", "snapshot"}
 _SNAPSHOT_KEYS = {
     "room_id", "mode", "status", "players", "current_turn",
     "state_version", "theme_key", "bot_difficulty", "spectators",
-    "history", "expected_kana",
+    "eliminated_seats", "history", "expected_kana",
     "turn_seconds", "deadline_at", "paused_remaining_seconds",
     "timed_out_seat", "losing_seat", "end_reason",
 }
+_LEGACY_SNAPSHOT_KEYS = _SNAPSHOT_KEYS - {"eliminated_seats"}
 _PLAYER_KEYS = {"index", "owner_user_id", "controller", "handback_pending"}
 _TURN_KEYS = {
     "surface", "reading", "canonical_key", "seat_index", "actor_user_id",
@@ -101,6 +104,7 @@ def serialize_room_snapshot(snapshot: RoomSnapshot) -> dict[str, Any]:
         "theme_key": snapshot.theme_key,
         "bot_difficulty": snapshot.bot_difficulty,
         "spectators": list(snapshot.spectators),
+        "eliminated_seats": list(snapshot.eliminated_seats),
         "history": [
             {
                 "surface": turn.surface,
@@ -135,12 +139,23 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
 
     root = _mapping(document, "snapshot document")
     _exact_keys(root, _ROOT_KEYS, "snapshot document")
-    if _integer(root[_SCHEMA_KEY], _SCHEMA_KEY) != SNAPSHOT_SCHEMA_VERSION:
+    schema_version = _integer(root[_SCHEMA_KEY], _SCHEMA_KEY)
+    if schema_version not in _SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS:
         raise RoomSnapshotCorruptError("unsupported room snapshot schema")
     if _boolean(root["deleted"], "deleted"):
         raise RoomSnapshotCorruptError("room snapshot is marked deleted")
     payload = _mapping(root["snapshot"], "snapshot")
-    _exact_keys(payload, _SNAPSHOT_KEYS, "snapshot")
+    if schema_version == _LEGACY_SNAPSHOT_SCHEMA_VERSION:
+        _exact_keys(payload, _LEGACY_SNAPSHOT_KEYS, "snapshot")
+        eliminated_seats: tuple[int, ...] = ()
+    else:
+        _exact_keys(payload, _SNAPSHOT_KEYS, "snapshot")
+        eliminated_seats = tuple(
+            _integer(value, f"eliminated_seats[{index}]")
+            for index, value in enumerate(
+                _array(payload["eliminated_seats"], "eliminated_seats")
+            )
+        )
 
     players = []
     for index, raw in enumerate(_array(payload["players"], "players")):
@@ -197,6 +212,7 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
                 payload["bot_difficulty"], "bot_difficulty"
             ),
             spectators=spectators,
+            eliminated_seats=eliminated_seats,
             history=tuple(history),
             expected_kana=_nullable_string(payload["expected_kana"], "expected_kana"),
             turn_seconds=_nullable_integer(payload["turn_seconds"], "turn_seconds"),
@@ -848,13 +864,19 @@ def _stored_status(status: RoomStatus) -> str:
 
 
 def _winner(snapshot: RoomSnapshot) -> str | None:
-    if (
-        snapshot.status is not RoomStatus.FINISHED
-        or snapshot.losing_seat is None
-        or len(snapshot.players) != 2
-    ):
+    if snapshot.status is not RoomStatus.FINISHED:
         return None
-    return snapshot.players[1 - snapshot.losing_seat].owner_user_id
+    active = tuple(
+        seat
+        for seat in snapshot.players
+        if seat.index not in snapshot.eliminated_seats
+    )
+    if len(active) == 1:
+        return active[0].owner_user_id
+    # Backward compatibility for finished two-player schema-v2 snapshots.
+    if snapshot.losing_seat is not None and len(snapshot.players) == 2:
+        return snapshot.players[1 - snapshot.losing_seat].owner_user_id
+    return None
 
 
 def _snapshot_from_game(game: Game) -> RoomSnapshot:
@@ -964,7 +986,7 @@ def _version(value: int) -> None:
 def _repository_document(value: object) -> bool:
     return (
         isinstance(value, dict)
-        and value.get(_SCHEMA_KEY) == SNAPSHOT_SCHEMA_VERSION
+        and value.get(_SCHEMA_KEY) in _SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS
         and isinstance(value.get("deleted"), bool)
     )
 

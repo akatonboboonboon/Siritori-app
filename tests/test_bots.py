@@ -116,6 +116,47 @@ class HardBotTests(unittest.TestCase):
 
         self.assertEqual(selected, ringo)
 
+    def test_prioritizes_forced_win_over_mobile_continuation(self) -> None:
+        forced_win = word("朝", "あさ", rank=99)
+        mobile = word("赤", "あか", rank=1)
+        index = WordIndex(
+            [
+                forced_win,
+                mobile,
+                word("柿", "かき", rank=1),
+                word("狐", "きつね", rank=1),
+            ]
+        )
+
+        self.assertEqual(index.reply_count(forced_win, frozenset()), 0)
+        self.assertEqual(index.reply_count(mobile, frozenset()), 1)
+
+        selected = HardBot(seed=9).choose(BotContext("あ"), index)
+
+        self.assertEqual(selected, forced_win)
+
+    def test_avoids_two_ply_trap_despite_more_immediate_replies(self) -> None:
+        trapped = word("赤", "あか", rank=1)
+        resilient = word("朝", "あさ", rank=99)
+        index = WordIndex(
+            [
+                trapped,
+                resilient,
+                word("柿", "かき", rank=1),
+                word("酒", "さけ", rank=1),
+                word("刺身", "さしみ", rank=2),
+                word("煙", "けむり", rank=1),
+                word("水", "みず", rank=1),
+            ]
+        )
+
+        self.assertEqual(index.reply_count(trapped, frozenset()), 1)
+        self.assertEqual(index.reply_count(resilient, frozenset()), 2)
+
+        selected = HardBot(seed=9).choose(BotContext("あ"), index)
+
+        self.assertEqual(selected, resilient)
+
     def test_reply_count_excludes_used_keys_and_candidate_itself(self) -> None:
         risu = word("リス", "りす", rank=1)
         ringo = word("林檎", "りんご", rank=10)
