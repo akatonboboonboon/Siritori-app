@@ -232,7 +232,7 @@ class NormalBot(_SeededStrategy):
 
 
 class HardBot(_SeededStrategy):
-    """Choose the move that leaves the opponent the fewest safe replies."""
+    """Look two turns ahead and avoid replies that can immediately trap the bot."""
 
     def choose(self, context: BotContext, words: WordIndex) -> WordOption | None:
         legal = words.legal_options(
@@ -242,11 +242,54 @@ class HardBot(_SeededStrategy):
         if not legal:
             return None
         candidates = self._safe_or_all(legal)
-        return min(
-            candidates,
-            key=lambda option: (
-                words.reply_count(option, context.used_canonical_keys),
+
+        # If every legal word ends with ``ん``, the game is already lost.
+        # Keep the fallback deterministic instead of evaluating an irrelevant
+        # continuation after the terminal move.
+        if all(option.ends_with_n for option in candidates):
+            return min(
+                candidates,
+                key=lambda option: (
+                    option.rank,
+                    self._tie_break(option, context),
+                ),
+            )
+
+        def lookahead_score(option: WordOption) -> tuple[object, ...]:
+            unavailable = set(context.used_canonical_keys)
+            unavailable.add(option.canonical_key)
+            opponent_replies = words.legal_options(
+                option.last_kana,
+                unavailable,
+                avoid_n=True,
+            )
+
+            # No safe reply means the opponent is forced to lose.
+            if not opponent_replies:
+                return (
+                    0,
+                    0,
+                    0,
+                    option.rank,
+                    self._tie_break(option, context),
+                )
+
+            # Assume that the opponent chooses the reply that leaves this bot
+            # the fewest safe counters. Maximising that worst case prevents
+            # the old Hard bot from walking into an obvious two-ply trap.
+            worst_counter_count = min(
+                words.reply_count(reply, unavailable)
+                for reply in opponent_replies
+            )
+            return (
+                1,
+                -worst_counter_count,
+                len(opponent_replies),
                 option.rank,
                 self._tie_break(option, context),
-            ),
+            )
+
+        return min(
+            candidates,
+            key=lookahead_score,
         )

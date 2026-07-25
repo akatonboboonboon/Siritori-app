@@ -38,6 +38,7 @@ from .models import RoomRole, RoomStatus as StoredRoomStatus
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
     LexiconRoomService,
+    Role,
     RoomCoordinator,
     RoomError,
     RoomEvent,
@@ -1266,6 +1267,13 @@ def register_auth_pages(
                 RoomStatus.FINISHED: "終了",
             }
             status_label.set_text(status_names[snapshot.status])
+            if (
+                snapshot.status is RoomStatus.ACTIVE
+                and snapshot.eliminated_seats
+            ):
+                status_label.set_text(
+                    f"対局中・残り{len(snapshot.active_seat_indexes)}人"
+                )
             expected_label.set_text(
                 snapshot.expected_kana or "自由"
             )
@@ -1343,9 +1351,32 @@ def register_auth_pages(
                         "対局が終了しました。",
                     )
                 )
+                winner_indexes = snapshot.active_seat_indexes
+                if len(winner_indexes) == 1:
+                    winner_index = winner_indexes[0]
+                    own_seat = snapshot.seat_for_user(user_id)
+                    feedback_label.set_text(
+                        "あなたの勝ちです！"
+                        if (
+                            own_seat is not None
+                            and own_seat.index == winner_index
+                        )
+                        else f"プレイヤー{winner_index + 1}の勝ちです。"
+                    )
+            elif (
+                snapshot.role_for_user(user_id) is Role.SPECTATOR
+                and snapshot.seat_for_user(user_id) is not None
+            ):
+                feedback_label.set_text("脱落しました。観戦中です。")
             elif allowed:
                 feedback_label.set_text(
                     "辞書にある単語を入力してください。"
+                )
+            elif snapshot.eliminated_seats:
+                latest = snapshot.eliminated_seats[-1]
+                feedback_label.set_text(
+                    f"プレイヤー{latest + 1}が脱落しました。"
+                    f"残り{len(snapshot.active_seat_indexes)}人です。"
                 )
             else:
                 feedback_label.set_text(
