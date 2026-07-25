@@ -21,6 +21,23 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(SettingsError):
             Settings.from_environment({"APP_ENV": "production"})
 
+    def test_render_is_production_even_without_app_env(self) -> None:
+        with self.assertRaises(SettingsError):
+            Settings.from_environment({"RENDER": "true"})
+
+        settings = Settings.from_environment(
+            {
+                "RENDER": "true",
+                "DATABASE_URL": "postgresql://pooled",
+                "DIRECT_DATABASE_URL": "postgresql://direct",
+                "NICEGUI_STORAGE_SECRET": STORAGE_SECRET,
+                "SESSION_SECRET": SESSION_SECRET,
+            }
+        )
+
+        self.assertEqual(settings.app_env, "production")
+        self.assertTrue(settings.cookie_secure)
+
     def test_production_requires_distinct_long_secrets(self) -> None:
         base = {
             "APP_ENV": "production",
