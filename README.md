@@ -6,7 +6,7 @@ Pythonと[NiceGUI](https://nicegui.io/)で作る、PC・スマートフォン対
 
 ## 公開URL
 
-- Render: https://siritori-app-4myd.onrender.com
+- Render: https://siritori-app-4myd.onrender.com/
 
 RenderとNeonの無料枠を使う設計です。公開アカウントの作成と秘密情報の登録は、
 リポジトリ所有者が行います。
