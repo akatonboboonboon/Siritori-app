@@ -64,7 +64,16 @@ class Settings:
         cls, environ: Mapping[str, str] | None = None
     ) -> "Settings":
         values = os.environ if environ is None else environ
-        app_env = values.get("APP_ENV", "development").strip().lower()
+        configured_app_env = (
+            values.get("APP_ENV", "development").strip().lower()
+        )
+        # Render services created manually do not consume render.yaml, but
+        # Render always exposes RENDER=true. Treat that signal as production
+        # so an ephemeral SQLite database can never silently hold accounts.
+        running_on_render = (
+            values.get("RENDER", "").strip().lower() == "true"
+        )
+        app_env = "production" if running_on_render else configured_app_env
         if app_env not in {"development", "test", "production"}:
             raise SettingsError(
                 "APP_ENV must be development, test, or production"
