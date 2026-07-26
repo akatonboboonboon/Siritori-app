@@ -5,6 +5,7 @@ import unittest
 from shiritori.bots import (
     BotContext,
     BotStrategy,
+    EasyBot,
     HardBot,
     NormalBot,
     WordIndex,
@@ -57,6 +58,31 @@ class WordIndexTests(unittest.TestCase):
                 return options[0] if options else None
 
         self.assertIsInstance(FirstLegal(), BotStrategy)
+
+
+class EasyBotTests(unittest.TestCase):
+    def test_choice_is_deterministic_and_ignores_rank(self) -> None:
+        index = WordIndex(
+            [
+                word("林檎", "りんご", rank=1),
+                word("リス", "りす", rank=999),
+                word("リボン", "りぼん", rank=2),
+            ]
+        )
+        context = BotContext("り")
+
+        first = EasyBot(seed=123).choose(context, index)
+        second = EasyBot(seed=123).choose(context, index)
+
+        self.assertEqual(first, second)
+        self.assertIn(first, index.starting_with("り"))
+
+    def test_returns_none_without_a_legal_option(self) -> None:
+        selected = EasyBot().choose(
+            BotContext("り", frozenset({"りす"})),
+            WordIndex([word("リス", "りす", rank=1)]),
+        )
+        self.assertIsNone(selected)
 
 
 class NormalBotTests(unittest.TestCase):
@@ -189,6 +215,23 @@ class HardBotTests(unittest.TestCase):
             WordIndex([looping]).reply_count(looping, frozenset()),
             0,
         )
+
+    def test_preindexed_safe_counts_match_legal_options(self) -> None:
+        options = [
+            word("林檎", "りんご", rank=1),
+            word("リス", "りす", rank=2),
+            word("リボン", "りぼん", rank=3),
+            word("ゴマ", "ごま", rank=4),
+        ]
+        index = WordIndex(options)
+        used = frozenset({"りす"})
+        counts = index.available_safe_counts(used)
+
+        for kana in ("り", "ご"):
+            expected = len(
+                index.legal_options(kana, used, avoid_n=True)
+            )
+            self.assertEqual(counts.get(kana, 0), expected)
 
     def test_returns_none_without_a_legal_option(self) -> None:
         selected = HardBot().choose(

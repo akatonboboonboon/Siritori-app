@@ -4,8 +4,7 @@ The strategies consume already validated dictionary entries.  They deliberately
 do not know about NiceGUI, a database, or a particular game-state class, which
 makes them safe to run from a room worker and straightforward to unit test.
 
-``EasyBot`` is intentionally not provided.  The repository owner can implement
-the small :class:`BotStrategy` protocol as an independent contribution.
+All three production difficulties share a validated immutable word index.
 """
 
 from __future__ import annotations
@@ -155,6 +154,26 @@ class WordIndex:
         self._by_first: Mapping[str, tuple[WordOption, ...]] = MappingProxyType(
             frozen
         )
+        safe_counts: dict[str, int] = {}
+        safe_counts_by_key: dict[str, dict[str, int]] = {}
+        for kana, bucket in frozen.items():
+            for option in bucket:
+                if option.ends_with_n:
+                    continue
+                safe_counts[kana] = safe_counts.get(kana, 0) + 1
+                locations = safe_counts_by_key.setdefault(
+                    option.canonical_key, {}
+                )
+                locations[kana] = locations.get(kana, 0) + 1
+        self._safe_counts: Mapping[str, int] = MappingProxyType(safe_counts)
+        self._safe_counts_by_key: Mapping[
+            str, Mapping[str, int]
+        ] = MappingProxyType(
+            {
+                key: MappingProxyType(locations)
+                for key, locations in safe_counts_by_key.items()
+            }
+        )
 
     def starting_with(self, kana: str) -> tuple[WordOption, ...]:
         return self._by_first.get(canonical_kana(kana), ())
@@ -172,6 +191,40 @@ class WordIndex:
             if option.canonical_key not in used_canonical_keys
             and (not avoid_n or not option.ends_with_n)
         )
+
+    def available_safe_counts(
+        self,
+        used_canonical_keys: frozenset[str] | set[str] = frozenset(),
+    ) -> Mapping[str, int]:
+        """Count safe options by first kana after removing used keys."""
+
+        counts = dict(self._safe_counts)
+        for key in used_canonical_keys:
+            for kana, amount in self._safe_counts_by_key.get(
+                key, {}
+            ).items():
+                counts[kana] = counts.get(kana, 0) - amount
+        return MappingProxyType(counts)
+
+    def safe_count_for_key(
+        self,
+        kana: str,
+        canonical_key: str,
+    ) -> int:
+        """Return safe options removed from one bucket by excluding a key."""
+
+        return self._safe_counts_by_key.get(canonical_key, {}).get(
+            canonical_kana(kana),
+            0,
+        )
+
+    def safe_locations_for_key(
+        self,
+        canonical_key: str,
+    ) -> Mapping[str, int]:
+        """Return safe first-kana bucket counts occupied by one key."""
+
+        return self._safe_counts_by_key.get(canonical_key, {})
 
     def reply_count(
         self,
@@ -209,6 +262,26 @@ class _SeededStrategy:
     def _safe_or_all(options: Sequence[WordOption]) -> Sequence[WordOption]:
         safe = tuple(option for option in options if not option.ends_with_n)
         return safe or options
+
+
+class EasyBot(_SeededStrategy):
+    """Choose a deterministic pseudo-random legal word, including risky ones."""
+
+    def choose(
+        self,
+        context: BotContext,
+        words: WordIndex,
+    ) -> WordOption | None:
+        legal = words.legal_options(
+            context.expected_kana,
+            context.used_canonical_keys,
+        )
+        if not legal:
+            return None
+        return min(
+            legal,
+            key=lambda option: self._tie_break(option, context),
+        )
 
 
 class NormalBot(_SeededStrategy):
@@ -255,7 +328,21 @@ class HardBot(_SeededStrategy):
                 ),
             )
 
-        def lookahead_score(option: WordOption) -> tuple[object, ...]:
+        available_safe_counts = words.available_safe_counts(
+            context.used_canonical_keys
+        )
+        continuation_cache: dict[
+            tuple[
+                str,
+                tuple[tuple[str, int], ...],
+                str,
+            ],
+            tuple[int, int, int],
+        ] = {}
+
+        def continuation_metrics(
+            option: WordOption,
+        ) -> tuple[int, int, int]:
             unavailable = set(context.used_canonical_keys)
             unavailable.add(option.canonical_key)
             opponent_replies = words.legal_options(
@@ -264,27 +351,59 @@ class HardBot(_SeededStrategy):
                 avoid_n=True,
             )
 
-            # No safe reply means the opponent is forced to lose.
             if not opponent_replies:
-                return (
-                    0,
-                    0,
-                    0,
-                    option.rank,
-                    self._tie_break(option, context),
-                )
+                return (0, 0, 0)
 
-            # Assume that the opponent chooses the reply that leaves this bot
-            # the fewest safe counters. Maximising that worst case prevents
-            # the old Hard bot from walking into an obvious two-ply trap.
+            def counter_count(reply: WordOption) -> int:
+                reply_kana = reply.last_kana
+                count = available_safe_counts.get(
+                    canonical_kana(reply_kana), 0
+                )
+                for excluded_key in {
+                    option.canonical_key,
+                    reply.canonical_key,
+                }:
+                    count -= words.safe_count_for_key(
+                        reply_kana,
+                        excluded_key,
+                    )
+                return max(count, 0)
+
             worst_counter_count = min(
-                words.reply_count(reply, unavailable)
+                counter_count(reply)
                 for reply in opponent_replies
             )
             return (
                 1,
                 -worst_counter_count,
                 len(opponent_replies),
+            )
+
+        def lookahead_score(option: WordOption) -> tuple[object, ...]:
+            locations = tuple(
+                words.safe_locations_for_key(
+                    option.canonical_key
+                ).items()
+            )
+            removes_specific_reply = (
+                option.canonical_key
+                if words.safe_count_for_key(
+                    option.last_kana,
+                    option.canonical_key,
+                )
+                else ""
+            )
+            cache_key = (
+                canonical_kana(option.last_kana),
+                locations,
+                removes_specific_reply,
+            )
+            metrics = continuation_cache.get(cache_key)
+            if metrics is None:
+                metrics = continuation_metrics(option)
+                continuation_cache[cache_key] = metrics
+            return (
+                *metrics,
                 option.rank,
                 self._tie_break(option, context),
             )

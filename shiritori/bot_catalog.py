@@ -13,6 +13,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Iterable, Protocol
 
+from .bot_data import load_bot_word_options
 from .bots import WordIndex, WordOption
 from .lexicon import LexiconCode, LexiconResult, LexiconValidator
 from .themes import ALL_THEME, ThemeDefinition
@@ -291,9 +292,15 @@ def build_bot_catalog(
 
 @lru_cache(maxsize=1)
 def get_default_bot_catalog() -> BotCatalog:
-    """Build and cache the server's default validated catalog."""
+    """Load and cache the large offline-validated default catalog."""
 
-    return build_bot_catalog()
+    options = load_bot_word_options()
+    return BotCatalog(
+        index=WordIndex(options),
+        options=options,
+        diagnostics=(),
+        attempted_count=len(options),
+    )
 
 
 def get_default_word_index() -> WordIndex:
