@@ -225,7 +225,7 @@ Render Blueprintは準備済みです。Dashboardの秘密情報と公開URLは�
 
 ## Phase 5: 1人用Bot戦
 
-**現状:** Easy／Normal／Hard、Bot数、一般語27,781語の索引、設定・対局画面、
+**現状:** Easy／Normal／Hard、Bot数、一般語28,750語の索引、設定・対局画面、
 厳密な`Game`スナップショットでの保存・一時停止・再開は実装済みです。
 タイマー警告の表現は本人担当です。
 

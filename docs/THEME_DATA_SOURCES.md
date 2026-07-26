@@ -52,26 +52,11 @@
 
 ## 一般Bot語彙
 
-テーマを指定しない対局のBotは、日本語WordNet 1.1から開発時に抽出して
-SudachiDict-core 20260428で検査した27,781語を使用します。
-
-- 日本語WordNet上で日本語の名詞として登録されている
-- 表記が1〜16文字のひらがな・カタカナ・漢字・許可記号だけで構成される
-- プレイヤー入力と同じSudachi完全一致判定を通過する
-- 読みが1通りに確定する普通名詞である
-- 同じ読みは先に採用した1語だけを残す
-
-展開後の`wnjpn.db`のSHA-256は
-`A8E749C4A356BF93D0B5DE505BCA8B21E13746F5728F76819728E8B4C3305A12`
-です。次のコマンドで同じCSVを再生成できます。
-
-```bash
-python -m scripts.build_bot_data \
-  --wordnet-db PATH/TO/wnjpn.db \
-  --output shiritori/bot_data/words.csv
-```
-
-生成済みCSVだけをアプリへ同梱するため、Botの実行時に外部通信は発生しません。
+テーマを指定しない対局のBotは、日本語WordNet、TKG Japanese-English
+Learner's Dictionary、Sudachiを役割分担して開発時に生成した28,750語を使用します。
+TKGは実在語判定のauthorityにはせず、自然さの粗い順位とBasic/Core名詞候補だけに
+利用しています。出典、固定commit/SHA-256、安全条件、CSV schema、再生成コマンドは
+[`BOT_DATA_SOURCES.md`](BOT_DATA_SOURCES.md)へ分離して記録しています。
 
 ## Wikipedia pageviewsの扱い
 

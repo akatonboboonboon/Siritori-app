@@ -45,7 +45,7 @@ RenderとNeonの無料枠を使う設計です。公開アカウントの作成�
 - 人間が0人の対人部屋削除、Bot戦の一時停止・復元
 - 暗号学的に安全なランダム先攻、自由初手、3〜180秒または無制限
 - Easy / Normal / 2手先を読むHard Botと、大語彙でも即答できる索引・探索キャッシュ
-- 日本語WordNetとSudachiで開発時に検査した一般Bot語彙27,781語
+- 日本語WordNet、TKG、Sudachiで開発時に検査した一般Bot語彙28,750語
 - 選択テーマを「表記＋読み」で照合するサーバー側テーマ制約
 - 日本語WordNet 1.1から開発時に候補を抽出し、Sudachiで実在語と読みを検査した9テーマ（アプリ実行時の外部通信なし）
 
@@ -191,7 +191,9 @@ PR、`AI_USAGE.md`、本人のレビュー・手動確認によって区別し�
 - [SudachiPy 0.6.11](https://pypi.org/project/SudachiPy/0.6.11/)
 - [SudachiDict](https://github.com/WorksApplications/SudachiDict)
 - [日本語WordNet 1.1](https://bond-lab.github.io/wnja/eng/downloads.html)
+- [TKG Japanese-English Learner's Dictionary](https://github.com/tkgally/je-dict-1)
 - [テーマ単語データの出典と作成方法](docs/THEME_DATA_SOURCES.md)
+- [一般Bot語彙の出典と生成方法](docs/BOT_DATA_SOURCES.md)
 - [SQLAlchemy Documentation](https://docs.sqlalchemy.org/en/20/)
 - [Alembic Documentation](https://alembic.sqlalchemy.org/en/latest/)
 - [Render: Deploy for Free](https://render.com/docs/free)

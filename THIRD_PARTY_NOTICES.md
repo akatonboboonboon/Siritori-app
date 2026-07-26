@@ -44,6 +44,24 @@ SudachiDictは複数の辞書素材を基に構築されています。再配布
 
 テーマ単語CSVは開発時に抽出済みで、アプリ実行時の外部通信はありません。
 
+## TKG Japanese-English Learner's Dictionary
+
+- 提供者: Tom Gally（エントリ作成・実装はClaudeを中心に実施）
+- 用途: 一般Bot候補の学習者向けcommonness tierとBasic/Core名詞候補
+- リポジトリ: <https://github.com/tkgally/je-dict-1>
+- 固定commit: `9dd2e89ef86212d249c013d77f843d59b110330c`
+- `entries_index.json` SHA-256:
+  `CD7A5D73465118EA484C9809C09DF61E6419C4D34689B5A78ACA3A4CF36B8A4B`
+- ライセンス: CC0 1.0 Universal
+- 公式ライセンス:
+  <https://github.com/tkgally/je-dict-1/blob/9dd2e89ef86212d249c013d77f843d59b110330c/LICENSE>
+- 詳細:
+  [`docs/BOT_DATA_SOURCES.md`](docs/BOT_DATA_SOURCES.md)
+
+TKGはAIを中心に作成され、現在も改善中の補助データです。収録だけを実在語の根拠にはせず、
+CSVへ採用する全表記・読みをSudachi完全一致検索で再検査しています。
+TKG本体はこのリポジトリへ複製していません。
+
 ## SQLAlchemy 2.0.51
 
 - 用途: PostgreSQL / SQLite のトランザクションとORM
