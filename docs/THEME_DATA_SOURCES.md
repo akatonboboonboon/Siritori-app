@@ -1,7 +1,9 @@
-# テーマ単語データの出典と生成方法
+# 廃止済みテーマ単語データの出典と生成履歴
 
-実行時の16テーマは、`shiritori/theme_data/word_themes.csv`を1回だけ読み込みます。
-日本語WordNet、Sudachi、GitHub、Wikipediaなどへ対局中に通信しません。
+テーマ機能は2026-07-26に廃止しました。現在のアプリは
+`shiritori/theme_data/word_themes.csv`を読み込まず、すべての対局で一般辞書を使います。
+この文書と旧CSVは、採用した出典・生成方法・AI活用の開発履歴を残すための資料です。
+日本語WordNet、Sudachi、GitHub、Wikipediaなどへ対局中に通信することもありません。
 
 ## 入力データ
 
@@ -20,7 +22,7 @@
 一般Bot語彙の出典、TKGの固定commit、Sudachiの役割は
 [`BOT_DATA_SOURCES.md`](BOT_DATA_SOURCES.md)に記録しています。
 
-## 実行時の統一CSV
+## 廃止前に使用した統一CSV（履歴）
 
 `word_themes.csv`は、1つの`surface,reading`へ複数テーマを付けられる疎な対応表です。
 表にない一般Bot語は「指定なし」だけで利用できます。列は次の5つです。
@@ -145,7 +147,7 @@ SudachiDict-full 20260723には`油淋鶏/ユーリンチー`がありますが�
 - バス（ばす）— `vehicle`
 - スカッシュ（すかっしゅ）— `sport|vegetable`
 
-## テーマを編集する手順
+## 廃止前の編集手順（履歴）
 
 1. `shiritori/theme_rules.py`へtarget roots、別宣言のfixed compatible roots、blocklistを追加・変更する。
 2. 正当なmulti-labelだけを許可edgeへ加える。テーマ間の継承や推測には使わない。

@@ -130,6 +130,21 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.bot_difficulty, "easy")
         self.assertEqual(len(snapshot.players), 2)
 
+    async def test_legacy_theme_argument_is_ignored_and_all_is_persisted(
+        self,
+    ) -> None:
+        snapshot = await self.service.create(
+            self.owner.id,
+            theme_key="food",
+            now=NOW,
+        )
+
+        self.assertEqual(snapshot.theme_key, "all")
+        with self.database.read_session() as session:
+            game = session.get(Game, snapshot.room_id)
+            self.assertIsNotNone(game)
+            self.assertEqual(game.theme_key, "all")
+
 
     async def test_paused_listing_rejects_projection_drift(self) -> None:
         snapshot = await self.service.create(self.owner.id, now=NOW)

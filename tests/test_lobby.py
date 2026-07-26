@@ -90,14 +90,14 @@ class LobbyServiceTests(unittest.TestCase):
         values.update(overrides)
         return self.service.create_pvp_room("owner", **values)  # type: ignore[arg-type]
 
-    def test_create_waiting_room_persists_settings_and_owner(self) -> None:
+    def test_create_ignores_legacy_theme_and_persists_owner(self) -> None:
         room = self.create_room(max_players=4, theme_key="food")
 
         self.assertEqual(room.status, StoredRoomStatus.WAITING)
         self.assertEqual(room.room_code, "ABCD22")
         self.assertEqual(room.name, "Weekend match")
         self.assertEqual(room.max_players, 4)
-        self.assertEqual(room.theme_key, "food")
+        self.assertEqual(room.theme_key, "all")
         self.assertEqual(room.turn_seconds, 30)
         self.assertEqual(room.revision, 0)
         self.assertEqual(
@@ -138,9 +138,6 @@ class LobbyServiceTests(unittest.TestCase):
             {"max_players": 1},
             {"max_players": True},
             {"allow_spectators": 1},
-            {"theme_key": "../food"},
-            {"theme_key": "1food"},
-            {"theme_key": "a" * 33},
             {"turn_seconds": 2},
             {"turn_seconds": True},
         )
@@ -148,9 +145,9 @@ class LobbyServiceTests(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 self.create_room(**overrides)
 
-    def test_theme_key_matches_theme_definition_identifier_rule(self) -> None:
-        room = self.create_room(theme_key="a" + "1" * 31)
-        self.assertEqual(room.theme_key, "a" + "1" * 31)
+    def test_obsolete_theme_key_format_is_ignored(self) -> None:
+        room = self.create_room(theme_key="../food")
+        self.assertEqual(room.theme_key, "all")
 
     def test_get_by_code_is_exact_and_never_crosses_rooms(self) -> None:
         first = self.create_room(name="First")
@@ -255,7 +252,8 @@ class LobbyServiceTests(unittest.TestCase):
         self.assertEqual(result.active_room.expected_kana, None)
         self.assertEqual(result.active_room.history, ())
         self.assertEqual(result.active_room.turn_seconds, 3)
-        self.assertEqual(result.active_room.theme_key, "country")
+        self.assertEqual(room.theme_key, "all")
+        self.assertEqual(result.active_room.theme_key, "all")
         self.assertEqual(result.active_room.bot_difficulty, "normal")
         self.assertIsNotNone(result.active_room.deadline_at)
         self.assertEqual(result.active_room.spectators, ("watcher",))

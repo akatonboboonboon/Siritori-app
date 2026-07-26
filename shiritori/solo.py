@@ -30,7 +30,7 @@ from .rooms import (
     SeatController,
     create_room_snapshot,
 )
-from .themes import ThemeCatalog
+from .themes import ALL_THEME_ID, ThemeCatalog
 
 
 StrategyResolver = Callable[[str], BotStrategy]
@@ -87,11 +87,11 @@ class SoloGameService:
         *,
         bot_count: int = 1,
         bot_difficulty: str = "normal",
-        theme_key: str = "all",
+        theme_key: str | None = None,
         turn_seconds: int | None = None,
         now: datetime | None = None,
     ) -> RoomSnapshot:
-        """Atomically persist a new solo game, then start its supervisor."""
+        """Create an unrestricted solo game; legacy theme input is ignored."""
 
         owner = _identifier(user_id, "user_id")
         if type(bot_count) is not int or not 1 <= bot_count <= 7:
@@ -100,7 +100,7 @@ class SoloGameService:
         # Resolve before writing so an unregistered user-owned EasyBot fails
         # closed instead of leaving an unplayable Game row.
         self._strategy_resolver(difficulty)
-        theme = self.themes.get(theme_key)
+        theme = self.themes.get(ALL_THEME_ID)
         created_at = now or datetime.now(timezone.utc)
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise ValueError("now must be timezone-aware")

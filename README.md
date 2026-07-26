@@ -22,7 +22,7 @@ RenderとNeonの無料枠を使う設計です。公開アカウントの作成�
 - 複数読みを自動決定せず、読み選択ダイアログを表示
 - 表記と読みを含む履歴
 - 「ん」と同じ読みの再使用による敗北・複数人戦での脱落
-- Bot数・Easy/Normal/Hard・テーマ・制限時間を選べる1人用Bot戦
+- Bot数・Easy/Normal/Hard・制限時間を選べる1人用Bot戦
 - 参加コード、準備状態、脱落後の観戦に対応したオンライン対戦部屋
 - 切断時のBot代行と、復帰時の本人への安全な引き継ぎ
 - オンライン対戦中の単語・手番・履歴のリアルタイム同期
@@ -46,8 +46,9 @@ RenderとNeonの無料枠を使う設計です。公開アカウントの作成�
 - 暗号学的に安全なランダム先攻、自由初手、3〜180秒または無制限
 - Easy / Normal / 2手先を読むHard Botと、大語彙でも即答できる索引・探索キャッシュ
 - 日本語WordNet、TKG、Sudachiで開発時に検査した一般Bot語彙30,643語
-- 選択テーマを「表記＋読み」で照合するサーバー側テーマ制約
-- 一般単語帳の各語に複数のテーマタグを付け、レビュー済み語も統合した16テーマ（計7,371表記、アプリ実行時の外部通信なし）
+- 新規・再開を問わず、すべてのPvP／ソロ対局はテーマ選択なしで一般辞書を使用
+- 以前保存したテーマ付き対局も、再開時はテーマ制約を適用せず、テーマ名を表示しない
+- `theme_key`と旧分類データはスキーマ・開発履歴の互換性だけのため一時的に維持し、実行時には使用しない
 
 最終的な文言・配色・PC／実スマートフォンでの表示確認は、応募者本人が判断して
 記録できるように残しています。本人のコードも別PRで共有・レビューできる構成です。
@@ -139,7 +140,7 @@ python -m alembic check
 ```
 
 GitHub Actionsでも依存整合性、Alembic、構文、全テストをPython 3.13で確認します。
-最終統合後の全298件の自動テストを通過しています。
+最終統合後の全305件の自動テストを通過しています。
 同じテストは各PRとmainのGitHub Actionsでも再実行します。
 
 ## Render + Neonへの公開
@@ -163,7 +164,6 @@ Dashboard上の秘密情報登録はリポジトリ所有者が行います。�
 
 AIが安全性・同時実行制御の基盤を担当し、次は応募者本人が実装・判断します。
 
-- 16テーマに収録した単語の目視レビューと誤分類修正
 - Easy / Normal / Hardの強さと収録語のプレイ感レビュー
 - タイマー警告表示と本人らしいデザイン調整
 - PC・実スマートフォンと公開URLでの最終操作確認
@@ -193,7 +193,7 @@ PR、`AI_USAGE.md`、本人のレビュー・手動確認によって区別し�
 - [SudachiDict](https://github.com/WorksApplications/SudachiDict)
 - [日本語WordNet 1.1](https://bond-lab.github.io/wnja/eng/downloads.html)
 - [TKG Japanese-English Learner's Dictionary](https://github.com/tkgally/je-dict-1)
-- [テーマ単語データの出典と作成方法](docs/THEME_DATA_SOURCES.md)
+- [廃止済みテーマデータの出典と作成履歴](docs/THEME_DATA_SOURCES.md)
 - [一般Bot語彙の出典と生成方法](docs/BOT_DATA_SOURCES.md)
 - [SQLAlchemy Documentation](https://docs.sqlalchemy.org/en/20/)
 - [Alembic Documentation](https://alembic.sqlalchemy.org/en/latest/)

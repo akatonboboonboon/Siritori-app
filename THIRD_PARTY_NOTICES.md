@@ -42,7 +42,7 @@ SudachiDictは複数の辞書素材を基に構築されています。再配布
 
 [日本語ワードネット （1.1版）© 2009-2011 NICT, 2012-2015 Francis Bond and 2016-2024 Francis Bond, Takayuki Kuribayashi](https://bond-lab.github.io/wnja/index.ja.html)
 
-テーマ単語CSVは開発時に抽出済みで、アプリ実行時の外部通信はありません。
+旧テーマ単語CSVは開発履歴として保持し、現在のアプリ実行時には読み込みません。
 
 ## TKG Japanese-English Learner's Dictionary
 

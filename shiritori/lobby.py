@@ -25,6 +25,7 @@ from .rooms import (
     SeatPicker,
     create_room_snapshot,
 )
+from .themes import ALL_THEME_ID
 
 
 INVITE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -348,7 +349,6 @@ class LobbyService:
         self.code_factory = code_factory or generate_invite_code
         self.game_id_factory = game_id_factory or (lambda: str(uuid4()))
         self.seat_picker = seat_picker
-        self.theme_resolver = theme_resolver
         self.max_code_attempts = max_code_attempts
 
     def create_pvp_room(
@@ -358,9 +358,10 @@ class LobbyService:
         name: str,
         max_players: int = 2,
         allow_spectators: bool = True,
-        theme_key: str = "all",
+        theme_key: str | None = None,
         turn_seconds: int | None = None,
     ) -> LobbyRoomSnapshot:
+        """Create an unrestricted room; legacy theme arguments are ignored."""
         owner = _require_user_id(owner_user_id)
         if not isinstance(name, str):
             raise ValueError("room name must be text")
@@ -371,12 +372,6 @@ class LobbyService:
             raise ValueError("max_players must be from 2 to 8")
         if type(allow_spectators) is not bool:
             raise ValueError("allow_spectators must be boolean")
-        key = validate_theme_key(theme_key)
-        if self.theme_resolver is not None:
-            try:
-                self.theme_resolver(key)
-            except KeyError as error:
-                raise ValueError(f"unknown theme: {key}") from error
         seconds = validate_turn_seconds(turn_seconds)
 
         for _ in range(self.max_code_attempts):
@@ -388,7 +383,7 @@ class LobbyService:
                     name=clean_name,
                     max_players=max_players,
                     allow_spectators=allow_spectators,
-                    theme_key=key,
+                    theme_key=ALL_THEME_ID,
                     turn_seconds=seconds,
                 )
             except InviteCodeConflict:

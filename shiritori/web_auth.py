@@ -680,12 +680,6 @@ def register_auth_pages(
             return RedirectResponse("/login?next=/lobby", status_code=303)
         _page_shell()
         logout_token = csrf.issue(principal.session_id)
-        theme_options = {"all": "すべて"}
-        if solo is not None:
-            theme_options = {
-                theme.theme_id: theme.label
-                for theme in solo.themes.themes
-            }
         with ui.element("main").classes("platform-shell"):
             with ui.column().classes("platform-wrap"):
                 with ui.element("header").classes("platform-header"):
@@ -712,11 +706,6 @@ def register_auth_pages(
                             label="部屋名",
                             value=f"{principal.account.display_name}の部屋",
                         ).props("outlined maxlength=64").classes("w-full")
-                        room_theme_select = ui.select(
-                            options=theme_options,
-                            value="all",
-                            label="テーマ",
-                        ).props("outlined options-dense").classes("w-full")
                         room_players_select = ui.select(
                             options={
                                 number: f"{number}人"
@@ -784,10 +773,7 @@ def register_auth_pages(
                                     raise RuntimeError(
                                         "lobby service is unavailable"
                                     )
-                                theme_key = room_theme_select.value
                                 max_players = room_players_select.value
-                                if not isinstance(theme_key, str):
-                                    raise ValueError("invalid theme")
                                 if (
                                     type(max_players) is not int
                                     or not 2 <= max_players <= 8
@@ -803,7 +789,6 @@ def register_auth_pages(
                                     allow_spectators=bool(
                                         spectator_switch.value
                                     ),
-                                    theme_key=theme_key,
                                     turn_seconds=room_turn_seconds(),
                                 )
                             except (LobbyError, TypeError, ValueError):
@@ -901,13 +886,8 @@ def register_auth_pages(
                     with ui.column().classes("dashboard-card"):
                         ui.label("1人でBot戦").classes("aside-title")
                         ui.label(
-                            "遊ぶ単語のテーマを選びます。"
+                            "Botの数・難易度・制限時間を選びます。"
                         ).classes("platform-muted")
-                        theme_select = ui.select(
-                            options=theme_options,
-                            value="all",
-                            label="テーマ",
-                        ).props("outlined options-dense").classes("w-full")
                         bot_count_select = ui.select(
                             options={
                                 number: f"{number}体"
@@ -958,12 +938,9 @@ def register_auth_pages(
                                     raise RuntimeError(
                                         "solo service is unavailable"
                                     )
-                                theme_key = theme_select.value
                                 bot_count = bot_count_select.value
                                 difficulty = difficulty_select.value
                                 timer_value = timer_select.value
-                                if not isinstance(theme_key, str):
-                                    raise ValueError("theme is required")
                                 if (
                                     type(bot_count) is not int
                                     or not 1 <= bot_count <= 7
@@ -989,7 +966,6 @@ def register_auth_pages(
                                     current_principal.account.id,
                                     bot_count=bot_count,
                                     bot_difficulty=difficulty,
-                                    theme_key=theme_key,
                                     turn_seconds=turn_seconds,
                                 )
                             except (
@@ -1068,19 +1044,13 @@ def register_auth_pages(
             room_code_label.set_text(
                 f"参加コード: {room.room_code}"
             )
-            theme = (
-                solo.themes.get(room.theme_key).label
-                if solo is not None
-                else room.theme_key
-            )
             timer_text = (
                 "無制限"
                 if room.turn_seconds is None
                 else f"{room.turn_seconds}秒"
             )
             settings_label.set_text(
-                f"テーマ: {theme}・制限時間: {timer_text}・"
-                f"最大{room.max_players}人"
+                f"制限時間: {timer_text}・最大{room.max_players}人"
             )
             members_box.clear()
             with members_box:
@@ -1347,13 +1317,6 @@ def register_auth_pages(
             if transient_message is None:
                 transient_feedback = None
             current_snapshot = snapshot
-            try:
-                theme_label = solo.themes.get(
-                    snapshot.theme_key
-                ).label
-            except KeyError:
-                theme_label = snapshot.theme_key
-            theme_label_element.set_text(f"テーマ: {theme_label}")
             timer = (
                 "無制限"
                 if snapshot.turn_seconds is None
@@ -1758,9 +1721,6 @@ def register_auth_pages(
                 ):
                     with ui.column():
                         game_title = ui.label("対局").classes("auth-title")
-                        theme_label_element = ui.label(
-                            "テーマ: 読み込み中"
-                        ).classes("platform-muted")
                         settings_label = ui.label("").classes(
                             "platform-muted"
                         )
@@ -1860,9 +1820,7 @@ def register_auth_pages(
                                 f"状態バージョン: {save.saved_state_version}"
                             ).classes("platform-muted")
                         else:
-                            ui.label(
-                                f"{save.theme_key} / {save.bot_difficulty}"
-                            ).classes("aside-title")
+                            ui.label(save.bot_difficulty).classes("aside-title")
                             timer = (
                                 "無制限"
                                 if save.turn_seconds is None

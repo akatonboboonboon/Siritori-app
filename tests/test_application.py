@@ -5,7 +5,9 @@ import tempfile
 import unittest
 
 from shiritori.application import ApplicationServices
+from shiritori.bot_catalog import get_default_word_index
 from shiritori.bots import BotContext, BotStrategy, WordIndex, WordOption
+from shiritori.rooms import RoomMode, create_room_snapshot
 from shiritori.settings import Settings
 from shiritori.themes import ThemeDefinition
 
@@ -50,6 +52,20 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
         await self.services.start()
 
         self.assertEqual(self.services.runtime.active_room_ids, frozenset())
+
+    async def test_runtime_bot_index_ignores_legacy_persisted_theme(
+        self,
+    ) -> None:
+        snapshot = create_room_snapshot(
+            "legacy-themed-bot-room",
+            ("alice", "bob"),
+            mode=RoomMode.PVP,
+            theme_key="retired-food",
+        )
+
+        index = self.services.runtime._word_index_resolver(snapshot)
+
+        self.assertIs(index, get_default_word_index())
 
     async def test_all_difficulties_are_registered_and_replaceable(self) -> None:
         self.assertIsInstance(
