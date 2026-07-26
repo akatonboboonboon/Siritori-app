@@ -50,6 +50,29 @@
 
 > [日本語ワードネット （1.1版）© 2009-2011 NICT, 2012-2015 Francis Bond and 2016-2024 Francis Bond, Takayuki Kuribayashi](https://bond-lab.github.io/wnja/index.ja.html)
 
+## 一般Bot語彙
+
+テーマを指定しない対局のBotは、日本語WordNet 1.1から開発時に抽出して
+SudachiDict-core 20260428で検査した27,781語を使用します。
+
+- 日本語WordNet上で日本語の名詞として登録されている
+- 表記が1〜16文字のひらがな・カタカナ・漢字・許可記号だけで構成される
+- プレイヤー入力と同じSudachi完全一致判定を通過する
+- 読みが1通りに確定する普通名詞である
+- 同じ読みは先に採用した1語だけを残す
+
+展開後の`wnjpn.db`のSHA-256は
+`A8E749C4A356BF93D0B5DE505BCA8B21E13746F5728F76819728E8B4C3305A12`
+です。次のコマンドで同じCSVを再生成できます。
+
+```bash
+python -m scripts.build_bot_data \
+  --wordnet-db PATH/TO/wnjpn.db \
+  --output shiritori/bot_data/words.csv
+```
+
+生成済みCSVだけをアプリへ同梱するため、Botの実行時に外部通信は発生しません。
+
 ## Wikipedia pageviewsの扱い
 
 Wikipedia pageviewsは、日本語WordNetから抽出した候補を一般的な語から順に並べるためのランキング用途だけに使用しています。WikipediaやWikipedia pageviewsはテーマ語彙の出典ではなく、そこから新しい単語や読みを追加しません。

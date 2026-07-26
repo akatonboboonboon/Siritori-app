@@ -6,7 +6,6 @@ import unittest
 
 from shiritori.application import ApplicationServices
 from shiritori.bots import BotContext, BotStrategy, WordIndex, WordOption
-from shiritori.room_runtime import RoomRuntimeCapabilityError
 from shiritori.settings import Settings
 from shiritori.themes import ThemeDefinition
 
@@ -52,7 +51,11 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.services.runtime.active_room_ids, frozenset())
 
-    async def test_normal_and_hard_are_server_owned_but_easy_is_extension(self) -> None:
+    async def test_all_difficulties_are_registered_and_replaceable(self) -> None:
+        self.assertIsInstance(
+            self.services.bot_strategy_for("easy"),
+            BotStrategy,
+        )
         self.assertIsInstance(
             self.services.bot_strategy_for("normal"),
             BotStrategy,
@@ -61,11 +64,11 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
             self.services.bot_strategy_for("hard"),
             BotStrategy,
         )
-        with self.assertRaises(RoomRuntimeCapabilityError):
-            self.services.bot_strategy_for("easy")
 
         easy = StubEasyBot()
-        self.services.register_bot_strategy("easy", easy)
+        with self.assertRaises(ValueError):
+            self.services.register_bot_strategy("easy", easy)
+        self.services.register_bot_strategy("easy", easy, replace=True)
         self.assertIs(self.services.bot_strategy_for("easy"), easy)
 
     async def test_custom_theme_builds_a_validated_bot_index(self) -> None:

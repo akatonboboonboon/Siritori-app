@@ -27,7 +27,7 @@ SudachiDictは複数の辞書素材を基に構築されています。再配布
 ## 日本語WordNet 1.1
 
 - 提供者: NICT、Francis Bond、Takayuki Kuribayashi
-- 用途: テーマ別単語候補の開発時抽出
+- 用途: テーマ別単語候補と一般Bot語彙の開発時抽出
 - 公式配布案内: <https://bond-lab.github.io/wnja/eng/downloads.html>
 - 使用したデータベース:
   <https://github.com/bond-lab/wnja/releases/download/v1.1/wnjpn.db.gz>

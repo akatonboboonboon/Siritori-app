@@ -9,7 +9,7 @@ from argon2 import PasswordHasher
 from sqlalchemy import update
 
 from shiritori.auth import AuthService
-from shiritori.bots import HardBot, NormalBot
+from shiritori.bots import EasyBot, HardBot, NormalBot
 from shiritori.database import Database
 from shiritori.models import Game
 from shiritori.room_persistence import (
@@ -52,6 +52,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         strategies = {
             "normal": NormalBot(seed=1),
+            "easy": EasyBot(seed=0),
             "hard": HardBot(seed=2),
         }
         self.runtime = RoomRuntime(
@@ -120,15 +121,15 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(resumed.deadline_at)
         self.assertEqual(await self.service.list_paused(self.owner.id), ())
 
-    async def test_unregistered_easy_fails_before_creating_game(self) -> None:
-        with self.assertRaises(KeyError):
-            await self.service.create(
-                self.owner.id,
-                bot_difficulty="easy",
-                now=NOW,
-            )
+    async def test_easy_game_can_be_created(self) -> None:
+        snapshot = await self.service.create(
+            self.owner.id,
+            bot_difficulty="easy",
+            now=NOW,
+        )
 
-        self.assertEqual(await self.service.list_paused(self.owner.id), ())
+        self.assertEqual(snapshot.bot_difficulty, "easy")
+        self.assertEqual(len(snapshot.players), 2)
 
 
     async def test_paused_listing_rejects_projection_drift(self) -> None:

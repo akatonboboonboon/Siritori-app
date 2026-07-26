@@ -14,7 +14,7 @@ from typing import Final
 
 from .auth import AuthService
 from .bot_catalog import build_bot_catalog, get_default_word_index
-from .bots import BotStrategy, HardBot, NormalBot, WordIndex
+from .bots import BotStrategy, EasyBot, HardBot, NormalBot, WordIndex
 from .database import Database, GameRepository
 from .lobby import LobbyService
 from .lobby_persistence import SQLAlchemyLobbyRepository
@@ -80,6 +80,7 @@ class ApplicationServices:
         room_hub = RoomHub()
         rooms = RoomCoordinator(room_repository, hub=room_hub)
         strategies: dict[str, BotStrategy] = {
+            "easy": EasyBot(seed="server-easy"),
             "normal": NormalBot(seed="server-normal"),
             "hard": HardBot(seed="server-hard"),
         }
