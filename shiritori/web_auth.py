@@ -11,6 +11,7 @@ from hashlib import sha256
 import hmac
 from html import escape
 import logging
+import math
 from pathlib import Path
 import secrets
 from threading import Lock
@@ -70,6 +71,72 @@ class AuthWebServices:
     rooms: RoomCoordinator | None = None
     room_words: LexiconRoomService | None = None
     lobby: LobbyService | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DeadlinePresentation:
+    text: str
+    level: str
+    expired: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _VersionedFeedback:
+    state_version: int | None
+    message: str
+
+
+def _deadline_presentation(
+    deadline_at: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> _DeadlinePresentation:
+    """Return a stable whole-second countdown and its visual urgency."""
+
+    if deadline_at is None:
+        return _DeadlinePresentation(
+            text="残り時間: 無制限",
+            level="normal",
+            expired=False,
+        )
+    checked_at = datetime.now(timezone.utc) if now is None else now
+    seconds = max(
+        0,
+        math.ceil((deadline_at - checked_at).total_seconds()),
+    )
+    level = (
+        "danger"
+        if seconds <= 5
+        else "warning"
+        if seconds <= 10
+        else "normal"
+    )
+    return _DeadlinePresentation(
+        text=f"残り時間: {seconds}秒",
+        level=level,
+        expired=deadline_at <= checked_at,
+    )
+
+
+def _feedback_for_version(
+    feedback: _VersionedFeedback | None,
+    state_version: int,
+) -> str | None:
+    """Keep transient feedback only while its authoritative state is current."""
+
+    if feedback is None or feedback.state_version != state_version:
+        return None
+    return feedback.message
+
+
+def _solo_difficulty_options() -> dict[str, str]:
+    """Return every Bot difficulty exposed by the application service."""
+
+    return {
+        "easy": "やさしい",
+        "normal": "ふつう",
+        "hard": "むずかしい",
+    }
 
 
 class CsrfProtector:
@@ -837,10 +904,7 @@ def register_auth_pages(
                             label="Botの数",
                         ).props("outlined options-dense").classes("w-full")
                         difficulty_select = ui.select(
-                            options={
-                                "normal": "ふつう",
-                                "hard": "むずかしい",
-                            },
+                            options=_solo_difficulty_options(),
                             value="normal",
                             label="難易度",
                         ).props("outlined options-dense").classes("w-full")
@@ -892,7 +956,10 @@ def register_auth_pages(
                                     or not 1 <= bot_count <= 7
                                 ):
                                     raise ValueError("invalid bot count")
-                                if difficulty not in {"normal", "hard"}:
+                                if (
+                                    difficulty
+                                    not in _solo_difficulty_options()
+                                ):
                                     raise ValueError("invalid difficulty")
                                 if timer_value == "unlimited":
                                     turn_seconds = None
@@ -1217,6 +1284,8 @@ def register_auth_pages(
         client = ui.context.client
         current_snapshot: RoomSnapshot | None = None
         pending_submission: tuple[str, int, str] | None = None
+        transient_feedback: _VersionedFeedback | None = None
+        rendered_history: tuple[object, ...] | None = None
         attaching = False
         submitting = False
         polling = False
@@ -1230,13 +1299,36 @@ def register_auth_pages(
                 and seat.controller is SeatController.HUMAN
             )
 
+        def show_transient_feedback(message: str) -> None:
+            nonlocal transient_feedback
+            state_version = (
+                current_snapshot.state_version
+                if current_snapshot is not None
+                else None
+            )
+            transient_feedback = _VersionedFeedback(
+                state_version=state_version,
+                message=message,
+            )
+            if (
+                current_snapshot is None
+                or current_snapshot.status is not RoomStatus.FINISHED
+            ):
+                feedback_label.set_text(message)
+
         def render(snapshot: RoomSnapshot) -> None:
-            nonlocal current_snapshot
+            nonlocal current_snapshot, rendered_history, transient_feedback
             if (
                 current_snapshot is not None
                 and snapshot.state_version < current_snapshot.state_version
             ):
                 return
+            transient_message = _feedback_for_version(
+                transient_feedback,
+                snapshot.state_version,
+            )
+            if transient_message is None:
+                transient_feedback = None
             current_snapshot = snapshot
             try:
                 theme_label = solo.themes.get(
@@ -1252,9 +1344,13 @@ def register_auth_pages(
             )
             if snapshot.mode.value == "solo_bot":
                 game_title.set_text("1人でBot戦")
+                difficulty = _solo_difficulty_options().get(
+                    snapshot.bot_difficulty,
+                    snapshot.bot_difficulty,
+                )
                 settings_label.set_text(
                     f"Bot {len(snapshot.players) - 1}体・"
-                    f"{snapshot.bot_difficulty}・{timer}"
+                    f"{difficulty}・{timer}"
                 )
             else:
                 game_title.set_text("オンライン対戦")
@@ -1290,47 +1386,52 @@ def register_auth_pages(
             elif current_seat.owner_user_id == user_id:
                 turn_label.set_text("あなたの番です")
             else:
-                turn_label.set_text("相手の番です")
-            if snapshot.deadline_at is None:
-                deadline_label.set_text("残り時間: 無制限")
-            else:
-                remaining = max(
-                    0,
-                    int(
-                        (
-                            snapshot.deadline_at
-                            - datetime.now(timezone.utc)
-                        ).total_seconds()
-                    ),
+                turn_label.set_text(
+                    f"プレイヤー{current_seat.index + 1}の番です"
                 )
-                deadline_label.set_text(f"残り時間: 約{remaining}秒")
+            deadline = _deadline_presentation(snapshot.deadline_at)
+            deadline_label.set_text(deadline.text)
+            deadline_label.classes(
+                add=f"deadline--{deadline.level}",
+                remove=(
+                    "deadline--normal deadline--warning deadline--danger"
+                ),
+            )
 
-            history_box.clear()
-            with history_box:
-                if not snapshot.history:
-                    ui.label(
-                        "先攻は好きな辞書単語から始められます。"
-                    ).classes("platform-muted")
-                for index, record in enumerate(
-                    snapshot.history, start=1
-                ):
-                    if record.by_bot:
-                        actor = f"Bot {record.seat_index + 1}"
-                    elif record.actor_user_id == user_id:
-                        actor = "あなた"
-                    else:
-                        actor = "相手"
-                    with ui.row().classes(
-                        "w-full items-center justify-between gap-3"
-                    ):
+            history_signature = tuple(snapshot.history)
+            if history_signature != rendered_history:
+                rendered_history = history_signature
+                history_box.clear()
+                with history_box:
+                    if not snapshot.history:
                         ui.label(
-                            f"{index}. {record.surface}"
-                        ).classes("aside-title")
-                        ui.label(
-                            f"{actor}・よみ: {record.reading}"
+                            "先攻は好きな辞書単語から始められます。"
                         ).classes("platform-muted")
+                    for index, record in enumerate(
+                        snapshot.history, start=1
+                    ):
+                        if record.by_bot:
+                            actor = f"Bot {record.seat_index + 1}"
+                        elif record.actor_user_id == user_id:
+                            actor = "あなた"
+                        else:
+                            actor = f"プレイヤー{record.seat_index + 1}"
+                        with ui.row().classes(
+                            "game-history-row w-full items-center "
+                            "justify-between gap-3"
+                        ):
+                            ui.label(
+                                f"{index}. {record.surface}"
+                            ).classes("aside-title")
+                            ui.label(
+                                f"{actor}・よみ: {record.reading}"
+                            ).classes("platform-muted")
 
-            allowed = can_submit(snapshot) and not submitting
+            allowed = (
+                can_submit(snapshot)
+                and not submitting
+                and not deadline.expired
+            )
             if allowed:
                 word_input.enable()
                 submit_button.enable()
@@ -1363,11 +1464,18 @@ def register_auth_pages(
                         )
                         else f"プレイヤー{winner_index + 1}の勝ちです。"
                     )
-            elif (
-                snapshot.role_for_user(user_id) is Role.SPECTATOR
-                and snapshot.seat_for_user(user_id) is not None
-            ):
-                feedback_label.set_text("脱落しました。観戦中です。")
+            elif transient_message is not None:
+                feedback_label.set_text(transient_message)
+            elif snapshot.role_for_user(user_id) is Role.SPECTATOR:
+                feedback_label.set_text(
+                    "脱落しました。観戦中です。"
+                    if snapshot.seat_for_user(user_id) is not None
+                    else "観戦者として観戦中です。"
+                )
+            elif deadline.expired:
+                feedback_label.set_text(
+                    "時間切れを確定しています。"
+                )
             elif allowed:
                 feedback_label.set_text(
                     "辞書にある単語を入力してください。"
@@ -1414,14 +1522,14 @@ def register_auth_pages(
                 )
             except (SoloGameAuthorizationError, RoomError):
                 LOGGER.exception("failed to open solo game")
-                feedback_label.set_text(
+                show_transient_feedback(
                     "この対局を開けません。"
                 )
                 word_input.disable()
                 submit_button.disable()
             except Exception:
                 LOGGER.exception("failed to connect solo game")
-                feedback_label.set_text(
+                show_transient_feedback(
                     "対局へ接続できませんでした。"
                 )
             else:
@@ -1491,19 +1599,19 @@ def register_auth_pages(
                 reading_dialog.close()
                 if error.current_snapshot is not None:
                     render(error.current_snapshot)
-                feedback_label.set_text(
+                show_transient_feedback(
                     "状態が更新されました。もう一度お試しください。"
                 )
             except RoomError:
                 LOGGER.exception("solo word submission failed")
                 pending_submission = None
                 reading_dialog.close()
-                feedback_label.set_text(
+                show_transient_feedback(
                     "今はその単語を送信できません。"
                 )
             except Exception:
                 LOGGER.exception("unexpected solo submission failure")
-                feedback_label.set_text(
+                show_transient_feedback(
                     "単語を確認できませんでした。"
                 )
             else:
@@ -1524,7 +1632,7 @@ def register_auth_pages(
                                 on_click=lambda _event=None,
                                 value=reading: choose_reading(value),
                             ).props("outline no-caps").classes("w-full")
-                    feedback_label.set_text(result.message)
+                    show_transient_feedback(result.message)
                     reading_dialog.open()
                 elif (
                     result.status
@@ -1538,11 +1646,11 @@ def register_auth_pages(
                         and result.outcome.snapshot is not None
                     ):
                         render(result.outcome.snapshot)
-                    feedback_label.set_text(result.message)
+                    show_transient_feedback(result.message)
                 else:
                     pending_submission = None
                     reading_dialog.close()
-                    feedback_label.set_text(result.message)
+                    show_transient_feedback(result.message)
             finally:
                 submitting = False
                 if current_snapshot is not None:
@@ -1552,7 +1660,11 @@ def register_auth_pages(
             _event: object | None = None,
         ) -> None:
             snapshot = current_snapshot
-            if snapshot is None or not can_submit(snapshot):
+            if (
+                snapshot is None
+                or not can_submit(snapshot)
+                or _deadline_presentation(snapshot.deadline_at).expired
+            ):
                 return
             await perform_submission(
                 str(word_input.value or ""),
@@ -1578,7 +1690,7 @@ def register_auth_pages(
             nonlocal pending_submission
             pending_submission = None
             reading_dialog.close()
-            feedback_label.set_text("読みの選択を取り消しました。")
+            show_transient_feedback("読みの選択を取り消しました。")
 
         with ui.element("main").classes("platform-shell"):
             with ui.column().classes("platform-wrap"):
@@ -1610,7 +1722,10 @@ def register_auth_pages(
                                 "aside-title"
                             )
                         deadline_label = ui.label("").classes(
-                            "platform-muted"
+                            "deadline-label deadline--normal"
+                        ).props(
+                            "role='status' aria-live='polite' "
+                            "aria-atomic='true'"
                         )
                         word_input = ui.input(
                             label="次のことば",
@@ -1632,7 +1747,7 @@ def register_auth_pages(
                     with ui.column().classes("dashboard-card"):
                         ui.label("ことばの履歴").classes("aside-title")
                         history_box = ui.column().classes(
-                            "w-full gap-2"
+                            "game-history w-full gap-2"
                         )
 
                 with ui.dialog() as reading_dialog, ui.card():

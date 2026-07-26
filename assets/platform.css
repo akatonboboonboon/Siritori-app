@@ -147,6 +147,51 @@ body {
   font-weight: 850;
 }
 
+.deadline-label {
+  width: fit-content;
+  min-height: 32px;
+  padding: 5px 9px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font-weight: 850;
+  transition:
+    color 160ms ease,
+    border-color 160ms ease,
+    background-color 160ms ease;
+}
+
+.deadline--normal {
+  color: #77738c;
+}
+
+.deadline--warning {
+  color: #92550f;
+  border-color: rgba(230, 155, 59, 0.32);
+  background: rgba(255, 184, 77, 0.13);
+}
+
+.deadline--danger {
+  color: #a3313c;
+  border-color: rgba(216, 76, 87, 0.32);
+  background: rgba(216, 76, 87, 0.11);
+}
+
+.game-history {
+  max-height: min(52vh, 440px);
+  padding-right: 4px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.game-history-row {
+  min-width: 0;
+}
+
+.game-history-row > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .logout-form {
   margin: 0;
 }
