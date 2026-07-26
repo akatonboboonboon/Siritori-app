@@ -76,7 +76,7 @@ CSV列は次の4列です。
 - `source_ref`: `curated`、`wnja:<synset>`、または`tkg:<entry_id>`
 - `commonness_tier`: `curated`、`basic`、`core`、`general`、`wordnet`
 
-現在の生成結果は30,547語です。
+現在の生成結果は30,643語です。旧テーマseedのうち、一般語彙の表記・読みの一意性を壊さない96 pairも同じSudachi規則で検証して追加しています。
 
 | tier | 語数 |
 |---|---:|
@@ -84,7 +84,7 @@ CSV列は次の4列です。
 | basic | 310 |
 | core | 1,195 |
 | general | 9,460 |
-| wordnet | 19,502 |
+| wordnet | 19,598 |
 
 ## 再生成と一致確認
 
@@ -94,16 +94,18 @@ CSV列は次の4列です。
 python -m scripts.build_bot_data \
   --wordnet-db PATH/TO/wnjpn.db \
   --tkg-index PATH/TO/entries_index.json \
-  --output shiritori/bot_data/words.csv
+  --output shiritori/bot_data/words.csv \
+  --theme-output shiritori/theme_data/word_themes.csv
 ```
 
-チェックイン済みCSVと再生成結果が完全一致するかは、書き換えずに確認できます。
+チェックイン済みの一般CSVと統一テーマCSVの両方が再生成結果と完全一致するかは、書き換えずに確認できます。
 
 ```bash
 python -m scripts.build_bot_data \
   --wordnet-db PATH/TO/wnjpn.db \
   --tkg-index PATH/TO/entries_index.json \
   --output shiritori/bot_data/words.csv \
+  --theme-output shiritori/theme_data/word_themes.csv \
   --check
 ```
 

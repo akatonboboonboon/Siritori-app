@@ -1,20 +1,12 @@
-"""Versioned theme definitions plus the user's own three food words."""
+"""Sixteen compatible themes backed by one unified offline mapping."""
 
 from __future__ import annotations
 
 from typing import Final
 
-from .theme_data import THEME_DATA_DIRECTORY, load_theme_entries
+from .theme_data import THEME_SEPARATOR, load_word_theme_rows
 from .themes import ThemeDefinition, ThemeEntryInput
 
-
-# These three entries are user-authored. Keep them explicit and separate from
-# generated data so future CSV rebuilds can never remove them.
-FOOD_ADDITIONS: Final[tuple[ThemeEntryInput, ...]] = (
-    ("林檎", "りんご"),
-    ("蜜柑", "みかん"),
-    ("西瓜", "すいか"),
-)
 
 THEME_LABELS: Final[dict[str, str]] = {
     "food": "食べ物・飲み物",
@@ -26,16 +18,37 @@ THEME_LABELS: Final[dict[str, str]] = {
     "vehicle": "乗り物",
     "fruit": "果物・木の実",
     "vegetable": "野菜・きのこ",
+    "person_job": "人物・職業",
+    "nature": "自然",
+    "place_building": "場所・建物",
+    "body": "体・体の部位",
+    "clothing": "服・身につけるもの",
+    "daily_tools": "道具・生活用品",
+    "music": "音楽・楽器",
 }
+
+_WORD_THEME_ROWS: Final = load_word_theme_rows()
+_MANUAL_FOOD_SOURCE_REF: Final = "manual:user-food-v1"
+
+# Preserve the public compatibility name without duplicating vocabulary in
+# Python.  These six reviewed rows live in the generated unified mapping.
+FOOD_ADDITIONS: Final[tuple[ThemeEntryInput, ...]] = tuple(
+    (row.surface, row.reading)
+    for row in _WORD_THEME_ROWS
+    if _MANUAL_FOOD_SOURCE_REF in row.source_ref.split(THEME_SEPARATOR)
+)
 
 
 def _build_theme(theme_id: str, label: str) -> ThemeDefinition:
-    entries: list[ThemeEntryInput] = list(
-        load_theme_entries(THEME_DATA_DIRECTORY / f"{theme_id}.csv")
+    return ThemeDefinition.from_entries(
+        theme_id,
+        label,
+        (
+            (row.surface, row.reading)
+            for row in _WORD_THEME_ROWS
+            if theme_id in row.theme_ids
+        ),
     )
-    if theme_id == "food":
-        entries.extend(FOOD_ADDITIONS)
-    return ThemeDefinition.from_entries(theme_id, label, entries)
 
 
 USER_THEMES: Final[tuple[ThemeDefinition, ...]] = tuple(

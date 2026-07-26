@@ -37,6 +37,27 @@ from shiritori.lexicon import (
     katakana_to_hiragana,
     normalize_surface,
 )
+from shiritori.theme_data import (
+    AUTO_THEME_SOURCE_REF,
+    REVIEWED_THEME_DATA_PATH,
+    THEME_DATA_DIRECTORY,
+    THEME_SEPARATOR,
+    WORD_THEME_DATA_HEADER,
+    WORD_THEME_DATA_PATH,
+    load_reviewed_theme_rows,
+    load_theme_rows,
+)
+from shiritori.theme_rules import (
+    AUTOMATIC_MULTI_LABEL_LINKS,
+    BOTANICAL_THEME_IDS,
+    LEGACY_THEME_IDS,
+    PERSON_EXCLUDED_THEME_IDS,
+    PERSON_SYNSET,
+    THEME_BLOCKLISTS,
+    THEME_COMPATIBLE_ROOTS,
+    THEME_IDS,
+    THEME_ROOTS,
+)
 
 
 WORDNET_DATABASE_SHA256: Final = (
@@ -56,6 +77,7 @@ CSV_HEADER: Final = (
     "source_ref",
     "commonness_tier",
 )
+WORDNET_SOURCE_REF: Final = re.compile(r"^wnja:\d{8}-[nvars]$")
 MAX_SURFACE_LENGTH: Final = 16
 ALLOWED_SURFACE: Final = re.compile(
     r"^[\u3041-\u3096\u30a1-\u30fa\u3400-\u9fff々〆ヵヶー・]+$"
@@ -103,6 +125,20 @@ class RankedRow:
             self.source_ref,
             self.commonness_tier,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedThemeSeed:
+    """One reviewed legacy membership used only during offline generation."""
+
+    surface: str
+    reading: str
+    source_ref: str
+    theme_ids: frozenset[str]
+
+
+BotCsvRow = tuple[str, str, str, str]
+ThemeMembershipCsvRow = tuple[str, str, str, str, str]
 
 
 def _verify_hash(path: Path, expected: str, label: str) -> None:
@@ -394,12 +430,430 @@ def select_rows(
     return accepted
 
 
-def render_rows(rows: Iterable[tuple[str, str, str, str]]) -> str:
-    """Render generated rows exactly as the checked-in CSV."""
+def _legacy_wordnet_refs(source_ref: str) -> tuple[str, ...]:
+    """Expand ``wnja:a|b`` legacy notation to fully qualified refs."""
+
+    if not source_ref.startswith("wnja:"):
+        raise ValueError(f"invalid legacy WordNet source_ref: {source_ref}")
+    values = tuple(
+        f"wnja:{value}"
+        for value in source_ref.removeprefix("wnja:").split("|")
+    )
+    if any(WORDNET_SOURCE_REF.fullmatch(value) is None for value in values):
+        raise ValueError(f"invalid legacy WordNet source_ref: {source_ref}")
+    return values
+
+
+def load_reviewed_theme_seeds(
+    theme_data_directory: Path = THEME_DATA_DIRECTORY,
+) -> tuple[ReviewedThemeSeed, ...]:
+    """Load all legacy and explicit reviewed pairs as build-time seeds."""
+
+    by_pair: dict[tuple[str, str], dict[str, object]] = {}
+    for theme_id in LEGACY_THEME_IDS:
+        for row in load_theme_rows(theme_data_directory / f"{theme_id}.csv"):
+            if row.surface in THEME_BLOCKLISTS[theme_id]:
+                raise ValueError(
+                    f"reviewed seed reintroduces blocked {theme_id} word: "
+                    f"{row.surface}"
+                )
+            key = (row.surface, row.reading)
+            aggregate = by_pair.setdefault(
+                key,
+                {"source_refs": set(), "theme_ids": set()},
+            )
+            source_refs = aggregate["source_refs"]
+            theme_ids = aggregate["theme_ids"]
+            assert isinstance(source_refs, set)
+            assert isinstance(theme_ids, set)
+            source_refs.update(_legacy_wordnet_refs(row.source_ref))
+            theme_ids.add(theme_id)
+
+    additions_path = theme_data_directory / REVIEWED_THEME_DATA_PATH.name
+    for row in load_reviewed_theme_rows(additions_path):
+        key = (row.surface, row.reading)
+        aggregate = by_pair.setdefault(
+            key,
+            {"source_refs": set(), "theme_ids": set()},
+        )
+        source_refs = aggregate["source_refs"]
+        theme_ids = aggregate["theme_ids"]
+        assert isinstance(source_refs, set)
+        assert isinstance(theme_ids, set)
+        source_refs.update(row.source_ref.split(THEME_SEPARATOR))
+        theme_ids.update(row.theme_ids)
+
+    seeds: list[ReviewedThemeSeed] = []
+    for (surface, reading), aggregate in by_pair.items():
+        source_refs = aggregate["source_refs"]
+        theme_ids = aggregate["theme_ids"]
+        assert isinstance(source_refs, set)
+        assert isinstance(theme_ids, set)
+        if not source_refs:
+            raise ValueError(
+                f"reviewed theme seed lacks provenance: {surface}"
+            )
+        seeds.append(
+            ReviewedThemeSeed(
+                surface=surface,
+                reading=reading,
+                source_ref=THEME_SEPARATOR.join(sorted(source_refs)),
+                theme_ids=frozenset(theme_ids),
+            )
+        )
+    return tuple(
+        sorted(
+            seeds,
+            key=lambda seed: (len(seed.surface), seed.surface, seed.reading),
+        )
+    )
+
+
+def validate_reviewed_theme_seeds(
+    seeds: Iterable[ReviewedThemeSeed],
+    *,
+    validator: LexiconValidator,
+) -> tuple[ReviewedThemeSeed, ...]:
+    """Require every reviewed exact reading, including aliases, in Sudachi."""
+
+    frozen_seeds = tuple(seeds)
+    for seed in frozen_seeds:
+        result = validator.validate(seed.surface)
+        if not result.candidates_for_reading(seed.reading):
+            raise ValueError(
+                "reviewed theme seed no longer matches Sudachi: "
+                f"{seed.surface}/{seed.reading}"
+            )
+    return frozen_seeds
+
+
+def merge_reviewed_theme_rows(
+    rows: Iterable[BotCsvRow],
+    seeds: Iterable[ReviewedThemeSeed],
+    *,
+    validator: LexiconValidator | None = None,
+) -> list[BotCsvRow]:
+    """Add conflict-free WordNet reviewed pairs to the general vocabulary.
+
+    All reviewed pairs remain in the unified theme mapping.  This narrower
+    merge adds only pairs that preserve the general vocabulary's one-surface,
+    one-reading invariant and that have WordNet provenance.
+    """
+
+    merged = list(rows)
+    seen_pairs = {(row[0], row[1]) for row in merged}
+    seen_surfaces = {row[0] for row in merged}
+    seen_readings = {row[1] for row in merged}
+    active_validator = validator or LexiconValidator()
+    frozen_seeds = validate_reviewed_theme_seeds(
+        seeds,
+        validator=active_validator,
+    )
+
+    for seed in frozen_seeds:
+        pair = (seed.surface, seed.reading)
+        if pair in seen_pairs:
+            continue
+        if seed.surface in seen_surfaces or seed.reading in seen_readings:
+            continue
+        wordnet_ref = next(
+            (
+                source_ref
+                for source_ref in seed.source_ref.split(THEME_SEPARATOR)
+                if WORDNET_SOURCE_REF.fullmatch(source_ref) is not None
+            ),
+            None,
+        )
+        if wordnet_ref is None:
+            continue
+        merged.append(
+            (seed.surface, seed.reading, wordnet_ref, "wordnet")
+        )
+        seen_pairs.add(pair)
+        seen_surfaces.add(seed.surface)
+        seen_readings.add(seed.reading)
+    return merged
+
+
+def _retain_hierarchical_automatic_themes(
+    eligible_theme_ids: set[str],
+    reviewed_theme_ids: frozenset[str] | set[str] = frozenset(),
+) -> set[str]:
+    """Keep reviewed hierarchy links without changing the old-nine projection.
+
+    The legacy automatic gate remains authoritative.  Reviewed legacy labels
+    can anchor a compatible new automatic tag, but reviewed new labels never
+    make an unrelated automatic tag acceptable.  Explicit reviewed labels are
+    unioned by the caller only after this gate.
+    """
+
+    if not eligible_theme_ids:
+        return set()
+    legacy_automatic = eligible_theme_ids.intersection(LEGACY_THEME_IDS)
+    if (
+        len(legacy_automatic) > 1
+        and not legacy_automatic <= BOTANICAL_THEME_IDS
+    ):
+        return set()
+
+    new_automatic = eligible_theme_ids.difference(LEGACY_THEME_IDS)
+    legacy_anchors = legacy_automatic.union(
+        set(reviewed_theme_ids).intersection(LEGACY_THEME_IDS)
+    )
+    if legacy_anchors:
+        frontier = list(legacy_anchors)
+        retained = set(legacy_anchors)
+        candidates = legacy_anchors.union(new_automatic)
+        while frontier:
+            current = frontier.pop()
+            for candidate in candidates - retained:
+                if (
+                    frozenset((current, candidate))
+                    in AUTOMATIC_MULTI_LABEL_LINKS
+                ):
+                    retained.add(candidate)
+                    frontier.append(candidate)
+        return legacy_automatic.union(retained.intersection(new_automatic))
+
+    if not new_automatic:
+        return legacy_automatic
+    frontier = [
+        next(theme_id for theme_id in THEME_IDS if theme_id in new_automatic)
+    ]
+    retained = set(frontier)
+    while frontier:
+        current = frontier.pop()
+        for candidate in new_automatic - retained:
+            if frozenset((current, candidate)) in AUTOMATIC_MULTI_LABEL_LINKS:
+                retained.add(candidate)
+                frontier.append(candidate)
+    if retained != new_automatic:
+        return legacy_automatic
+    return legacy_automatic.union(new_automatic)
+
+
+def classify_theme_memberships(
+    connection: sqlite3.Connection,
+    rows: Iterable[BotCsvRow],
+    seeds: Iterable[ReviewedThemeSeed],
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Classify exact pairs with fixed, per-theme sense compatibility.
+
+    A surface receives an automatic theme ``T`` only when at least one noun
+    sense reaches a target root for ``T`` and every noun sense reaches one of
+    the separately pinned compatibility roots for ``T``.  Compatibility roots
+    intentionally do not expand when target roots change.  Reviewed exact-pair
+    seeds are unioned only after all automatic review gates.
+    """
+
+    frozen_rows = tuple(rows)
+    connection.execute("DROP TABLE IF EXISTS temp.selected_bot_surface")
+    connection.execute("DROP TABLE IF EXISTS temp.selected_theme_root")
+    connection.execute("DROP TABLE IF EXISTS temp.selected_compatible_root")
+    connection.execute(
+        "CREATE TEMP TABLE selected_bot_surface("
+        "surface TEXT PRIMARY KEY)"
+    )
+    connection.executemany(
+        "INSERT INTO selected_bot_surface(surface) VALUES (?)",
+        ((row[0],) for row in frozen_rows),
+    )
+    connection.execute(
+        "CREATE TEMP TABLE selected_theme_root("
+        "theme_id TEXT NOT NULL, root TEXT NOT NULL, "
+        "PRIMARY KEY(theme_id, root))"
+    )
+    connection.executemany(
+        "INSERT INTO selected_theme_root(theme_id, root) VALUES (?, ?)",
+        (
+            (theme_id, root)
+            for theme_id, roots in THEME_ROOTS.items()
+            for root in roots
+        ),
+    )
+    connection.execute(
+        "CREATE TEMP TABLE selected_compatible_root("
+        "theme_id TEXT NOT NULL, root TEXT NOT NULL, "
+        "PRIMARY KEY(theme_id, root))"
+    )
+    connection.executemany(
+        "INSERT INTO selected_compatible_root(theme_id, root) VALUES (?, ?)",
+        (
+            (theme_id, root)
+            for theme_id, roots in THEME_COMPATIBLE_ROOTS.items()
+            for root in roots
+        ),
+    )
+
+    senses_by_surface: dict[str, set[str]] = {}
+    for surface, synset in connection.execute(
+        """
+        SELECT DISTINCT selected_bot_surface.surface, sense.synset
+        FROM selected_bot_surface
+        JOIN word ON word.lemma = selected_bot_surface.surface
+        JOIN sense ON sense.wordid = word.wordid
+        WHERE word.lang = 'jpn' AND word.pos = 'n'
+        ORDER BY 1, 2
+        """
+    ):
+        senses_by_surface.setdefault(str(surface), set()).add(str(synset))
+
+    def sense_theme_matches(table_name: str) -> dict[tuple[str, str], set[str]]:
+        if table_name not in {
+            "selected_theme_root",
+            "selected_compatible_root",
+        }:
+            raise ValueError(f"unsupported root table: {table_name}")
+        matches: dict[tuple[str, str], set[str]] = {}
+        query = f"""
+            SELECT DISTINCT selected_bot_surface.surface,
+                            sense.synset,
+                            {table_name}.theme_id
+            FROM selected_bot_surface
+            JOIN word ON word.lemma = selected_bot_surface.surface
+            JOIN sense ON sense.wordid = word.wordid
+            JOIN ancestor ON ancestor.synset1 = sense.synset
+            JOIN {table_name} ON {table_name}.root = ancestor.synset2
+            WHERE word.lang = 'jpn' AND word.pos = 'n'
+            UNION
+            SELECT DISTINCT selected_bot_surface.surface,
+                            sense.synset,
+                            {table_name}.theme_id
+            FROM selected_bot_surface
+            JOIN word ON word.lemma = selected_bot_surface.surface
+            JOIN sense ON sense.wordid = word.wordid
+            JOIN {table_name} ON {table_name}.root = sense.synset
+            WHERE word.lang = 'jpn' AND word.pos = 'n'
+            ORDER BY 1, 2, 3
+        """
+        for surface, synset, theme_id in connection.execute(query):
+            key = (str(surface), str(synset))
+            matches.setdefault(key, set()).add(str(theme_id))
+        return matches
+
+    targets_by_sense = sense_theme_matches("selected_theme_root")
+    compatible_by_sense = sense_theme_matches("selected_compatible_root")
+    person_senses = {
+        (str(surface), str(synset))
+        for surface, synset in connection.execute(
+            """
+            SELECT DISTINCT selected_bot_surface.surface, sense.synset
+            FROM selected_bot_surface
+            JOIN word ON word.lemma = selected_bot_surface.surface
+            JOIN sense ON sense.wordid = word.wordid
+            JOIN ancestor ON ancestor.synset1 = sense.synset
+            WHERE word.lang = 'jpn' AND word.pos = 'n'
+              AND ancestor.synset2 = ?
+            UNION
+            SELECT DISTINCT selected_bot_surface.surface, sense.synset
+            FROM selected_bot_surface
+            JOIN word ON word.lemma = selected_bot_surface.surface
+            JOIN sense ON sense.wordid = word.wordid
+            WHERE word.lang = 'jpn' AND word.pos = 'n'
+              AND sense.synset = ?
+            ORDER BY 1, 2
+            """,
+            (PERSON_SYNSET, PERSON_SYNSET),
+        )
+    }
+
+    eligible_by_surface: dict[str, set[str]] = {}
+    for surface, senses in senses_by_surface.items():
+        automatic_theme_ids: set[str] = set()
+        for theme_id in THEME_IDS:
+            if surface in THEME_BLOCKLISTS[theme_id]:
+                continue
+            if not any(
+                theme_id in targets_by_sense.get((surface, synset), ())
+                for synset in senses
+            ):
+                continue
+            if theme_id in PERSON_EXCLUDED_THEME_IDS and any(
+                (surface, synset) in person_senses for synset in senses
+            ):
+                continue
+            if all(
+                theme_id in compatible_by_sense.get((surface, synset), ())
+                for synset in senses
+            ):
+                automatic_theme_ids.add(theme_id)
+
+        if automatic_theme_ids:
+            eligible_by_surface[surface] = automatic_theme_ids
+
+    frozen_seeds = tuple(seeds)
+    reviewed_by_pair = {
+        (seed.surface, seed.reading): seed.theme_ids
+        for seed in frozen_seeds
+    }
+    memberships: dict[tuple[str, str], tuple[str, ...]] = {}
+    for surface, reading, _source_ref, _tier in frozen_rows:
+        reviewed_theme_ids = reviewed_by_pair.get(
+            (surface, reading), frozenset()
+        )
+        theme_ids = _retain_hierarchical_automatic_themes(
+            set(eligible_by_surface.get(surface, ())),
+            reviewed_theme_ids,
+        )
+        theme_ids.update(reviewed_theme_ids)
+        memberships[(surface, reading)] = tuple(
+            theme_id for theme_id in THEME_IDS if theme_id in theme_ids
+        )
+    for seed in frozen_seeds:
+        pair = (seed.surface, seed.reading)
+        if pair not in memberships:
+            memberships[pair] = tuple(
+                theme_id
+                for theme_id in THEME_IDS
+                if theme_id in seed.theme_ids
+            )
+    return memberships
+
+
+def theme_membership_rows(
+    memberships: dict[tuple[str, str], tuple[str, ...]],
+    seeds: Iterable[ReviewedThemeSeed],
+) -> list[ThemeMembershipCsvRow]:
+    """Return tagged exact pairs with their generation provenance."""
+
+    reviewed_by_pair = {
+        (seed.surface, seed.reading): seed.source_ref
+        for seed in seeds
+    }
+    rows: list[ThemeMembershipCsvRow] = []
+    for (surface, reading), theme_ids in memberships.items():
+        if not theme_ids:
+            continue
+        reviewed_source_ref = reviewed_by_pair.get((surface, reading))
+        rows.append(
+            (
+                surface,
+                reading,
+                THEME_SEPARATOR.join(theme_ids),
+                "reviewed" if reviewed_source_ref else "auto",
+                reviewed_source_ref or AUTO_THEME_SOURCE_REF,
+            )
+        )
+    return rows
+
+def render_rows(rows: Iterable[BotCsvRow]) -> str:
+    """Render general Bot rows exactly as the checked-in CSV."""
 
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, lineterminator="\n")
     writer.writerow(CSV_HEADER)
+    writer.writerows(rows)
+    return stream.getvalue()
+
+
+def render_theme_memberships(
+    rows: Iterable[ThemeMembershipCsvRow],
+) -> str:
+    """Render the sparse exact-pair multi-label mapping."""
+
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\n")
+    writer.writerow(WORD_THEME_DATA_HEADER)
     writer.writerows(rows)
     return stream.getvalue()
 
@@ -409,24 +863,60 @@ def build_bot_data(
     tkg_index: Path,
     output: Path,
     *,
+    theme_output: Path,
+    theme_data_directory: Path = THEME_DATA_DIRECTORY,
     check: bool = False,
 ) -> int:
-    """Verify both inputs, generate the CSV, and return its row count."""
+    """Generate the general vocabulary plus its sparse multi-label map."""
 
     verify_wordnet_hash(wordnet_db)
     verify_tkg_hash(tkg_index)
+    seeds = load_reviewed_theme_seeds(theme_data_directory)
+    validator = LexiconValidator()
     database_uri = f"{wordnet_db.resolve().as_uri()}?mode=ro"
     with closing(sqlite3.connect(database_uri, uri=True)) as connection:
         sources = extract_sources(connection)
-    rows = select_rows(sources, load_tkg_entries(tkg_index))
+        base_rows = select_rows(
+            sources,
+            load_tkg_entries(tkg_index),
+            validator=validator,
+        )
+        rows = merge_reviewed_theme_rows(
+            base_rows,
+            seeds,
+            validator=validator,
+        )
+        memberships = classify_theme_memberships(
+            connection,
+            rows,
+            seeds,
+        )
     rendered = render_rows(rows)
+    rendered_themes = render_theme_memberships(
+        theme_membership_rows(memberships, seeds)
+    )
 
+    if output.resolve() == theme_output.resolve():
+        raise ValueError("Bot output and theme output must be different files")
     if check:
         if not output.is_file() or output.read_text(encoding="utf-8") != rendered:
             raise ValueError("checked-in Bot CSV does not match regenerated data")
+        if (
+            not theme_output.is_file()
+            or theme_output.read_text(encoding="utf-8") != rendered_themes
+        ):
+            raise ValueError(
+                "checked-in theme CSV does not match regenerated data"
+            )
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(rendered, encoding="utf-8", newline="")
+        theme_output.parent.mkdir(parents=True, exist_ok=True)
+        theme_output.write_text(
+            rendered_themes,
+            encoding="utf-8",
+            newline="",
+        )
     return len(rows)
 
 
@@ -460,6 +950,18 @@ def parse_args() -> argparse.Namespace:
         help="destination CSV path",
     )
     parser.add_argument(
+        "--theme-output",
+        type=Path,
+        default=WORD_THEME_DATA_PATH,
+        help="destination for sparse exact-pair theme memberships",
+    )
+    parser.add_argument(
+        "--theme-data-directory",
+        type=Path,
+        default=THEME_DATA_DIRECTORY,
+        help="reviewed build-time seed directory for the nine legacy CSVs",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="fail instead of writing when output differs from regenerated data",
@@ -473,6 +975,8 @@ def main() -> None:
         args.wordnet_db,
         args.tkg_index,
         args.output,
+        theme_output=args.theme_output,
+        theme_data_directory=args.theme_data_directory,
         check=args.check,
     )
     action = "verified" if args.check else "written"

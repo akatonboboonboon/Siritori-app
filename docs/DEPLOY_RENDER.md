@@ -26,7 +26,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q .
 ```
 
-最終統合後の全256件の自動テストが成功しています。
+最終統合後の全298件の自動テストが成功しています。
 同じテストを各PRとmainのGitHub Actionsでも再実行します。
 
 ローカル起動:

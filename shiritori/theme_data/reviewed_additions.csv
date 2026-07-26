@@ -1,0 +1,9 @@
+surface,reading,theme_ids,source_ref
+林檎,りんご,food,manual:user-food-v1
+蜜柑,みかん,food,manual:user-food-v1
+西瓜,すいか,food|plant|fruit,manual:user-food-v1
+ユーリンチー,ゆーりんちー,food,manual:user-food-v1
+油淋鶏,ゆーりんちー,food,manual:user-food-v1
+湯豆腐,ゆどうふ,food,manual:user-food-v1
+バス,ばす,vehicle,manual:reviewed-polysemy-v1
+スカッシュ,すかっしゅ,sport|vegetable,manual:reviewed-polysemy-v1
