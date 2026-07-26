@@ -18,6 +18,7 @@ from .lobby import (
     LobbyLeaveResult,
     LobbyMember,
     LobbyMemberError,
+    LobbyNameConflict,
     LobbyNotReadyError,
     LobbyRevisionConflict,
     LobbyRoomNotFound,
@@ -26,6 +27,8 @@ from .lobby import (
     LobbyStateError,
     SpectatorsDisabledError,
     normalize_invite_code,
+    normalize_room_name,
+    room_name_key,
     validate_theme_key,
     validate_turn_seconds,
 )
@@ -83,16 +86,23 @@ class SQLAlchemyLobbyRepository:
         allow_spectators: bool,
         theme_key: str,
         turn_seconds: int | None,
+        is_public: bool = False,
+        fill_empty_seats_with_bots: bool = False,
     ) -> LobbyRoomSnapshot:
         owner = _identifier(owner_user_id, "owner_user_id", 36)
         code = normalize_invite_code(room_code)
-        clean_name = _room_name(name)
+        clean_name = normalize_room_name(name)
+        clean_name_key = room_name_key(clean_name)
         if type(max_players) is not int or not 2 <= max_players <= 8:
             raise ValueError("max_players must be from 2 to 8")
         if type(allow_spectators) is not bool:
             raise ValueError("allow_spectators must be boolean")
         key = validate_theme_key(theme_key)
         seconds = validate_turn_seconds(turn_seconds)
+        if type(is_public) is not bool:
+            raise ValueError("is_public must be boolean")
+        if type(fill_empty_seats_with_bots) is not bool:
+            raise ValueError("fill_empty_seats_with_bots must be boolean")
 
         try:
             with self._guard(), self.database.transaction() as session:
@@ -100,9 +110,12 @@ class SQLAlchemyLobbyRepository:
                     room_code=code,
                     owner_user_id=owner,
                     name=clean_name,
+                    name_key=clean_name_key,
                     status=StoredRoomStatus.WAITING.value,
                     max_players=max_players,
                     allow_spectators=allow_spectators,
+                    is_public=is_public,
+                    fill_empty_seats_with_bots=fill_empty_seats_with_bots,
                     theme_key=key,
                     turn_seconds=seconds,
                     revision=0,
@@ -124,6 +137,13 @@ class SQLAlchemyLobbyRepository:
                 session.flush()
                 return _snapshot(session, room)
         except IntegrityError as error:
+            conflict = _room_integrity_conflict(error)
+            if conflict == "name":
+                raise LobbyNameConflict(clean_name) from error
+            if conflict == "code":
+                raise InviteCodeConflict(code) from error
+            if self._active_name_exists(clean_name_key):
+                raise LobbyNameConflict(clean_name) from error
             if self._code_exists(code):
                 raise InviteCodeConflict(code) from error
             raise
@@ -138,6 +158,28 @@ class SQLAlchemyLobbyRepository:
                 )
             )
             return _snapshot(session, room) if room is not None else None
+
+    def list_public_waiting(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        with self.database.read_session() as session:
+            rooms = tuple(
+                session.scalars(
+                    select(Room)
+                    .where(
+                        Room.is_public.is_(True),
+                        Room.status == StoredRoomStatus.WAITING.value,
+                        Room.deleted_at.is_(None),
+                    )
+                    .order_by(Room.created_at.asc(), Room.id.asc())
+                    .limit(limit)
+                )
+            )
+            return tuple(_snapshot(session, room) for room in rooms)
 
     def find_active_game_id(
         self,
@@ -368,6 +410,7 @@ class SQLAlchemyLobbyRepository:
                     raise LobbyAuthorizationError("only the room owner can start")
                 if not current.all_players_ready:
                     raise LobbyNotReadyError("all players must be ready")
+                expected_bot_count = _expected_bot_count(current)
                 _validate_active_snapshot(
                     current,
                     active_room,
@@ -386,12 +429,16 @@ class SQLAlchemyLobbyRepository:
                     status=StoredGameStatus.ACTIVE.value,
                     theme_key=key,
                     turn_time_seconds=seconds,
-                    bot_count=0,
+                    bot_count=expected_bot_count,
                     bot_difficulty=active_room.bot_difficulty,
                     settings_json={
                         "room_code": room.room_code,
                         "max_players": room.max_players,
                         "allow_spectators": room.allow_spectators,
+                        "is_public": room.is_public,
+                        "fill_empty_seats_with_bots": (
+                            room.fill_empty_seats_with_bots
+                        ),
                     },
                     state_json=document,
                     starting_seat_index=active_room.current_turn,
@@ -478,6 +525,18 @@ class SQLAlchemyLobbyRepository:
                 player.seat_index = index
             session.flush()
             return LobbyLeaveResult(room=_snapshot(session, room), deleted=False)
+
+    def _active_name_exists(self, name_key: str) -> bool:
+        with self.database.read_session() as session:
+            return (
+                session.scalar(
+                    select(Room.id).where(
+                        Room.name_key == name_key,
+                        Room.deleted_at.is_(None),
+                    )
+                )
+                is not None
+            )
 
     def _code_exists(self, room_code: str) -> bool:
         with self.database.read_session() as session:
@@ -571,6 +630,8 @@ def _snapshot(session: Session, room: Room) -> LobbyRoomSnapshot:
         turn_seconds=room.turn_seconds,
         revision=room.revision,
         members=members,
+        is_public=room.is_public,
+        fill_empty_seats_with_bots=room.fill_empty_seats_with_bots,
     )
 
 
@@ -615,6 +676,8 @@ def _active_game_matches(
     if any(spectator.seat_index is not None for spectator in spectators):
         return False
 
+    expected_bot_count = _expected_bot_count_from_room(room, len(players))
+    settings = game.settings_json or {}
     last_turn = active.history[-1] if active.history else None
     return (
         game.room_id == room.id
@@ -628,15 +691,28 @@ def _active_game_matches(
         and game.theme_key == active.theme_key == room.theme_key
         and game.turn_time_seconds == active.turn_seconds == room.turn_seconds
         and game.bot_difficulty == active.bot_difficulty
-        and game.bot_count == 0
+        and game.bot_count == expected_bot_count
+        and settings.get("room_code") == room.room_code
+        and settings.get("max_players") == room.max_players
+        and settings.get("allow_spectators") is room.allow_spectators
+        and settings.get("is_public", False) is room.is_public
+        and settings.get(
+            "fill_empty_seats_with_bots",
+            False,
+        )
+        is room.fill_empty_seats_with_bots
+        and _active_player_layout_matches(
+            tuple(player.user_id for player in players),
+            active,
+            expected_bot_count,
+            require_human_control=False,
+        )
         and game.current_word_surface
         == (last_turn.surface if last_turn is not None else None)
         and game.current_word_reading
         == (last_turn.reading if last_turn is not None else None)
         and game.expected_kana == active.expected_kana
         and game.finished_at is None
-        and tuple(seat.owner_user_id for seat in active.players)
-        == tuple(player.user_id for player in players)
         and active.spectators
         == tuple(spectator.user_id for spectator in spectators)
     )
@@ -650,14 +726,9 @@ def _validate_active_snapshot(
     turn_seconds: int | None,
 ) -> None:
     expected_players = tuple(player.user_id for player in lobby.players)
-    actual_players = tuple(seat.owner_user_id for seat in active.players)
+    expected_bot_count = _expected_bot_count(lobby)
     expected_spectators = tuple(
         spectator.user_id for spectator in lobby.spectators
-    )
-    human_controllers = all(
-        seat.controller is SeatController.HUMAN
-        and not seat.handback_pending
-        for seat in active.players
     )
     initial_shape = (
         active.mode is RoomMode.PVP
@@ -677,17 +748,71 @@ def _validate_active_snapshot(
     )
     if (
         active.room_id != game_id
-        or actual_players != expected_players
+        or not _active_player_layout_matches(
+            expected_players,
+            active,
+            expected_bot_count,
+            require_human_control=True,
+        )
         or active.spectators != expected_spectators
         or active.turn_seconds != turn_seconds
         or active.theme_key != lobby.theme_key
         or lobby.theme_key != theme_key
         or active.bot_difficulty != "normal"
-        or not human_controllers
         or not initial_shape
         or not deadline_shape
     ):
         raise LobbyRevisionConflict(lobby)
+
+
+def _expected_bot_count(lobby: LobbyRoomSnapshot) -> int:
+    return (
+        lobby.max_players - len(lobby.players)
+        if lobby.fill_empty_seats_with_bots
+        else 0
+    )
+
+
+def _expected_bot_count_from_room(room: Room, human_count: int) -> int:
+    return (
+        room.max_players - human_count
+        if room.fill_empty_seats_with_bots
+        else 0
+    )
+
+
+def _active_player_layout_matches(
+    expected_human_ids: tuple[str, ...],
+    active: ActiveRoomSnapshot,
+    expected_bot_count: int,
+    *,
+    require_human_control: bool,
+) -> bool:
+    if len(active.players) != len(expected_human_ids) + expected_bot_count:
+        return False
+    human_seats = active.players[: len(expected_human_ids)]
+    bot_seats = active.players[len(expected_human_ids) :]
+    return (
+        tuple(seat.owner_user_id for seat in human_seats)
+        == expected_human_ids
+        and all(
+            (
+                seat.controller is SeatController.HUMAN
+                and not seat.handback_pending
+            )
+            or (
+                not require_human_control
+                and seat.controller is SeatController.BOT
+            )
+            for seat in human_seats
+        )
+        and all(
+            seat.owner_user_id is None
+            and seat.controller is SeatController.BOT
+            and not seat.handback_pending
+            for seat in bot_seats
+        )
+    )
 
 
 def _identifier(value: str, name: str, maximum: int) -> str:
@@ -701,13 +826,18 @@ def _identifier(value: str, name: str, maximum: int) -> str:
     return value
 
 
-def _room_name(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("room name must be text")
-    result = value.strip()
-    if not 1 <= len(result) <= 64:
-        raise ValueError("room name must contain 1-64 characters")
-    return result
+def _room_integrity_conflict(error: IntegrityError) -> str | None:
+    """Classify portable unique-constraint failures without hiding others."""
+
+    message = str(error.orig).casefold()
+    if (
+        "uq_rooms_active_name_key" in message
+        or "rooms.name_key" in message
+    ):
+        return "name"
+    if "uq_rooms_room_code" in message or "rooms.room_code" in message:
+        return "code"
+    return None
 
 
 __all__ = ["SQLAlchemyLobbyRepository"]

@@ -20,6 +20,7 @@ from shiritori.rooms import (
     RoomAuthorizationError,
     RoomCoordinator,
     RoomEventKind,
+    RoomInactive,
     RoomMode,
     RoomNotFound,
     RoomOperationConflictError,
@@ -161,6 +162,37 @@ class RoomFactoryTests(unittest.TestCase):
                 for seat in snapshot.players[1:]
             )
         )
+
+    def test_pvp_factory_can_fill_open_seats_with_permanent_bots(self) -> None:
+        snapshot = create_room_snapshot(
+            "pvp-with-bots",
+            ("alice",),
+            mode=RoomMode.PVP,
+            permanent_bot_count=2,
+            now=NOW,
+            seat_picker=lambda count: count - 1,
+        )
+
+        self.assertEqual(len(snapshot.players), 3)
+        self.assertEqual(snapshot.current_turn, 2)
+        self.assertEqual(snapshot.players[0].owner_user_id, "alice")
+        self.assertEqual(
+            [seat.controller for seat in snapshot.players],
+            [
+                SeatController.HUMAN,
+                SeatController.BOT,
+                SeatController.BOT,
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            create_room_snapshot(
+                "pvp-too-small",
+                ("alice",),
+                mode=RoomMode.PVP,
+                now=NOW,
+                seat_picker=lambda _: 0,
+            )
 
     def test_factory_validates_timer_range_and_picker(self) -> None:
         maximum = create_room_snapshot(
@@ -524,6 +556,426 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 operation_id="bound-operation",
                 now=NOW,
             )
+
+    async def test_two_seat_surrender_finishes_and_exact_retry_is_idempotent(
+        self,
+    ) -> None:
+        room = pvp_room(deadline_at=NOW + timedelta(seconds=10))
+        room = replace(
+            room,
+            players=(
+                replace(
+                    room.players[0],
+                    controller=SeatController.BOT,
+                ),
+                room.players[1],
+            ),
+        )
+        repository = InMemoryRoomRepository([room])
+        coordinator = RoomCoordinator(repository)
+        events = []
+        coordinator.hub.subscribe(
+            "pvp",
+            "bob",
+            "bob-tab",
+            Role.PLAYER,
+            events.append,
+        )
+        pending_disconnect = asyncio.create_task(asyncio.sleep(60))
+        coordinator._disconnect_tasks[("pvp", "alice")] = pending_disconnect
+
+        try:
+            first = await coordinator.surrender(
+                "pvp",
+                "alice",
+                expected_version=0,
+                operation_id="surrender-alice",
+                now=NOW,
+            )
+            retried = await coordinator.surrender(
+                "pvp",
+                "alice",
+                expected_version=0,
+                operation_id="surrender-alice",
+                now=NOW + timedelta(seconds=5),
+            )
+            await asyncio.sleep(0)
+        finally:
+            pending_disconnect.cancel()
+            await asyncio.gather(
+                pending_disconnect,
+                return_exceptions=True,
+            )
+
+        self.assertFalse(first.duplicate)
+        self.assertTrue(retried.duplicate)
+        self.assertEqual(first.snapshot, retried.snapshot)
+        assert first.snapshot is not None
+        self.assertEqual(first.snapshot.status, RoomStatus.FINISHED)
+        self.assertEqual(first.snapshot.current_turn, 1)
+        self.assertEqual(first.snapshot.eliminated_seats, (0,))
+        self.assertEqual(first.snapshot.active_seat_indexes, (1,))
+        self.assertEqual(first.snapshot.role_for_user("alice"), Role.SPECTATOR)
+        self.assertEqual(first.snapshot.end_reason, "surrender")
+        self.assertEqual(first.snapshot.losing_seat, 0)
+        self.assertIsNone(first.snapshot.timed_out_seat)
+        self.assertIsNone(first.snapshot.expected_kana)
+        self.assertIsNone(first.snapshot.deadline_at)
+        self.assertTrue(pending_disconnect.cancelled())
+        self.assertEqual(events[-1].kind, RoomEventKind.SNAPSHOT)
+        self.assertEqual(events[-1].snapshot, first.snapshot)
+
+    async def test_current_player_surrender_advances_and_resets_deadline(
+        self,
+    ) -> None:
+        room = create_room_snapshot(
+            "multi-current",
+            ("alice", "bob", "carol"),
+            mode=RoomMode.PVP,
+            turn_seconds=30,
+            now=NOW,
+            seat_picker=lambda _: 0,
+        )
+        room = replace(
+            room,
+            expected_kana="り",
+            deadline_at=NOW + timedelta(seconds=10),
+        )
+        repository = InMemoryRoomRepository([room])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.surrender(
+            "multi-current",
+            "alice",
+            expected_version=0,
+            operation_id="surrender-current",
+            now=NOW + timedelta(seconds=2),
+        )
+
+        assert outcome.snapshot is not None
+        self.assertEqual(outcome.snapshot.status, RoomStatus.ACTIVE)
+        self.assertEqual(outcome.snapshot.current_turn, 1)
+        self.assertEqual(outcome.snapshot.eliminated_seats, (0,))
+        self.assertEqual(outcome.snapshot.expected_kana, "り")
+        self.assertEqual(
+            outcome.snapshot.deadline_at,
+            NOW + timedelta(seconds=32),
+        )
+        self.assertEqual(outcome.snapshot.end_reason, "surrender")
+        self.assertEqual(outcome.snapshot.losing_seat, 0)
+        self.assertIsNone(outcome.snapshot.timed_out_seat)
+
+    async def test_non_current_surrender_preserves_turn_and_deadline(
+        self,
+    ) -> None:
+        original_deadline = NOW + timedelta(seconds=10)
+        room = create_room_snapshot(
+            "multi-non-current",
+            ("alice", "bob", "carol"),
+            mode=RoomMode.PVP,
+            turn_seconds=30,
+            now=NOW,
+            seat_picker=lambda _: 0,
+        )
+        room = replace(
+            room,
+            expected_kana="り",
+            deadline_at=original_deadline,
+        )
+        repository = InMemoryRoomRepository([room])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.surrender(
+            "multi-non-current",
+            "bob",
+            expected_version=0,
+            operation_id="surrender-non-current",
+            now=NOW + timedelta(seconds=2),
+        )
+
+        assert outcome.snapshot is not None
+        self.assertEqual(outcome.snapshot.status, RoomStatus.ACTIVE)
+        self.assertEqual(outcome.snapshot.current_turn, 0)
+        self.assertEqual(outcome.snapshot.eliminated_seats, (1,))
+        self.assertEqual(outcome.snapshot.expected_kana, "り")
+        self.assertEqual(outcome.snapshot.deadline_at, original_deadline)
+        self.assertEqual(outcome.snapshot.losing_seat, 1)
+
+    async def test_surrender_finishes_when_only_one_pvp_survivor_remains(
+        self,
+    ) -> None:
+        room = create_room_snapshot(
+            "multi-last-two",
+            ("alice", "bob", "carol"),
+            mode=RoomMode.PVP,
+            turn_seconds=30,
+            now=NOW,
+            seat_picker=lambda _: 0,
+        )
+        room = replace(
+            room,
+            eliminated_seats=(2,),
+            deadline_at=NOW + timedelta(seconds=10),
+        )
+        repository = InMemoryRoomRepository([room])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.surrender(
+            "multi-last-two",
+            "bob",
+            expected_version=0,
+            operation_id="surrender-last-two",
+            now=NOW,
+        )
+
+        assert outcome.snapshot is not None
+        self.assertEqual(outcome.snapshot.status, RoomStatus.FINISHED)
+        self.assertEqual(outcome.snapshot.current_turn, 0)
+        self.assertEqual(outcome.snapshot.eliminated_seats, (2, 1))
+        self.assertEqual(outcome.snapshot.active_seat_indexes, (0,))
+        self.assertEqual(outcome.snapshot.losing_seat, 1)
+        self.assertIsNone(outcome.snapshot.deadline_at)
+
+    async def test_solo_surrender_leaves_exactly_one_permanent_bot(
+        self,
+    ) -> None:
+        room = create_room_snapshot(
+            "solo-many-bots",
+            ("alice",),
+            mode=RoomMode.SOLO_BOT,
+            permanent_bot_count=3,
+            turn_seconds=30,
+            now=NOW,
+            seat_picker=lambda _: 2,
+        )
+        room = replace(
+            room,
+            players=(
+                replace(
+                    room.players[0],
+                    controller=SeatController.BOT,
+                ),
+                *room.players[1:],
+            ),
+        )
+        repository = InMemoryRoomRepository([room])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.surrender(
+            "solo-many-bots",
+            "alice",
+            expected_version=0,
+            operation_id="surrender-solo",
+            now=NOW,
+        )
+
+        assert outcome.snapshot is not None
+        self.assertEqual(outcome.snapshot.status, RoomStatus.FINISHED)
+        self.assertEqual(outcome.snapshot.current_turn, 1)
+        self.assertEqual(outcome.snapshot.active_seat_indexes, (1,))
+        self.assertEqual(outcome.snapshot.eliminated_seats, (0, 2, 3))
+        self.assertIsNone(
+            outcome.snapshot.players[1].owner_user_id
+        )
+        self.assertEqual(
+            outcome.snapshot.players[1].controller,
+            SeatController.BOT,
+        )
+        self.assertEqual(outcome.snapshot.losing_seat, 0)
+        self.assertEqual(outcome.snapshot.end_reason, "surrender")
+        self.assertIsNone(outcome.snapshot.timed_out_seat)
+        self.assertIsNone(outcome.snapshot.deadline_at)
+
+    async def test_surrender_rejects_non_active_or_unauthorized_users(
+        self,
+    ) -> None:
+        active = create_room_snapshot(
+            "surrender-auth",
+            ("alice", "bob", "carol"),
+            mode=RoomMode.PVP,
+            spectators=("viewer",),
+            now=NOW,
+            seat_picker=lambda _: 1,
+        )
+        eliminated = replace(active, eliminated_seats=(0,))
+        finished = replace(
+            pvp_room(),
+            status=RoomStatus.FINISHED,
+            current_turn=1,
+            eliminated_seats=(0,),
+            expected_kana=None,
+            deadline_at=None,
+        )
+        paused = replace(
+            solo_room(),
+            status=RoomStatus.PAUSED,
+            deadline_at=None,
+            paused_remaining_seconds=10,
+        )
+        cases = (
+            (active, "viewer", RoomAuthorizationError, "spectator"),
+            (active, "outsider", RoomAuthorizationError, "outsider"),
+            (eliminated, "alice", RoomAuthorizationError, "eliminated"),
+            (finished, "bob", RoomInactive, "finished"),
+            (paused, "alice", RoomInactive, "paused"),
+        )
+
+        for snapshot, user_id, error_type, label in cases:
+            with self.subTest(case=label):
+                coordinator = RoomCoordinator(
+                    InMemoryRoomRepository([snapshot])
+                )
+                with self.assertRaises(error_type):
+                    await coordinator.surrender(
+                        snapshot.room_id,
+                        user_id,
+                        expected_version=0,
+                        operation_id=f"surrender-{label}",
+                        now=NOW,
+                    )
+        bot_only_actor = RoomCoordinator(
+            InMemoryRoomRepository([solo_room()])
+        )
+        with self.assertRaises(RoomAuthorizationError):
+            await bot_only_actor.surrender(
+                "solo",
+                None,  # type: ignore[arg-type]
+                expected_version=0,
+                operation_id="surrender-permanent-bot",
+                now=NOW,
+            )
+
+    async def test_surrender_rejects_stale_version_without_mutation(
+        self,
+    ) -> None:
+        room = pvp_room(version=2)
+        repository = InMemoryRoomRepository([room])
+        coordinator = RoomCoordinator(repository)
+
+        with self.assertRaises(RoomVersionConflict):
+            await coordinator.surrender(
+                "pvp",
+                "alice",
+                expected_version=1,
+                operation_id="stale-surrender",
+                now=NOW,
+            )
+
+        self.assertEqual(await repository.load("pvp"), room)
+
+    async def test_surrender_operation_id_is_bound_to_actor_action_and_version(
+        self,
+    ) -> None:
+        repository = InMemoryRoomRepository([pvp_room()])
+        coordinator = RoomCoordinator(repository)
+        await coordinator.surrender(
+            "pvp",
+            "alice",
+            expected_version=0,
+            operation_id="bound-surrender",
+            now=NOW,
+        )
+
+        with self.assertRaises(RoomOperationConflictError):
+            await coordinator.surrender(
+                "pvp",
+                "bob",
+                expected_version=0,
+                operation_id="bound-surrender",
+                now=NOW,
+            )
+        with self.assertRaises(RoomOperationConflictError):
+            await coordinator.leave(
+                "pvp",
+                "alice",
+                expected_version=0,
+                operation_id="bound-surrender",
+                now=NOW,
+            )
+        with self.assertRaises(RoomOperationConflictError):
+            await coordinator.surrender(
+                "pvp",
+                "alice",
+                expected_version=1,
+                operation_id="bound-surrender",
+                now=NOW,
+            )
+
+    async def test_eliminated_owner_absence_never_enables_temporary_bot(
+        self,
+    ) -> None:
+        for absence in ("disconnect", "leave"):
+            with self.subTest(absence=absence):
+                room_id = f"eliminated-{absence}"
+                room = create_room_snapshot(
+                    room_id,
+                    ("alice", "bob", "carol"),
+                    mode=RoomMode.PVP,
+                    now=NOW,
+                    seat_picker=lambda _: 0,
+                )
+                repository = InMemoryRoomRepository([room])
+                coordinator = RoomCoordinator(
+                    repository,
+                    disconnect_grace_seconds=0,
+                    clock=lambda: NOW,
+                )
+                await coordinator.connect_client(
+                    room_id,
+                    "alice",
+                    f"alice-{absence}",
+                )
+                await coordinator.connect_client(
+                    room_id,
+                    "bob",
+                    f"bob-{absence}",
+                )
+                surrendered = await coordinator.surrender(
+                    room_id,
+                    "alice",
+                    expected_version=0,
+                    operation_id=f"surrender-{absence}",
+                    now=NOW,
+                )
+                assert surrendered.snapshot is not None
+
+                if absence == "disconnect":
+                    task = await coordinator.disconnect_client(
+                        room_id,
+                        f"alice-{absence}",
+                    )
+                    self.assertIsNotNone(task)
+                    assert task is not None
+                    await task
+                else:
+                    await coordinator.leave(
+                        room_id,
+                        "alice",
+                        expected_version=1,
+                        operation_id="leave-eliminated",
+                        now=NOW,
+                    )
+
+                snapshot = await repository.load(room_id)
+                assert snapshot is not None
+                self.assertEqual(snapshot.status, RoomStatus.ACTIVE)
+                self.assertEqual(snapshot.current_turn, 1)
+                self.assertEqual(snapshot.eliminated_seats, (0,))
+                self.assertEqual(
+                    snapshot.players[0],
+                    surrendered.snapshot.players[0],
+                )
+                self.assertEqual(
+                    snapshot.players[0].controller,
+                    SeatController.HUMAN,
+                )
+                self.assertFalse(snapshot.players[0].handback_pending)
+                self.assertEqual(
+                    snapshot.role_for_user("alice"),
+                    Role.SPECTATOR,
+                )
+                self.assertFalse(coordinator.hub.has_user(room_id, "alice"))
+                self.assertTrue(coordinator.hub.has_user(room_id, "bob"))
 
     async def test_user_cannot_preclaim_future_runtime_timeout_operation(self) -> None:
         room = pvp_room(deadline_at=NOW + timedelta(seconds=3))
@@ -1021,6 +1473,62 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await coordinator.load_snapshot("solo")
         self.assertEqual(snapshot.status, RoomStatus.PAUSED)
         self.assertEqual(snapshot.paused_remaining_seconds, 12)
+
+    async def test_restart_recovery_deletes_empty_finished_pvp_room(self) -> None:
+        finished = replace(
+            pvp_room(),
+            status=RoomStatus.FINISHED,
+            state_version=1,
+            eliminated_seats=(0,),
+            expected_kana=None,
+            deadline_at=None,
+            losing_seat=0,
+            end_reason="surrender",
+        )
+        repository = InMemoryRoomRepository([finished])
+        coordinator = RoomCoordinator(
+            repository,
+            disconnect_grace_seconds=0,
+        )
+
+        recovered = await coordinator.recover_after_restart("pvp")
+        self.assertEqual(recovered, finished)
+        pending = tuple(coordinator._disconnect_tasks.values())
+        self.assertEqual(len(pending), 2)
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        self.assertIsNone(await repository.load("pvp"))
+
+    async def test_finished_pvp_waits_for_returning_human_after_restart(
+        self,
+    ) -> None:
+        finished = replace(
+            pvp_room(),
+            status=RoomStatus.FINISHED,
+            state_version=1,
+            eliminated_seats=(0,),
+            expected_kana=None,
+            deadline_at=None,
+            losing_seat=0,
+            end_reason="surrender",
+        )
+        repository = InMemoryRoomRepository([finished])
+        coordinator = RoomCoordinator(
+            repository,
+            disconnect_grace_seconds=0.01,
+        )
+
+        await coordinator.recover_after_restart("pvp")
+        returned = await coordinator.connect_client(
+            "pvp",
+            "alice",
+            "alice-returned",
+        )
+        pending = tuple(coordinator._disconnect_tasks.values())
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        self.assertEqual(returned, finished)
+        self.assertEqual(await repository.load("pvp"), finished)
 
     async def test_last_human_pauses_solo_and_reconnect_resumes_snapshot(self) -> None:
         repository = InMemoryRoomRepository(

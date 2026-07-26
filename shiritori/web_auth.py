@@ -35,7 +35,7 @@ from .auth import (
 )
 from .bots import canonical_kana
 from .database import GameRepository
-from .lobby import LobbyError, LobbyService
+from .lobby import LobbyError, LobbyNameConflict, LobbyService
 from .models import RoomRole, RoomStatus as StoredRoomStatus
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
@@ -150,6 +150,53 @@ def _solo_difficulty_options() -> dict[str, str]:
         "normal": "ふつう",
         "hard": "むずかしい",
     }
+
+
+def _room_timer_text(turn_seconds: int | None) -> str:
+    """Return the compact Japanese timer label shared by room screens."""
+
+    return "無制限" if turn_seconds is None else f"{turn_seconds}秒"
+
+
+def _room_listing_summary(room: object) -> str:
+    """Describe only the non-sensitive fields allowed in public listings."""
+
+    players = getattr(room, "players")
+    player_count = len(players)
+    max_players = int(getattr(room, "max_players"))
+    timer = _room_timer_text(getattr(room, "turn_seconds"))
+    bot_fill = (
+        "不足分はNormal Bot"
+        if bool(getattr(room, "fill_empty_seats_with_bots"))
+        else "Bot補充なし"
+    )
+    spectator = (
+        "観戦可"
+        if bool(getattr(room, "allow_spectators"))
+        else "観戦不可"
+    )
+    return (
+        f"対戦参加 {player_count}/{max_players}人・"
+        f"{timer}・{bot_fill}・{spectator}"
+    )
+
+
+def _room_invite_url(request: Request, room_code: str) -> str:
+    """Build an absolute same-origin invite URL for clipboard sharing."""
+
+    return f"{str(request.base_url).rstrip('/')}/join/{room_code}"
+
+
+def _can_surrender(snapshot: RoomSnapshot, user_id: str) -> bool:
+    """Return whether the authenticated owner still has an active seat."""
+
+    seat = snapshot.seat_for_user(user_id)
+    return (
+        snapshot.status is RoomStatus.ACTIVE
+        and seat is not None
+        and seat.owner_user_id == user_id
+        and seat.index not in snapshot.eliminated_seats
+    )
 
 
 class CsrfProtector:
@@ -381,6 +428,22 @@ def _auth_rate_limit_keys(
     )
     return ip_key, account_key
 
+
+def _invite_rate_limit_keys(
+    request: Request, account_id: str
+) -> tuple[str, str]:
+    """Return independent fixed-size buckets for invite-code lookups."""
+
+    client_host = request.client.host if request.client else "unknown"
+    ip_identity = str(client_host).strip().casefold() or "unknown"
+    account_identity = str(account_id).strip() or "unknown"
+    return (
+        "invite-ip:" + sha256(ip_identity.encode("utf-8")).hexdigest(),
+        "invite-account:"
+        + sha256(account_identity.encode("utf-8")).hexdigest(),
+    )
+
+
 def _safe_next(value: str | None, *, default: str = "/lobby") -> str:
     candidate = str(value or "")
     parts = urlsplit(candidate)
@@ -515,6 +578,10 @@ def register_auth_pages(
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
+    invite_account_attempts = LoginAttemptLimiter(
+        attempts=30, window_seconds=60
+    )
+    invite_ip_attempts = LoginAttemptLimiter(attempts=60, window_seconds=60)
 
     def consume_auth_attempt(
         request: Request, username: str
@@ -525,6 +592,16 @@ def register_auth_pages(
         ip_allowed = ip_attempts.allow(ip_key)
         account_allowed = account_attempts.allow(account_key)
         return ip_allowed and account_allowed, account_key
+
+    def consume_invite_attempt(request: Request, account_id: str) -> bool:
+        ip_key, account_key = _invite_rate_limit_keys(
+            request, account_id
+        )
+        # Always consume both buckets so the response does not reveal which
+        # identity reached its limit.
+        ip_allowed = invite_ip_attempts.allow(ip_key)
+        account_allowed = invite_account_attempts.allow(account_key)
+        return ip_allowed and account_allowed
 
     async def principal_for(request: Request):
         return await session_principal_from_request(
@@ -729,9 +806,20 @@ def register_auth_pages(
                         spectator_switch = ui.switch(
                             "観戦を許可する", value=True
                         )
+                        public_switch = ui.switch(
+                            "公開部屋としてロビーに表示する",
+                            value=False,
+                        )
+                        ui.label(
+                            "非公開でも、招待URLを知っている人は参加できます。"
+                        ).classes("platform-muted room-setting-help")
+                        bot_fill_switch = ui.switch(
+                            "不足人数をNormal Botで補う",
+                            value=False,
+                        )
                         room_code_input = ui.input(
                             label="参加コード",
-                            placeholder="例: ABC234",
+                            placeholder="例: ABCD234567",
                         ).props(
                             "outlined maxlength=12 autocomplete=off"
                         ).classes("w-full")
@@ -789,7 +877,15 @@ def register_auth_pages(
                                     allow_spectators=bool(
                                         spectator_switch.value
                                     ),
+                                    is_public=bool(public_switch.value),
+                                    fill_empty_seats_with_bots=bool(
+                                        bot_fill_switch.value
+                                    ),
                                     turn_seconds=room_turn_seconds(),
+                                )
+                            except LobbyNameConflict:
+                                room_error.set_text(
+                                    "同名の部屋が既にあります。"
                                 )
                             except (LobbyError, TypeError, ValueError):
                                 LOGGER.exception("invalid room setup")
@@ -831,6 +927,13 @@ def register_auth_pages(
                                     raise RuntimeError(
                                         "lobby service is unavailable"
                                     )
+                                if not consume_invite_attempt(
+                                    request, current_principal.account.id
+                                ):
+                                    room_error.set_text(
+                                        "確認回数が多すぎます。少し待ってください。"
+                                    )
+                                    return
                                 join_method = (
                                     lobby.join_as_spectator
                                     if as_spectator
@@ -999,6 +1102,252 @@ def register_auth_pages(
                             on_click=create_solo_game,
                         ).props("unelevated no-caps").classes("w-full")
 
+                with ui.column().classes(
+                    "dashboard-card public-room-list"
+                ):
+                    with ui.row().classes(
+                        "w-full items-center justify-between gap-3"
+                    ):
+                        ui.label("公開中の部屋").classes("aside-title")
+                        public_room_status = ui.label("").classes(
+                            "platform-muted"
+                        ).props("role='status' aria-live='polite'")
+                    ui.label(
+                        "参加したい部屋を選ぶと、内容を確認してから入れます。"
+                    ).classes("platform-muted")
+                    public_room_box = ui.column().classes(
+                        "w-full gap-3"
+                    )
+                    public_refreshing = False
+
+                    async def refresh_public_rooms() -> None:
+                        nonlocal public_refreshing
+                        if public_refreshing:
+                            return
+                        public_refreshing = True
+                        try:
+                            if lobby is None:
+                                raise RuntimeError(
+                                    "lobby service is unavailable"
+                                )
+                            listed_rooms = await asyncio.to_thread(
+                                lobby.list_public_waiting,
+                                limit=50,
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "failed to list public waiting rooms"
+                            )
+                            public_room_status.set_text(
+                                "公開部屋を取得できませんでした。"
+                            )
+                        else:
+                            public_room_box.clear()
+                            public_room_status.set_text(
+                                f"{len(listed_rooms)}件"
+                            )
+                            with public_room_box:
+                                if not listed_rooms:
+                                    ui.label(
+                                        "現在、参加できる公開部屋はありません。"
+                                    ).classes("platform-muted")
+                                for listed_room in listed_rooms:
+                                    with ui.row().classes(
+                                        "public-room-card w-full "
+                                        "items-center justify-between gap-3"
+                                    ):
+                                        with ui.column().classes(
+                                            "min-w-0 gap-1"
+                                        ):
+                                            ui.label(
+                                                listed_room.name
+                                            ).classes("aside-title")
+                                            ui.label(
+                                                _room_listing_summary(
+                                                    listed_room
+                                                )
+                                            ).classes("platform-muted")
+                                        ui.link(
+                                            "部屋を見る",
+                                            f"/join/{listed_room.room_code}",
+                                        ).classes("platform-link")
+                        finally:
+                            public_refreshing = False
+
+                await refresh_public_rooms()
+                ui.timer(4.0, refresh_public_rooms)
+
+    @ui.page("/join/{room_code}")
+    async def room_invite_page(room_code: str, request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            next_path = f"/join/{room_code}"
+            return RedirectResponse(
+                f"/login?{urlencode({'next': next_path})}",
+                status_code=303,
+            )
+        if lobby is None:
+            return RedirectResponse("/lobby", status_code=303)
+
+        invite_rate_limited = not consume_invite_attempt(
+            request, principal.account.id
+        )
+        if invite_rate_limited:
+            initial_room = None
+        else:
+            try:
+                initial_room = await asyncio.to_thread(
+                    lobby.get_room, room_code
+                )
+            except (LobbyError, TypeError, ValueError):
+                initial_room = None
+
+        if (
+            initial_room is not None
+            and initial_room.member_for(principal.account.id) is not None
+        ):
+            return RedirectResponse(
+                f"/room/{initial_room.room_code}",
+                status_code=303,
+            )
+        if (
+            initial_room is not None
+            and initial_room.status is not StoredRoomStatus.WAITING
+        ):
+            initial_room = None
+
+        _page_shell()
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                ui.link("← ロビーへ", "/lobby").classes("platform-link")
+                with ui.column().classes(
+                    "dashboard-card room-invite-card"
+                ):
+                    ui.label("部屋への招待").classes("auth-title")
+                    if initial_room is None:
+                        unavailable_message = (
+                            "招待URLの確認回数が多すぎます。"
+                            "少し待ってからお試しください。"
+                            if invite_rate_limited
+                            else "この招待URLは無効か、部屋が削除されています。"
+                        )
+                        ui.label(unavailable_message).classes(
+                            "auth-error"
+                        ).props(
+                            "role='alert' aria-live='assertive'"
+                        )
+                        return
+                    visibility = (
+                        "公開部屋"
+                        if initial_room.is_public
+                        else "招待URL限定の非公開部屋"
+                    )
+                    ui.label(initial_room.name).classes("aside-title")
+                    ui.label(
+                        f"{visibility}・"
+                        f"{_room_listing_summary(initial_room)}"
+                    ).classes("platform-muted")
+                    join_feedback = ui.label(
+                        "参加方法を選んでください。"
+                    ).classes("platform-muted").props(
+                        "role='status' aria-live='polite'"
+                    )
+                    join_busy = False
+
+                    async def accept_invite(
+                        *,
+                        as_spectator: bool,
+                    ) -> None:
+                        nonlocal join_busy
+                        if join_busy:
+                            return
+                        join_busy = True
+                        player_join_button.disable()
+                        spectator_join_button.disable()
+                        try:
+                            current_principal = await principal_for(
+                                request
+                            )
+                            if current_principal is None:
+                                ui.navigate.to(
+                                    "/login?"
+                                    + urlencode(
+                                        {
+                                            "next": f"/join/{room_code}"
+                                        }
+                                    )
+                                )
+                                return
+                            if not consume_invite_attempt(
+                                request, current_principal.account.id
+                            ):
+                                join_feedback.set_text(
+                                    "確認回数が多すぎます。"
+                                    "少し待ってからお試しください。"
+                                )
+                                return
+                            join_method = (
+                                lobby.join_as_spectator
+                                if as_spectator
+                                else lobby.join_as_player
+                            )
+                            joined = await asyncio.to_thread(
+                                join_method,
+                                current_principal.account.id,
+                                initial_room.room_code,
+                            )
+                        except LobbyError:
+                            join_feedback.set_text(
+                                "部屋の状態が変わりました。"
+                                "ロビーから最新の状態を確認してください。"
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "unexpected invite acceptance failure"
+                            )
+                            join_feedback.set_text(
+                                "部屋へ参加できませんでした。"
+                            )
+                        else:
+                            ui.navigate.to(
+                                f"/room/{joined.room_code}"
+                            )
+                            return
+                        finally:
+                            join_busy = False
+                            if (
+                                len(initial_room.players)
+                                < initial_room.max_players
+                            ):
+                                player_join_button.enable()
+                            if initial_room.allow_spectators:
+                                spectator_join_button.enable()
+
+                    player_join_button = ui.button(
+                        "対戦参加",
+                        icon="sports_esports",
+                        on_click=lambda: accept_invite(
+                            as_spectator=False
+                        ),
+                    ).props("unelevated no-caps").classes("w-full")
+                    spectator_join_button = ui.button(
+                        "観戦参加",
+                        icon="visibility",
+                        on_click=lambda: accept_invite(
+                            as_spectator=True
+                        ),
+                    ).props("outline no-caps").classes("w-full")
+                    if (
+                        len(initial_room.players)
+                        >= initial_room.max_players
+                    ):
+                        player_join_button.disable()
+                    if not initial_room.allow_spectators:
+                        spectator_join_button.disable()
+                        spectator_join_button.set_text(
+                            "この部屋は観戦できません"
+                        )
+
     @ui.page("/room/{room_code}")
     async def waiting_room_page(room_code: str, request: Request):
         principal = await principal_for(request)
@@ -1035,6 +1384,9 @@ def register_auth_pages(
 
         _page_shell()
         current_room = initial_room
+        invite_url = _room_invite_url(
+            request, initial_room.room_code
+        )
         refreshing = False
 
         def render_room(room) -> None:
@@ -1044,13 +1396,18 @@ def register_auth_pages(
             room_code_label.set_text(
                 f"参加コード: {room.room_code}"
             )
-            timer_text = (
-                "無制限"
-                if room.turn_seconds is None
-                else f"{room.turn_seconds}秒"
+            visibility = (
+                "公開" if room.is_public else "非公開"
+            )
+            bot_fill = (
+                "不足分はNormal Bot"
+                if room.fill_empty_seats_with_bots
+                else "Bot補充なし"
             )
             settings_label.set_text(
-                f"制限時間: {timer_text}・最大{room.max_players}人"
+                f"{visibility}・制限時間: "
+                f"{_room_timer_text(room.turn_seconds)}・"
+                f"最大{room.max_players}人・{bot_fill}"
             )
             members_box.clear()
             with members_box:
@@ -1088,14 +1445,28 @@ def register_auth_pages(
             start_button.set_visibility(is_owner)
             if is_owner and room.all_players_ready:
                 start_button.enable()
-                message_label.set_text(
-                    "全員の準備が完了しました。"
-                )
+                if room.fill_empty_seats_with_bots:
+                    missing = room.max_players - len(room.players)
+                    message_label.set_text(
+                        "参加者の準備が完了しました。"
+                        f"開始すると空き{missing}席を"
+                        "Normal Botで補います。"
+                    )
+                else:
+                    message_label.set_text(
+                        "全員の準備が完了しました。"
+                    )
             elif is_owner:
                 start_button.disable()
-                message_label.set_text(
-                    "2人以上が準備OKになると開始できます。"
-                )
+                if room.fill_empty_seats_with_bots:
+                    message_label.set_text(
+                        "参加中の全プレイヤーが準備OKなら、"
+                        "1人でも開始できます。"
+                    )
+                else:
+                    message_label.set_text(
+                        "2人以上が準備OKになると開始できます。"
+                    )
             elif is_player:
                 message_label.set_text(
                     "部屋の作成者が開始するまでお待ちください。"
@@ -1209,6 +1580,12 @@ def register_auth_pages(
                 poll_timer.deactivate()
                 ui.navigate.to("/lobby")
 
+        def copy_invite_url() -> None:
+            ui.clipboard.write(invite_url)
+            invite_feedback.set_text(
+                "招待URLをコピーしました。"
+            )
+
         with ui.element("main").classes("platform-shell"):
             with ui.column().classes("platform-wrap"):
                 with ui.row().classes(
@@ -1226,6 +1603,26 @@ def register_auth_pages(
                         )
                     ui.link("ロビーへ", "/lobby").classes(
                         "platform-link"
+                    )
+                with ui.column().classes(
+                    "dashboard-card invite-panel"
+                ):
+                    ui.label("部屋を招待する").classes("aside-title")
+                    invite_input = ui.input(
+                        label="招待URL",
+                        value=invite_url,
+                    ).props("outlined readonly").classes("w-full")
+                    ui.button(
+                        "URLをコピー",
+                        icon="content_copy",
+                        on_click=copy_invite_url,
+                    ).props("outline no-caps").classes(
+                        "w-full invite-copy-button"
+                    )
+                    invite_feedback = ui.label(
+                        "公開・非公開に関係なく、このURLから参加できます。"
+                    ).classes("platform-muted").props(
+                        "role='status' aria-live='polite'"
                     )
                 with ui.element("section").classes("dashboard-grid"):
                     with ui.column().classes("dashboard-card"):
@@ -1271,6 +1668,7 @@ def register_auth_pages(
         rendered_history: tuple[object, ...] | None = None
         attaching = False
         submitting = False
+        surrendering = False
         polling = False
         session_invalidated = False
 
@@ -1421,12 +1819,23 @@ def register_auth_pages(
                 word_input.disable()
                 submit_button.disable()
 
+            surrender_allowed = (
+                not session_invalidated
+                and _can_surrender(snapshot, user_id)
+            )
+            surrender_button.set_visibility(surrender_allowed)
+            if surrender_allowed and not surrendering:
+                surrender_button.enable()
+            else:
+                surrender_button.disable()
+
             if snapshot.status is RoomStatus.FINISHED:
                 reasons = {
                     "ends_with_n": "「ん」で終わったため終了しました。",
                     "duplicate": "同じ読みを使ったため終了しました。",
                     "timeout": "時間切れで終了しました。",
                     "no_legal_move": "出せる単語がなく終了しました。",
+                    "surrender": "降参により終了しました。",
                 }
                 feedback_label.set_text(
                     reasons.get(
@@ -1438,7 +1847,7 @@ def register_auth_pages(
                 if len(winner_indexes) == 1:
                     winner_index = winner_indexes[0]
                     own_seat = snapshot.seat_for_user(user_id)
-                    feedback_label.set_text(
+                    winner_text = (
                         "あなたの勝ちです！"
                         if (
                             own_seat is not None
@@ -1446,14 +1855,46 @@ def register_auth_pages(
                         )
                         else f"プレイヤー{winner_index + 1}の勝ちです。"
                     )
+                    if (
+                        snapshot.end_reason == "surrender"
+                        and snapshot.losing_seat is not None
+                    ):
+                        surrender_text = (
+                            "あなたは降参しました。"
+                            if (
+                                own_seat is not None
+                                and own_seat.index
+                                == snapshot.losing_seat
+                            )
+                            else (
+                                f"プレイヤー"
+                                f"{snapshot.losing_seat + 1}が"
+                                "降参しました。"
+                            )
+                        )
+                        feedback_label.set_text(
+                            f"{surrender_text}{winner_text}"
+                        )
+                    else:
+                        feedback_label.set_text(winner_text)
             elif transient_message is not None:
                 feedback_label.set_text(transient_message)
             elif snapshot.role_for_user(user_id) is Role.SPECTATOR:
-                feedback_label.set_text(
-                    "脱落しました。観戦中です。"
-                    if snapshot.seat_for_user(user_id) is not None
-                    else "観戦者として観戦中です。"
-                )
+                own_seat = snapshot.seat_for_user(user_id)
+                if (
+                    own_seat is not None
+                    and snapshot.end_reason == "surrender"
+                    and snapshot.losing_seat == own_seat.index
+                ):
+                    feedback_label.set_text(
+                        "降参しました。観戦中です。"
+                    )
+                else:
+                    feedback_label.set_text(
+                        "脱落しました。観戦中です。"
+                        if own_seat is not None
+                        else "観戦者として観戦中です。"
+                    )
             elif deadline.expired:
                 feedback_label.set_text(
                     "時間切れを確定しています。"
@@ -1464,8 +1905,16 @@ def register_auth_pages(
                 )
             elif snapshot.eliminated_seats:
                 latest = snapshot.eliminated_seats[-1]
+                action = (
+                    "が降参して観戦に回りました。"
+                    if (
+                        snapshot.end_reason == "surrender"
+                        and snapshot.losing_seat == latest
+                    )
+                    else "が脱落しました。"
+                )
                 feedback_label.set_text(
-                    f"プレイヤー{latest + 1}が脱落しました。"
+                    f"プレイヤー{latest + 1}{action}"
                     f"残り{len(snapshot.active_seat_indexes)}人です。"
                 )
             else:
@@ -1499,8 +1948,11 @@ def register_auth_pages(
             pending_submission = None
             poll_timer.deactivate()
             reading_dialog.close()
+            surrender_dialog.close()
             word_input.disable()
             submit_button.disable()
+            surrender_button.disable()
+            surrender_button.set_visibility(False)
             feedback_label.set_text(
                 "セッションの有効期限が切れました。"
                 "ログインし直してください。"
@@ -1714,6 +2166,68 @@ def register_auth_pages(
             reading_dialog.close()
             show_transient_feedback("読みの選択を取り消しました。")
 
+        def open_surrender_dialog() -> None:
+            snapshot = current_snapshot
+            if (
+                snapshot is None
+                or surrendering
+                or not _can_surrender(snapshot, user_id)
+            ):
+                return
+            surrender_dialog.open()
+
+        async def confirm_surrender() -> None:
+            nonlocal surrendering
+            snapshot = current_snapshot
+            if (
+                snapshot is None
+                or surrendering
+                or not _can_surrender(snapshot, user_id)
+            ):
+                surrender_dialog.close()
+                return
+            surrendering = True
+            surrender_button.disable()
+            surrender_confirm_button.disable()
+            try:
+                if not await play_session_is_valid():
+                    return
+                outcome = await rooms.surrender(
+                    game_id,
+                    user_id,
+                    expected_version=snapshot.state_version,
+                    operation_id=uuid4().hex,
+                )
+            except RoomVersionConflict as error:
+                if error.current_snapshot is not None:
+                    render(error.current_snapshot)
+                show_transient_feedback(
+                    "状態が更新されました。"
+                    "内容を確認してからもう一度お試しください。"
+                )
+            except RoomError:
+                LOGGER.exception("room surrender failed")
+                show_transient_feedback(
+                    "現在は降参できません。"
+                )
+            except Exception:
+                LOGGER.exception("unexpected surrender failure")
+                show_transient_feedback(
+                    "降参を確定できませんでした。"
+                )
+            else:
+                if outcome.snapshot is not None:
+                    render(outcome.snapshot)
+                show_transient_feedback(
+                    "降参しました。観戦に移ります。"
+                )
+            finally:
+                surrendering = False
+                surrender_confirm_button.enable()
+                surrender_dialog.close()
+                if current_snapshot is not None:
+                    render(current_snapshot)
+
         with ui.element("main").classes("platform-shell"):
             with ui.column().classes("platform-wrap"):
                 with ui.row().classes(
@@ -1758,6 +2272,14 @@ def register_auth_pages(
                             on_click=submit_word,
                         ).props("unelevated no-caps").classes("w-full")
                         word_input.on("keydown.enter", submit_word)
+                        surrender_button = ui.button(
+                            "降参する",
+                            icon="flag",
+                            on_click=open_surrender_dialog,
+                        ).props(
+                            "outline no-caps color=negative"
+                        ).classes("w-full surrender-button")
+                        surrender_button.set_visibility(False)
                         feedback_label = ui.label(
                             "対局へ接続しています。"
                         ).classes("platform-muted").props(
@@ -1783,6 +2305,28 @@ def register_auth_pages(
                         "取り消す",
                         on_click=cancel_reading,
                     ).props("flat no-caps")
+
+                with ui.dialog() as surrender_dialog, ui.card().classes(
+                    "confirm-dialog"
+                ):
+                    ui.label("本当に降参しますか？").classes(
+                        "aside-title"
+                    )
+                    ui.label(
+                        "降参すると対戦には戻れません。"
+                        "複数人対戦では観戦に回ります。"
+                    ).classes("platform-muted")
+                    surrender_confirm_button = ui.button(
+                        "降参を確定",
+                        icon="flag",
+                        on_click=confirm_surrender,
+                    ).props("unelevated no-caps color=negative").classes(
+                        "w-full"
+                    )
+                    ui.button(
+                        "対戦を続ける",
+                        on_click=surrender_dialog.close,
+                    ).props("outline no-caps").classes("w-full")
 
         word_input.disable()
         submit_button.disable()

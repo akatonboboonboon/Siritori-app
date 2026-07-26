@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
@@ -16,6 +17,7 @@ from shiritori.rooms import (
     RoomCoordinator,
     RoomMode,
     RoomNotFound,
+    RoomStatus,
     WordSubmissionStatus,
     create_room_snapshot,
 )
@@ -276,6 +278,89 @@ class StartupRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("deleted room supervisor did not stop")
         finally:
             await services.close()
+            temporary_directory.cleanup()
+
+    async def test_restart_closes_finished_pvp_and_releases_room_name(
+        self,
+    ) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        database_path = Path(temporary_directory.name, "finished-restart.sqlite3")
+        database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+        settings = Settings(
+            app_env="test",
+            database_url=database_url,
+            direct_database_url=database_url,
+            nicegui_storage_secret="test-storage-secret-with-32-characters",
+            session_secret="test-session-secret-with-32-characters",
+        )
+        services: ApplicationServices | None = ApplicationServices.build(
+            settings
+        )
+        restarted: ApplicationServices | None = None
+        try:
+            services.database.create_schema_for_testing()
+            owner = services.auth.register(
+                "finished-restart-owner",
+                "owner-password-123",
+            )
+            guest = services.auth.register(
+                "finished-restart-guest",
+                "guest-password-123",
+            )
+            lobby = services.lobby.create_pvp_room(
+                owner.id,
+                name="reusable finished room",
+            )
+            services.lobby.join_as_player(guest.id, lobby.room_code)
+            services.lobby.set_ready(owner.id, lobby.room_code, ready=True)
+            services.lobby.set_ready(guest.id, lobby.room_code, ready=True)
+            started = services.lobby.start(owner.id, lobby.room_code)
+            snapshot = await services.room_repository.load(started.game_id)
+            assert snapshot is not None
+            finished = replace(
+                snapshot,
+                status=RoomStatus.FINISHED,
+                state_version=snapshot.state_version + 1,
+                eliminated_seats=(0,),
+                expected_kana=None,
+                deadline_at=None,
+                losing_seat=0,
+                end_reason="surrender",
+            )
+            result = await services.room_repository.compare_and_swap(
+                started.game_id,
+                snapshot.state_version,
+                "finish-before-service-restart",
+                finished,
+                command_fingerprint="f" * 64,
+            )
+            self.assertEqual(result.current_snapshot, finished)
+
+            await services.close()
+            services = None
+            restarted = ApplicationServices.build(settings)
+            restarted.rooms.disconnect_grace_seconds = 0
+            await restarted.start()
+
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                try:
+                    await restarted.rooms.load_snapshot(started.game_id)
+                except RoomNotFound:
+                    break
+            else:
+                self.fail("finished PvP room was not removed after restart")
+
+            replacement = restarted.lobby.create_pvp_room(
+                owner.id,
+                name="reusable finished room",
+            )
+            self.assertEqual(replacement.name, "reusable finished room")
+        finally:
+            if restarted is not None:
+                await restarted.close()
+            if services is not None:
+                await services.close()
             temporary_directory.cleanup()
 
 

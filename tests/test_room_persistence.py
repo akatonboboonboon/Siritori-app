@@ -455,6 +455,49 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
             }
         with self.assertRaises(RoomSnapshotCorruptError):
             await self.repository.list_active_room_ids()
+
+    async def test_recovery_list_keeps_finished_pvp_until_lobby_is_deleted(
+        self,
+    ) -> None:
+        with self.database.transaction() as session:
+            session.get(Room, self.lobby_id).status = "active"
+
+        await self.repository.initialize(self.initial)
+        finished = replace(
+            self.initial,
+            status=RoomStatus.FINISHED,
+            current_turn=1,
+            state_version=1,
+            eliminated_seats=(0,),
+            expected_kana=None,
+            deadline_at=None,
+            losing_seat=0,
+            end_reason="surrender",
+        )
+        await cas(
+            self.repository,
+            self.game_id,
+            0,
+            "finish-before-restart",
+            finished,
+        )
+
+        self.assertEqual(await self.repository.list_active_room_ids(), ())
+        self.assertEqual(
+            await self.repository.list_recoverable_room_ids(),
+            (self.game_id,),
+        )
+
+        with self.database.transaction() as session:
+            lobby = session.get(Room, self.lobby_id)
+            lobby.status = "closed"
+            lobby.deleted_at = NOW
+
+        self.assertEqual(
+            await self.repository.list_recoverable_room_ids(),
+            (),
+        )
+
     async def test_delete_closes_lobby_and_receipt_survives_restart(self) -> None:
         await self.repository.initialize(self.initial)
         deleted = await delete(self.repository,

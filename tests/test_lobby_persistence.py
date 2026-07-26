@@ -6,21 +6,24 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
+from threading import Barrier
 import unittest
 
 from alembic import command
 from alembic.config import Config
 from argon2 import PasswordHasher
-from sqlalchemy import inspect, select
+from sqlalchemy import inspect, select, text
 
 from shiritori.auth import AuthService
 from shiritori.database import Database
 from shiritori.lobby import (
     LobbyCapacityError,
+    LobbyNameConflict,
     LobbyRevisionConflict,
     LobbyRoomNotFound,
     LobbyService,
     SpectatorsDisabledError,
+    room_name_key,
 )
 from shiritori.lobby_persistence import SQLAlchemyLobbyRepository
 from shiritori.models import (
@@ -37,7 +40,12 @@ from shiritori.room_persistence import (
     RoomSnapshotCorruptError,
     SQLAlchemyRoomRepository,
 )
-from shiritori.rooms import RoomCoordinator, RoomMode, create_room_snapshot
+from shiritori.rooms import (
+    RoomCoordinator,
+    RoomMode,
+    SeatController,
+    create_room_snapshot,
+)
 
 
 GAME_ID = "00000000-0000-0000-0000-000000000101"
@@ -306,6 +314,252 @@ class LobbyPersistenceTests(unittest.TestCase):
 
         self.assertEqual(second.room_code, "SQLA23")
 
+    def test_duplicate_name_identity_is_normalized_and_case_insensitive(
+        self,
+    ) -> None:
+        first = self.create_room(
+            name=" \tＰｅｒｓｉｓｔｅｎｔ　Ｒｏｏｍ\n",
+            is_public=True,
+        )
+        duplicate_service = LobbyService(
+            self.repository,
+            code_factory=lambda: "SQLA23",
+        )
+
+        with self.assertRaises(LobbyNameConflict):
+            duplicate_service.create_pvp_room(
+                self.guest.id,
+                name="persistent room",
+            )
+
+        with self.database.read_session() as session:
+            stored = session.get(Room, first.id)
+            self.assertEqual(stored.name, "Persistent Room")
+            self.assertEqual(
+                stored.name_key,
+                room_name_key("persistent room"),
+            )
+
+    def test_concurrent_duplicate_name_creation_has_one_winner(self) -> None:
+        second_database = Database(self.database_url)
+        second_repository = SQLAlchemyLobbyRepository(second_database)
+        services = (
+            LobbyService(
+                self.repository,
+                code_factory=lambda: "NAME22",
+            ),
+            LobbyService(
+                second_repository,
+                code_factory=lambda: "NAME23",
+            ),
+        )
+        barrier = Barrier(2)
+
+        def create(index_and_user: tuple[int, str]) -> str:
+            index, user_id = index_and_user
+            barrier.wait()
+            try:
+                services[index].create_pvp_room(
+                    user_id,
+                    name=("Shared Room" if index == 0 else "ＳＨＡＲＥＤ　ＲＯＯＭ"),
+                )
+            except LobbyNameConflict:
+                return "conflict"
+            return "created"
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = tuple(
+                    executor.map(
+                        create,
+                        (
+                            (0, self.owner.id),
+                            (1, self.guest.id),
+                        ),
+                    )
+                )
+        finally:
+            second_database.dispose()
+
+        self.assertEqual(sorted(outcomes), ["conflict", "created"])
+        with self.database.read_session() as session:
+            matching = tuple(
+                session.scalars(
+                    select(Room).where(
+                        Room.name_key == room_name_key("shared room"),
+                        Room.deleted_at.is_(None),
+                    )
+                )
+            )
+            self.assertEqual(len(matching), 1)
+
+    def test_deleted_room_releases_name_for_a_new_room(self) -> None:
+        original = self.create_room(name="Reusable Room")
+        self.assertTrue(
+            self.service.leave(self.owner.id, original.room_code).deleted
+        )
+        replacement_service = LobbyService(
+            self.repository,
+            code_factory=lambda: "SQLA23",
+        )
+
+        replacement = replacement_service.create_pvp_room(
+            self.guest.id,
+            name="  ＲＥＵＳＡＢＬＥ　ＲＯＯＭ  ",
+        )
+
+        self.assertNotEqual(replacement.id, original.id)
+        self.assertEqual(replacement.name, "REUSABLE ROOM")
+        with self.database.read_session() as session:
+            old = session.get(Room, original.id)
+            new = session.get(Room, replacement.id)
+            self.assertIsNotNone(old.deleted_at)
+            self.assertIsNone(new.deleted_at)
+            self.assertEqual(old.name_key, new.name_key)
+
+    def test_public_waiting_listing_filters_and_keeps_creation_order(self) -> None:
+        def create(
+            code: str,
+            owner_id: str,
+            name: str,
+            *,
+            is_public: bool,
+            fill: bool = False,
+        ):
+            service = LobbyService(
+                self.repository,
+                code_factory=lambda: code,
+                game_id_factory=lambda: STALE_GAME_ID,
+                seat_picker=lambda _: 0,
+            )
+            room = service.create_pvp_room(
+                owner_id,
+                name=name,
+                is_public=is_public,
+                fill_empty_seats_with_bots=fill,
+            )
+            return service, room
+
+        _, first = create(
+            "LIST21", self.owner.id, "First public", is_public=True
+        )
+        create("LIST22", self.guest.id, "Private", is_public=False)
+        active_service, active = create(
+            "LIST23",
+            self.third.id,
+            "Already active",
+            is_public=True,
+            fill=True,
+        )
+        active_service.set_ready(self.third.id, active.room_code, ready=True)
+        active_service.start(self.third.id, active.room_code)
+        deleted_service, deleted = create(
+            "LIST24", self.watcher.id, "Deleted", is_public=True
+        )
+        deleted_service.leave(self.watcher.id, deleted.room_code)
+        _, last = create(
+            "LIST25", self.guest.id, "Last public", is_public=True
+        )
+
+        self.assertEqual(
+            tuple(room.id for room in self.repository.list_public_waiting()),
+            (first.id, last.id),
+        )
+        self.assertEqual(
+            self.repository.list_public_waiting(limit=1),
+            (first,),
+        )
+
+    def test_bot_fill_projection_is_durable_and_lookup_consistent(self) -> None:
+        room = self.create_room(
+            max_players=4,
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.set_ready(self.owner.id, room.room_code, ready=True)
+
+        started = self.service.start(self.owner.id, room.room_code)
+
+        self.assertEqual(len(started.active_room.players), 4)
+        self.assertEqual(
+            tuple(seat.owner_user_id for seat in started.active_room.players),
+            (self.owner.id, None, None, None),
+        )
+        self.assertEqual(
+            self.service.active_game_id(self.owner.id, room.room_code),
+            GAME_ID,
+        )
+        with self.database.read_session() as session:
+            game = session.get(Game, GAME_ID)
+            self.assertEqual(game.bot_count, 3)
+            self.assertEqual(
+                game.settings_json,
+                {
+                    "room_code": room.room_code,
+                    "max_players": 4,
+                    "allow_spectators": True,
+                    "is_public": True,
+                    "fill_empty_seats_with_bots": True,
+                },
+            )
+
+    def test_active_lookup_accepts_owned_temporary_bot_with_permanent_tail(
+        self,
+    ) -> None:
+        room = self.create_room(
+            max_players=3,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.join_as_player(self.guest.id, room.room_code)
+        self.service.set_ready(self.owner.id, room.room_code, ready=True)
+        self.service.set_ready(self.guest.id, room.room_code, ready=True)
+        started = self.service.start(self.owner.id, room.room_code)
+        coordinator = RoomCoordinator(
+            SQLAlchemyRoomRepository(self.database)
+        )
+
+        async def leave_owner():
+            await coordinator.connect_client(
+                started.game_id,
+                self.owner.id,
+                "owner-tab",
+            )
+            await coordinator.connect_client(
+                started.game_id,
+                self.guest.id,
+                "guest-tab",
+            )
+            return await coordinator.leave(
+                started.game_id,
+                self.owner.id,
+                expected_version=0,
+                operation_id="owner-temp-bot",
+            )
+
+        outcome = asyncio.run(leave_owner())
+
+        assert outcome.snapshot is not None
+        self.assertEqual(
+            tuple(
+                (seat.owner_user_id, seat.controller)
+                for seat in outcome.snapshot.players
+            ),
+            (
+                (self.owner.id, SeatController.BOT),
+                (self.guest.id, SeatController.HUMAN),
+                (None, SeatController.BOT),
+            ),
+        )
+        for user_id in (self.owner.id, self.guest.id):
+            with self.subTest(user_id=user_id):
+                self.assertEqual(
+                    self.service.active_game_id(user_id, room.room_code),
+                    GAME_ID,
+                )
+        with self.database.read_session() as session:
+            game = session.get(Game, GAME_ID)
+            self.assertEqual(game.bot_count, 1)
+
     def test_concurrent_last_seat_join_has_exactly_one_winner(self) -> None:
         room = self.create_room(max_players=2)
         second_database = Database(self.database_url)
@@ -565,9 +819,28 @@ class LobbyPersistenceMigrationTests(unittest.TestCase):
                         )
                     }
                     self.assertTrue(
-                        {"theme_key", "turn_seconds", "revision"}.issubset(
+                        {
+                            "theme_key",
+                            "turn_seconds",
+                            "revision",
+                            "name_key",
+                            "is_public",
+                            "fill_empty_seats_with_bots",
+                        }.issubset(
                             room_columns
                         )
+                    )
+                    room_indexes = {
+                        index["name"]: index
+                        for index in schema.get_indexes("rooms")
+                    }
+                    active_name_index = room_indexes[
+                        "uq_rooms_active_name_key"
+                    ]
+                    self.assertTrue(active_name_index["unique"])
+                    self.assertEqual(
+                        active_name_index["column_names"],
+                        ["name_key"],
                     )
                     self.assertIn("ready", membership_columns)
                     self.assertEqual(
@@ -583,6 +856,113 @@ class LobbyPersistenceMigrationTests(unittest.TestCase):
                             "created_at",
                         },
                     )
+                finally:
+                    database.dispose()
+            finally:
+                if previous is None:
+                    os.environ.pop("DIRECT_DATABASE_URL", None)
+                else:
+                    os.environ["DIRECT_DATABASE_URL"] = previous
+
+    def test_migration_normalizes_and_deduplicates_active_legacy_names(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "legacy-rooms.sqlite3")
+            url = f"sqlite+pysqlite:///{path.as_posix()}"
+            import os
+
+            previous = os.environ.get("DIRECT_DATABASE_URL")
+            os.environ["DIRECT_DATABASE_URL"] = url
+            try:
+                config = Config(str(root / "alembic.ini"))
+                command.upgrade(config, "0001_initial_schema")
+                database = Database(url)
+                try:
+                    with database.engine.begin() as connection:
+                        connection.execute(
+                            text(
+                                "INSERT INTO users "
+                                "(id, username, username_key, password_hash) "
+                                "VALUES "
+                                "(:id, :username, :username_key, :password_hash)"
+                            ),
+                            {
+                                "id": "00000000-0000-0000-0000-000000000901",
+                                "username": "migration-owner",
+                                "username_key": "migration-owner",
+                                "password_hash": "not-used-in-this-test",
+                            },
+                        )
+                        connection.execute(
+                            text(
+                                "INSERT INTO rooms "
+                                "(id, room_code, owner_user_id, name, status, "
+                                "max_players, allow_spectators, theme_key, "
+                                "revision, created_at, updated_at, deleted_at) "
+                                "VALUES "
+                                "(:id, :code, :owner, :name, 'waiting', 2, "
+                                "1, 'all', 0, :created, :created, :deleted)"
+                            ),
+                            (
+                                {
+                                    "id": "00000000-0000-0000-0000-000000000911",
+                                    "code": "MIGR21",
+                                    "owner": "00000000-0000-0000-0000-000000000901",
+                                    "name": "  Legacy　Room  ",
+                                    "created": "2026-07-24 00:00:01",
+                                    "deleted": None,
+                                },
+                                {
+                                    "id": "00000000-0000-0000-0000-000000000912",
+                                    "code": "MIGR22",
+                                    "owner": "00000000-0000-0000-0000-000000000901",
+                                    "name": "legacy room",
+                                    "created": "2026-07-24 00:00:02",
+                                    "deleted": None,
+                                },
+                                {
+                                    "id": "00000000-0000-0000-0000-000000000913",
+                                    "code": "MIGR23",
+                                    "owner": "00000000-0000-0000-0000-000000000901",
+                                    "name": "LEGACY ROOM",
+                                    "created": "2026-07-24 00:00:03",
+                                    "deleted": "2026-07-24 00:00:04",
+                                },
+                            ),
+                        )
+                    database.dispose()
+                    command.upgrade(config, "head")
+                    command.check(config)
+                    migrated = Database(url)
+                    try:
+                        with migrated.read_session() as session:
+                            rooms = tuple(
+                                session.scalars(
+                                    select(Room).order_by(Room.created_at)
+                                )
+                            )
+                            self.assertEqual(
+                                tuple(room.name for room in rooms),
+                                ("Legacy Room", "legacy room (2)", "LEGACY ROOM"),
+                            )
+                            self.assertEqual(
+                                tuple(room.name_key for room in rooms),
+                                tuple(room_name_key(room.name) for room in rooms),
+                            )
+                            self.assertTrue(
+                                all(len(room.name_key) == 64 for room in rooms)
+                            )
+                            self.assertTrue(
+                                all(not room.is_public for room in rooms)
+                            )
+                            self.assertTrue(
+                                all(
+                                    not room.fill_empty_seats_with_bots
+                                    for room in rooms
+                                )
+                            )
+                    finally:
+                        migrated.dispose()
                 finally:
                     database.dispose()
             finally:
