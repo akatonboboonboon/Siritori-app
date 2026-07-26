@@ -33,7 +33,7 @@ from .auth import (
     UsernameUnavailableError,
     canonicalize_username,
 )
-from .bots import canonical_kana
+from .bots import canonical_kana, final_kana
 from .game_session import SessionCode
 from .database import GameRepository
 from .lobby import (
@@ -44,6 +44,10 @@ from .lobby import (
     LobbyStateError,
 )
 from .models import RoomRole, RoomStatus as StoredRoomStatus
+from .onboarding import (
+    OnboardingService,
+    OnboardingUserUnavailableError,
+)
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
     LexiconRoomService,
@@ -73,6 +77,7 @@ from .score_attack_persistence import (
 from .settings import Settings
 from .solo import SoloGameAuthorizationError, SoloGameService
 from .statistics import StatisticsRepository
+from .word_review import WordReviewService
 from .word_suggestions import (
     WordSuggestionPendingLimitError,
     WordSuggestionService,
@@ -102,6 +107,8 @@ class AuthWebServices:
     statistics: StatisticsRepository | None = None
     score_attack: SQLAlchemyScoreAttackService | None = None
     word_suggestions: WordSuggestionService | None = None
+    word_review: WordReviewService | None = None
+    onboarding: OnboardingService | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,7 +250,10 @@ def _match_result_presentation(
         title=title,
         tone=tone,
         outcome=outcome,
-        accepted_word_count=len(snapshot.history),
+        accepted_word_count=sum(
+            final_kana(record.reading) != "ん"
+            for record in snapshot.history
+        ),
         end_reason=_END_REASON_TEXT.get(
             snapshot.end_reason,
             "対局終了条件を満たした",
@@ -251,6 +261,89 @@ def _match_result_presentation(
         round_summary=round_summary,
         last_word=last_word,
     )
+
+
+def _result_share_text(result: _MatchResultPresentation) -> str:
+    """Return a private-ID-free, URL-free plain-text result."""
+
+    return "\n".join(
+        (
+            "しりとり対局結果",
+            result.title,
+            result.outcome,
+            f"成立したことば: {result.accepted_word_count}語",
+            f"終了理由: {result.end_reason}",
+            f"対戦概要: {result.round_summary}",
+            f"最後のことば: {result.last_word}",
+        )
+    )
+
+
+def _result_share_script() -> str:
+    """Share from the trusted click itself, then fall back to copying."""
+
+    return """
+(event) => {
+  const button = event && event.currentTarget;
+  const source = document.getElementById('siritori-result-share-payload');
+  const status = document.getElementById('siritori-result-share-status');
+  const text = source ? source.textContent.trim() : '';
+  const setStatus = (message) => {
+    if (status) status.textContent = message;
+  };
+  const copyResult = async () => {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (_clipboardError) {
+        // A denied Clipboard API must still reach the legacy fallback.
+      }
+    }
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    let copied = false;
+    try {
+      copied = document.execCommand('copy');
+    } finally {
+      area.remove();
+    }
+    if (!copied) throw new Error('copy unavailable');
+  };
+  void (async () => {
+    if (!text) {
+      setStatus('共有できる対局結果がありません。');
+      return;
+    }
+    if (button) button.disabled = true;
+    try {
+      if (typeof navigator.share === 'function') {
+        try {
+          await navigator.share({title: 'しりとり対局結果', text});
+          setStatus('対局結果を共有しました。');
+          return;
+        } catch (error) {
+          if (error && error.name === 'AbortError') {
+            setStatus('共有をキャンセルしました。');
+            return;
+          }
+        }
+      }
+      await copyResult();
+      setStatus('対局結果をコピーしました。');
+    } catch (_error) {
+      setStatus('共有またはコピーを利用できませんでした。');
+    } finally {
+      if (button) button.disabled = false;
+    }
+  })();
+}
+""".strip()
 
 
 def _snapshot_effect(
@@ -714,6 +807,28 @@ def _safe_next(value: str | None, *, default: str = "/lobby") -> str:
     return default
 
 
+def _tutorial_return_path(value: str | None) -> str:
+    """Keep tutorial completion on a safe, non-recursive internal route."""
+
+    target = _safe_next(value)
+    parts = urlsplit(target)
+    if parts.path == "/tutorial":
+        nested_values = parse_qs(parts.query).get("next", ())
+        nested = _safe_next(
+            nested_values[0] if nested_values else None
+        )
+        if urlsplit(nested).path == "/tutorial":
+            return "/lobby"
+        return nested
+    return target
+
+
+def _tutorial_url(next_path: str | None) -> str:
+    return "/tutorial?" + urlencode(
+        {"next": _tutorial_return_path(next_path)}
+    )
+
+
 def _error_redirect(path: str, code: str, next_path: str) -> RedirectResponse:
     query = urlencode({"error": code, "next": _safe_next(next_path)})
     return RedirectResponse(f"{path}?{query}", status_code=303)
@@ -831,6 +946,8 @@ def register_auth_pages(
     statistics = services.statistics
     score_attack = services.score_attack
     word_suggestions = services.word_suggestions
+    word_review = services.word_review
+    onboarding = services.onboarding
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
@@ -863,6 +980,27 @@ def register_auth_pages(
         return await session_principal_from_request(
             request, auth, settings
         )
+
+    async def authenticated_destination(
+        user_id: str,
+        next_path: str | None,
+    ) -> str:
+        target = _tutorial_return_path(next_path)
+        if onboarding is None:
+            return target
+        try:
+            needs_tutorial = await asyncio.to_thread(
+                onboarding.needs_tutorial,
+                user_id,
+            )
+        except OnboardingUserUnavailableError:
+            raise
+        except Exception:
+            LOGGER.exception("failed to load onboarding progress")
+            return target
+        if needs_tutorial:
+            return _tutorial_url(target)
+        return target
 
     @ui.page("/login")
     async def login_page(request: Request):
@@ -964,7 +1102,17 @@ def register_auth_pages(
         # A valid login clears only its canonical account bucket. Clearing the
         # IP-wide bucket would let one successful account bypass that limit.
         account_attempts.reset(account_key)
-        response = RedirectResponse(next_path, status_code=303)
+        try:
+            destination = await authenticated_destination(
+                issued.account.id,
+                next_path,
+            )
+        except OnboardingUserUnavailableError:
+            await asyncio.to_thread(auth.logout, issued.token)
+            return _error_redirect(
+                "/login", "credentials", next_path
+            )
+        response = RedirectResponse(destination, status_code=303)
         _set_session_cookie(
             response, issued.token, issued.expires_at, settings
         )
@@ -1000,17 +1148,297 @@ def register_auth_pages(
         except UsernameUnavailableError:
             return _error_redirect("/register", "unavailable", next_path)
         account_attempts.reset(account_key)
-        response = RedirectResponse(next_path, status_code=303)
+        try:
+            destination = await authenticated_destination(
+                issued.account.id,
+                next_path,
+            )
+        except OnboardingUserUnavailableError:
+            await asyncio.to_thread(auth.logout, issued.token)
+            return _error_redirect(
+                "/login", "credentials", next_path
+            )
+        response = RedirectResponse(destination, status_code=303)
         _set_session_cookie(
             response, issued.token, issued.expires_at, settings
         )
         return response
+
+    @ui.page("/tutorial")
+    async def tutorial_page(request: Request):
+        next_path = _tutorial_return_path(
+            request.query_params.get("next")
+        )
+        tutorial_path = _tutorial_url(next_path)
+        principal = await principal_for(request)
+        if principal is None:
+            login_query = urlencode({"next": tutorial_path})
+            return RedirectResponse(
+                f"/login?{login_query}",
+                status_code=303,
+            )
+        if onboarding is None:
+            return RedirectResponse(next_path, status_code=303)
+
+        _page_shell()
+        user_id = principal.account.id
+        step_index = 0
+        busy = False
+        steps = (
+            (
+                "しりとりの基本",
+                "読みの最後の文字から、次の単語をつなぎます。",
+                (
+                    "先攻は辞書にある好きな単語から始められます。",
+                    "漢字やカタカナも使えます。読みは自動で確認されます。",
+                    "「ん」で終わる単語や、一度使った読みは使えません。",
+                ),
+            ),
+            (
+                "遊び方を選ぶ",
+                "1人でも、友だちとも遊べます。",
+                (
+                    "Bot戦はBot数・難易度・制限時間を選べます。",
+                    "対人戦は部屋を作るか、参加コードから入ります。",
+                    "手番と次の文字を確認してから単語を送ります。",
+                ),
+            ),
+            (
+                "対戦と観戦",
+                "途中からでも同じ部屋で楽しめます。",
+                (
+                    "観戦可能な部屋では、対戦中でも観戦できます。",
+                    "脱落後は観戦に回り、残った人へ手番が続きます。",
+                    "対戦中も観戦中もリアクションを送れます。",
+                ),
+            ),
+            (
+                "記録を楽しむ",
+                "遊んだ結果はアカウントに保存されます。",
+                (
+                    "戦績・ランキング・デイリーチャレンジを確認できます。",
+                    "結果は共有でき、同じ設定で再戦もできます。",
+                    "辞書にない単語は追加リクエストから申請できます。",
+                ),
+            ),
+        )
+
+        def render_step(*, focus: bool) -> None:
+            title, summary, points = steps[step_index]
+            step_count.set_text(
+                f"{step_index + 1} / {len(steps)}"
+            )
+            progress.set_value((step_index + 1) / len(steps))
+            progress.props(
+                f"aria-valuenow={step_index + 1} "
+                f"aria-valuemax={len(steps)}"
+            )
+            step_title.set_text(title)
+            step_summary.set_text(summary)
+            step_body.clear()
+            items = "".join(
+                f"<li>{escape(point)}</li>" for point in points
+            )
+            with step_body:
+                ui.html(
+                    f"<ul class='tutorial-points'>{items}</ul>"
+                )
+            back_button.set_visibility(step_index > 0)
+            next_button.set_visibility(
+                step_index < len(steps) - 1
+            )
+            skip_button.set_visibility(
+                step_index < len(steps) - 1
+            )
+            start_button.set_visibility(
+                step_index == len(steps) - 1
+            )
+            if focus:
+                step_title.run_method("focus")
+
+        def previous_step() -> None:
+            nonlocal step_index
+            if busy or step_index <= 0:
+                return
+            step_index -= 1
+            render_step(focus=True)
+
+        def next_step() -> None:
+            nonlocal step_index
+            if busy or step_index >= len(steps) - 1:
+                return
+            step_index += 1
+            render_step(focus=True)
+
+        async def finish_tutorial(
+            _event: object | None = None,
+        ) -> None:
+            nonlocal busy
+            if busy:
+                return
+            busy = True
+            for button in (
+                back_button,
+                next_button,
+                skip_button,
+                start_button,
+            ):
+                button.disable()
+            tutorial_error.set_text("")
+            tutorial_error.set_visibility(False)
+            try:
+                current_principal = await principal_for(request)
+                if not _session_principal_matches_user(
+                    current_principal,
+                    user_id,
+                ):
+                    login_query = urlencode(
+                        {"next": tutorial_path}
+                    )
+                    ui.navigate.to(f"/login?{login_query}")
+                    return
+                await asyncio.to_thread(
+                    onboarding.complete,
+                    user_id,
+                )
+            except OnboardingUserUnavailableError:
+                login_query = urlencode({"next": tutorial_path})
+                ui.navigate.to(f"/login?{login_query}")
+                return
+            except Exception:
+                LOGGER.exception(
+                    "failed to complete account tutorial"
+                )
+                tutorial_error.set_text(
+                    "完了状態を保存できませんでした。"
+                    "少し待ってからもう一度お試しください。"
+                )
+                tutorial_error.set_visibility(True)
+            else:
+                ui.navigate.to(next_path)
+                return
+            finally:
+                busy = False
+                for button in (
+                    back_button,
+                    next_button,
+                    skip_button,
+                    start_button,
+                ):
+                    button.enable()
+
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes(
+                "tutorial-card"
+            ):
+                with ui.row().classes(
+                    "tutorial-heading w-full items-start "
+                    "justify-between gap-3"
+                ):
+                    with ui.column().classes("min-w-0 gap-1"):
+                        ui.label("遊び方ガイド").classes(
+                            "auth-title"
+                        ).props(
+                            "role='heading' aria-level='1'"
+                        )
+                        ui.label(
+                            "4つのポイントを確認すると、すぐに遊べます。"
+                        ).classes("platform-muted")
+                    step_count = ui.label("").classes(
+                        "tutorial-step-count"
+                    ).props(
+                        "role='status' aria-live='polite' "
+                        "aria-atomic='true'"
+                    )
+                progress = ui.linear_progress(
+                    value=0.25,
+                ).classes("tutorial-progress w-full").props(
+                    "aria-label='チュートリアルの進み具合' "
+                    "aria-valuemin=1 aria-valuemax=4"
+                )
+                with ui.element("section").classes(
+                    "tutorial-step w-full"
+                ).props(
+                    "role='group' "
+                    "aria-labelledby='tutorial-step-title'"
+                ):
+                    step_title = ui.label("").classes(
+                        "tutorial-step-title"
+                    ).props(
+                        "id='tutorial-step-title' tabindex='-1' "
+                        "role='heading' aria-level='2'"
+                    )
+                    step_summary = ui.label("").classes(
+                        "tutorial-step-summary"
+                    )
+                    step_body = ui.column().classes("w-full")
+                tutorial_error = ui.label("").classes(
+                    "auth-error"
+                ).props(
+                    "role='alert' aria-live='assertive'"
+                )
+                tutorial_error.set_visibility(False)
+                with ui.row().classes(
+                    "tutorial-actions w-full items-center gap-2"
+                ):
+                    back_button = ui.button(
+                        "戻る",
+                        icon="arrow_back",
+                        on_click=previous_step,
+                    ).props("outline no-caps")
+                    skip_button = ui.button(
+                        "スキップ",
+                        on_click=finish_tutorial,
+                    ).props("flat no-caps")
+                    next_button = ui.button(
+                        "次へ",
+                        icon="arrow_forward",
+                        on_click=next_step,
+                    ).props("unelevated no-caps")
+                    start_button = ui.button(
+                        "始める",
+                        icon="play_arrow",
+                        on_click=finish_tutorial,
+                    ).props("unelevated no-caps")
+        render_step(focus=False)
 
     @ui.page("/lobby")
     async def lobby_page(request: Request):
         principal = await principal_for(request)
         if principal is None:
             return RedirectResponse("/login?next=/lobby", status_code=303)
+        if onboarding is not None:
+            try:
+                needs_tutorial = await asyncio.to_thread(
+                    onboarding.needs_tutorial,
+                    principal.account.id,
+                )
+            except OnboardingUserUnavailableError:
+                return RedirectResponse(
+                    "/login?next=/lobby",
+                    status_code=303,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "failed to load onboarding progress in lobby"
+                )
+            else:
+                if needs_tutorial:
+                    return RedirectResponse(
+                        _tutorial_url("/lobby"),
+                        status_code=303,
+                    )
+        show_admin_review = False
+        if word_review is not None:
+            try:
+                show_admin_review = await asyncio.to_thread(
+                    word_review.is_admin,
+                    principal.account.id,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "failed to load word-review authorization in lobby"
+                )
         _page_shell()
         logout_token = csrf.issue(principal.session_id)
         with ui.element("main").classes("platform-shell"):
@@ -1038,9 +1466,19 @@ def register_auth_pages(
                     ui.link("スコアアタック", "/score-attack").classes(
                         "platform-link"
                     )
+                    ui.link(
+                        "デイリーチャレンジ", "/daily-challenge"
+                    ).classes("platform-link")
                     ui.link("単語追加リクエスト", "/word-suggestions").classes(
                         "platform-link"
                     )
+                    if show_admin_review:
+                        ui.link(
+                            "単語審査", "/admin/word-suggestions"
+                        ).classes("platform-link")
+                    ui.link(
+                        "遊び方", _tutorial_url("/lobby")
+                    ).classes("platform-link")
                 with ui.element("section").classes("dashboard-grid"):
                     with ui.column().classes("dashboard-card"):
                         ui.label("部屋を作る・参加する").classes("aside-title")
@@ -2918,6 +3356,7 @@ def register_auth_pages(
         surrendering = False
         post_match_transitioning = False
         post_match_task: asyncio.Task[None] | None = None
+        post_match_auto_return_cancelled = False
         polling = False
         session_invalidated = False
 
@@ -3306,16 +3745,24 @@ def register_auth_pages(
                 result_reason.set_text(result.end_reason)
                 result_round.set_text(result.round_summary)
                 result_last_word.set_text(result.last_word)
+                result_share_payload.set_text(
+                    _result_share_text(result)
+                )
             if finished and is_solo:
                 post_match_label.set_text(
                     "Bot数・難易度・制限時間を変えずに、"
                     "新しい対局へ挑戦できます。"
                 )
             elif finished:
-                post_match_label.set_text(
-                    "この部屋は終了後も残ります。"
-                    "まもなく全員を待機画面へ戻します。"
-                )
+                if post_match_auto_return_cancelled:
+                    post_match_label.set_text(
+                        "共有後、「待機部屋へ戻る」を押してください。"
+                    )
+                else:
+                    post_match_label.set_text(
+                        "12秒後に待機画面へ戻ります。"
+                        "結果を共有すると自動移動を停止します。"
+                    )
             if post_match_transitioning:
                 solo_rematch_button.disable()
                 waiting_room_button.disable()
@@ -3423,12 +3870,44 @@ def register_auth_pages(
             apply_snapshot_effect(effect)
             sync_reaction_buttons()
 
+        def pause_auto_return_for_share(
+            _event: object | None = None,
+        ) -> None:
+            nonlocal post_match_auto_return_cancelled, post_match_task
+            snapshot = current_snapshot
+            if (
+                snapshot is None
+                or snapshot.status is not RoomStatus.FINISHED
+                or snapshot.mode is not RoomMode.PVP
+            ):
+                return
+            post_match_auto_return_cancelled = True
+            scheduled = post_match_task
+            post_match_task = None
+            if scheduled is not None and not scheduled.done():
+                scheduled.cancel()
+            post_match_label.set_text(
+                "共有後、「待機部屋へ戻る」を押してください。"
+            )
+
+        async def delayed_return_to_waiting_room() -> None:
+            await asyncio.sleep(12.0)
+            if (
+                post_match_auto_return_cancelled
+                or client.is_deleted
+                or session_invalidated
+            ):
+                return
+            await return_to_waiting_room()
+
         def schedule_return_to_waiting_room() -> None:
             nonlocal post_match_task
+            if post_match_auto_return_cancelled:
+                return
             if post_match_task is not None and not post_match_task.done():
                 return
             post_match_task = asyncio.create_task(
-                return_to_waiting_room(delay_seconds=5.0)
+                delayed_return_to_waiting_room()
             )
 
         async def on_room_event(event: RoomEvent) -> None:
@@ -3561,6 +4040,9 @@ def register_auth_pages(
                 polling = False
 
         async def detach() -> None:
+            scheduled = post_match_task
+            if scheduled is not None and not scheduled.done():
+                scheduled.cancel()
             try:
                 await rooms.disconnect_client(game_id, client.id)
             except Exception:
@@ -3792,10 +4274,19 @@ def register_auth_pages(
 
         async def return_to_waiting_room(
             _event: object | None = None,
-            *,
-            delay_seconds: float = 0.0,
         ) -> None:
-            nonlocal post_match_transitioning
+            nonlocal post_match_auto_return_cancelled
+            nonlocal post_match_task, post_match_transitioning
+            scheduled = post_match_task
+            current_task = asyncio.current_task()
+            if scheduled is not current_task:
+                post_match_auto_return_cancelled = True
+                post_match_task = None
+                if (
+                    scheduled is not None
+                    and not scheduled.done()
+                ):
+                    scheduled.cancel()
             snapshot = current_snapshot
             if (
                 post_match_transitioning
@@ -3811,8 +4302,6 @@ def register_auth_pages(
                 "対局結果を保存しました。待機画面へ戻ります。"
             )
             try:
-                if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
                 if client.is_deleted or not await play_session_is_valid():
                     return
                 waiting_room = await asyncio.to_thread(
@@ -3862,6 +4351,9 @@ def register_auth_pages(
                         ui.link("ロビーへ", "/lobby").classes(
                             "platform-link"
                         )
+                        ui.link(
+                            "遊び方", _tutorial_url(f"/play/{game_id}")
+                        ).classes("platform-link")
                         with ui.row().classes(
                             "items-center justify-end gap-2"
                         ):
@@ -3999,6 +4491,12 @@ def register_auth_pages(
                                         "match-result-metric-value"
                                     )
                         result_panel.set_visibility(False)
+                        result_share_payload = ui.label("").classes(
+                            "result-share-payload"
+                        ).props(
+                            "id='siritori-result-share-payload' "
+                            "aria-hidden='true'"
+                        )
                         with ui.element("section").classes(
                             "reaction-panel w-full"
                         ):
@@ -4034,6 +4532,25 @@ def register_auth_pages(
                                 "platform-muted"
                             ).props(
                                 "role='status' aria-live='polite'"
+                            )
+                            result_share_button = ui.button(
+                                "結果を共有",
+                                icon="share",
+                                on_click=pause_auto_return_for_share,
+                            ).props(
+                                "outline no-caps "
+                                "aria-label='対局結果を共有する'"
+                            ).classes("w-full result-share-button")
+                            result_share_button.on(
+                                "click",
+                                js_handler=_result_share_script(),
+                            )
+                            ui.label("").classes(
+                                "platform-muted result-share-status"
+                            ).props(
+                                "id='siritori-result-share-status' "
+                                "role='status' aria-live='polite' "
+                                "aria-atomic='true'"
                             )
                             solo_rematch_button = ui.button(
                                 "同じ設定でもう一度挑戦",

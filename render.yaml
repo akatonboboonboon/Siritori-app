@@ -19,3 +19,5 @@ services:
         generateValue: true
       - key: SESSION_SECRET
         generateValue: true
+      - key: ADMIN_USERNAMES
+        sync: false

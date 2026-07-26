@@ -210,10 +210,14 @@ NiceGUIの `storage_secret` はCookie署名に必要なため、安定した秘�
 保護画面`/word-suggestions`へ返すのは本人の単語、読み、補足、状態、時刻だけで、申請IDやユーザーID、
 他人の申請は含めません。
 
-このテーブルは`LexiconValidator`、一般辞書、Bot候補CSVから意図的に分離します。
-申請作成や状態変更だけで対局の判定結果は変わらず、`approved`になっても自動では
-使用可能になりません。辞書反映は、出典・品詞・読み・ライセンスを人が確認した
-別の固定データ更新と回帰テストを必要とします。
+`WordReviewService`は`ADMIN_USERNAMES`の登録済み有効アカウントだけを毎回DBで再認可し、
+同じ表記と読みの申請群を1トランザクションで承認または却下します。申請状態、担当者付き監査行、
+承認語を同時に保存し、commit後だけプロセス内の`ApprovedWordCatalog`へ公開します。
+`ApprovedLexiconValidator`はSudachiを先に使い、未収録または対象外の場合だけ承認語の完全一致へ
+fallbackします。構造違反は上書きせず、通常対局と公開1人用の人間入力へ適用します。
+Bot候補CSVとBot索引は変更しません。ランキング対象の`SQLAlchemyScoreAttackService`と
+`SQLAlchemyDailyChallengeService`は、同じルール版の途中で審査結果により語彙が変わらないよう、
+固定したSudachi validatorを使います。
 
 ## 切断、再接続、復旧
 
@@ -262,9 +266,9 @@ Render Freeではpre-deploy commandを利用できないため、`python -m scri
 部屋名キー・公開設定・空席Bot補充設定を追加するマイグレーションも同じ処理でNeonへ
 自動適用されます。戦績・ランキング用の`0003_match_statistics`、スコアアタック用の
 `0004_score_attack_runs`、複数ラウンド用の`0005_room_current_game`、
-単語追加リクエスト用の`0006_word_suggestions`も自動適用します。
-既存の環境変数をそのまま使い、追加の環境変数やNeon Consoleでの手作業による
-列・索引・テーブル作成は不要です。
+単語追加リクエスト用の`0006_word_suggestions`、審査・日次挑戦・チュートリアル用の
+`0007_final_features`も自動適用します。Neon Consoleでの手作業による列・索引・
+テーブル作成は不要です。管理画面を有効にする場合は`ADMIN_USERNAMES`を追加します。
 
 ## デプロイ環境変数
 
@@ -278,6 +282,7 @@ README、ログへ書きません。本番デプロイとDashboardの値はま�
 | `DIRECT_DATABASE_URL` | Neonのdirect migration URL |
 | `NICEGUI_STORAGE_SECRET` | NiceGUIのCookie署名用ランダム秘密値 |
 | `SESSION_SECRET` | アプリ独自セッション用ランダム秘密値 |
+| `ADMIN_USERNAMES` | 単語審査を許可する登録済みユーザー名。複数はカンマ区切り |
 | `APP_ENV` | 本番では `production` |
 
 `PORT` はRenderが自動設定するため手動登録しません。DB接続文字列や秘密値をローカルで

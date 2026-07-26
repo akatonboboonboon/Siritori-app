@@ -42,6 +42,8 @@ from shiritori.web_auth import (
     _match_result_presentation,
     _post_match_lobby_destination,
     _reaction_sender_label,
+    _result_share_script,
+    _result_share_text,
     _read_form,
     _room_invite_url,
     _room_listing_summary,
@@ -53,6 +55,8 @@ from shiritori.web_auth import (
     _sound_cue_script,
     _set_session_cookie,
     _solo_difficulty_options,
+    _tutorial_return_path,
+    _tutorial_url,
     _word_suggestion_status_label,
 )
 
@@ -412,6 +416,101 @@ class GameResultUiHelperTests(unittest.TestCase):
         self.assertNotIn("secret-bob-id", combined)
         self.assertNotIn("secret-watcher-id", combined)
 
+    def test_result_count_excludes_losing_word_ending_with_n(self) -> None:
+        now = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
+        active = create_room_snapshot(
+            "result-ends-with-n",
+            ("alice", "bob"),
+            mode=RoomMode.PVP,
+            now=now,
+            seat_picker=lambda _count: 0,
+        )
+        accepted = TurnRecord(
+            surface="りんご",
+            reading="りんご",
+            canonical_key="りんご",
+            seat_index=0,
+            actor_user_id="alice",
+            by_bot=False,
+            submitted_at=now,
+        )
+        losing = TurnRecord(
+            surface="ごはん",
+            reading="ごはん",
+            canonical_key="ごはん",
+            seat_index=1,
+            actor_user_id="bob",
+            by_bot=False,
+            submitted_at=now,
+        )
+        finished = replace(
+            active,
+            status=RoomStatus.FINISHED,
+            state_version=3,
+            current_turn=0,
+            eliminated_seats=(1,),
+            history=(accepted, losing),
+            losing_seat=1,
+            end_reason="ends_with_n",
+            deadline_at=None,
+        )
+
+        result = _match_result_presentation(finished, "alice")
+
+        self.assertEqual(result.accepted_word_count, 1)
+        self.assertEqual(result.last_word, "ごはん（ごはん）")
+
+    def test_result_share_is_plain_text_with_safe_browser_fallbacks(
+        self,
+    ) -> None:
+        result = _MatchResultPresentation(
+            title="勝利！",
+            tone="victory",
+            outcome="あなたが最後まで勝ち残りました。",
+            accepted_word_count=12,
+            end_reason="時間切れ",
+            round_summary="3人で開始・2人脱落",
+            last_word="りんご（りんご）",
+        )
+
+        shared = _result_share_text(result)
+        script = _result_share_script()
+
+        self.assertEqual(
+            shared.splitlines(),
+            [
+                "しりとり対局結果",
+                "勝利！",
+                "あなたが最後まで勝ち残りました。",
+                "成立したことば: 12語",
+                "終了理由: 時間切れ",
+                "対戦概要: 3人で開始・2人脱落",
+                "最後のことば: りんご（りんご）",
+            ],
+        )
+        for private_value in (
+            "private-user-id",
+            "private-game-id",
+            "room-code",
+            "http://",
+            "https://",
+        ):
+            self.assertNotIn(private_value, shared)
+        self.assertIn("navigator.share", script)
+        self.assertIn("navigator.clipboard.writeText", script)
+        self.assertIn("document.execCommand('copy')", script)
+        self.assertIn(
+            "} catch (_clipboardError) {",
+            script,
+        )
+        self.assertLess(
+            script.index("catch (_clipboardError)"),
+            script.index("document.createElement('textarea')"),
+        )
+        self.assertIn("AbortError", script)
+        self.assertIn("textContent", script)
+        self.assertNotIn("location.href", script)
+
     def test_solo_result_names_a_permanent_bot(self) -> None:
         active = create_room_snapshot(
             "solo-result",
@@ -596,9 +695,12 @@ class GameResultUiHelperTests(unittest.TestCase):
         self.assertIn('app.storage.user', source)
         self.assertIn('game_sound_muted', source)
         self.assertIn('game_reduced_motion', source)
-        self.assertIn('delay_seconds=5.0', source)
+        self.assertIn('await asyncio.sleep(12.0)', source)
+        self.assertIn('post_match_auto_return_cancelled', source)
+        self.assertIn('delayed_return_to_waiting_room()', source)
         self.assertIn('@media (prefers-reduced-motion: reduce)', css)
         self.assertIn('.match-result-card', css)
+        self.assertIn('.result-share-button', css)
         self.assertIn('.game-effect--error', css)
         self.assertIn('rooms.send_reaction(game_id, user_id, emoji)', source)
         self.assertIn('event.kind is RoomEventKind.REACTION', source)
@@ -606,6 +708,45 @@ class GameResultUiHelperTests(unittest.TestCase):
         self.assertIn('while len(reaction_bubbles) > 4', source)
         self.assertIn('.reaction-bubble--enter', css)
         self.assertIn('.reaction-panel', css)
+
+    def test_tutorial_is_protected_persisted_and_responsive(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "shiritori" / "web_auth.py").read_text(
+            encoding="utf-8"
+        )
+        css = (root / "assets" / "platform.css").read_text(
+            encoding="utf-8"
+        )
+        page_source = source[
+            source.index('@ui.page("/tutorial")'):
+            source.index('@ui.page("/lobby")')
+        ]
+
+        self.assertIn(
+            "onboarding: OnboardingService | None = None",
+            source,
+        )
+        self.assertIn("principal = await principal_for(request)", page_source)
+        self.assertIn(
+            "_session_principal_matches_user(",
+            page_source,
+        )
+        self.assertIn("onboarding.complete,", page_source)
+        self.assertIn('"しりとりの基本"', page_source)
+        self.assertIn('"遊び方を選ぶ"', page_source)
+        self.assertIn('"対戦と観戦"', page_source)
+        self.assertIn('"記録を楽しむ"', page_source)
+        self.assertIn('"戻る"', page_source)
+        self.assertIn('"次へ"', page_source)
+        self.assertIn('"スキップ"', page_source)
+        self.assertIn('"始める"', page_source)
+        self.assertIn("aria-labelledby='tutorial-step-title'", page_source)
+        self.assertIn("tabindex='-1'", page_source)
+        self.assertIn('"遊び方"', source)
+        self.assertIn("_tutorial_url(", source)
+        self.assertIn(".tutorial-card", css)
+        self.assertIn(".tutorial-actions .q-btn", css)
+        self.assertIn("@media (max-width: 620px)", css)
 
     def test_word_suggestion_page_is_protected_and_intentional(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -871,6 +1012,28 @@ class RequestSecurityTests(unittest.TestCase):
         self.assertEqual(_safe_next("/\\attacker.example"), "/lobby")
         self.assertEqual(_safe_next("https://attacker.example"), "/lobby")
         self.assertEqual(_safe_next("/ok\r\nLocation: x"), "/lobby")
+
+    def test_tutorial_return_path_is_internal_and_non_recursive(self) -> None:
+        self.assertEqual(
+            _tutorial_return_path("/play/game-1"),
+            "/play/game-1",
+        )
+        self.assertEqual(
+            _tutorial_return_path("/tutorial?next=/play/game-1"),
+            "/play/game-1",
+        )
+        self.assertEqual(
+            _tutorial_return_path("/tutorial?next=/tutorial"),
+            "/lobby",
+        )
+        self.assertEqual(
+            _tutorial_return_path("https://attacker.example"),
+            "/lobby",
+        )
+        self.assertEqual(
+            _tutorial_url("/play/game-1"),
+            "/tutorial?next=%2Fplay%2Fgame-1",
+        )
 
     def test_production_cookie_is_secure_httponly_and_lax(self) -> None:
         settings = Settings.from_environment(

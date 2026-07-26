@@ -1,0 +1,139 @@
+.admin-review-shell {
+  width: min(1120px, 100%);
+  margin: 0 auto;
+  gap: 1rem;
+}
+
+.admin-review-header {
+  width: 100%;
+  gap: 0.45rem;
+}
+
+.admin-review-toolbar {
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.admin-review-layout {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.75fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.admin-review-section {
+  width: 100%;
+  min-width: 0;
+  gap: 0.75rem;
+}
+
+.admin-review-card {
+  width: 100%;
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid rgba(84, 110, 122, 0.22);
+  border-radius: 16px;
+  background: var(--q-card-color, #fff);
+  box-shadow: 0 6px 22px rgba(38, 50, 56, 0.06);
+  gap: 0.75rem;
+}
+
+.admin-review-word {
+  overflow-wrap: anywhere;
+  font-size: clamp(1.2rem, 2vw, 1.55rem);
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.admin-review-reading,
+.admin-review-note,
+.admin-review-person {
+  overflow-wrap: anywhere;
+}
+
+.admin-review-submissions {
+  width: 100%;
+  gap: 0.55rem;
+}
+
+.admin-review-submission {
+  width: 100%;
+  padding: 0.7rem 0.8rem;
+  border-radius: 12px;
+  background: rgba(96, 125, 139, 0.08);
+  gap: 0.25rem;
+}
+
+.admin-review-actions {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.admin-review-action,
+.admin-review-back,
+.admin-review-reload {
+  min-height: 44px;
+}
+
+.admin-review-feedback {
+  width: 100%;
+  min-height: 1.5rem;
+}
+
+.admin-review-empty {
+  width: 100%;
+  padding: 1.25rem;
+  border: 1px dashed rgba(84, 110, 122, 0.34);
+  border-radius: 14px;
+  text-align: center;
+}
+
+.admin-review-recent-row {
+  width: 100%;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid rgba(84, 110, 122, 0.16);
+  gap: 0.25rem;
+}
+
+.admin-review-recent-row:last-child {
+  border-bottom: 0;
+}
+
+@media (max-width: 820px) {
+  .admin-review-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-review-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 520px) {
+  .admin-review-card {
+    padding: 0.85rem;
+    border-radius: 14px;
+  }
+
+  .admin-review-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-review-action {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-review-card,
+  .admin-review-action {
+    scroll-behavior: auto;
+    transition: none !important;
+  }
+}

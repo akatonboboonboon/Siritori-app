@@ -59,6 +59,14 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
             self.services.database,
         )
 
+    async def test_ranked_modes_keep_a_fixed_official_lexicon(self) -> None:
+        self.assertIsNone(self.services.score_attack.validator)
+        self.assertIsNone(self.services.daily_challenge.validator)
+        self.assertIs(
+            self.services.room_words.validator,
+            self.services.approved_validator,
+        )
+
     async def test_start_drains_all_expired_score_attack_batches(self) -> None:
         class StubScoreAttack:
             def __init__(self) -> None:

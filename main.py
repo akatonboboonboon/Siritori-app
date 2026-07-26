@@ -8,8 +8,10 @@ from fastapi import HTTPException, Request
 from nicegui import app, ui
 from sqlalchemy import text
 
+from shiritori.admin_pages import register_admin_pages
 from shiritori.application import ApplicationServices
 from shiritori.customize import APP_TITLE
+from shiritori.daily_pages import register_daily_pages
 from shiritori.page import register_pages
 from shiritori.settings import Settings
 from shiritori.web_auth import AuthWebServices, register_auth_pages
@@ -27,6 +29,9 @@ SOLO = SERVICES.solo
 STATISTICS = SERVICES.statistics
 SCORE_ATTACK = SERVICES.score_attack
 WORD_SUGGESTIONS = SERVICES.word_suggestions
+DAILY_CHALLENGE = SERVICES.daily_challenge
+ONBOARDING = SERVICES.onboarding
+WORD_REVIEW = SERVICES.word_review
 
 
 @app.middleware("http")
@@ -49,6 +54,9 @@ async def security_headers(request: Request, call_next):
             "/rankings",
             "/score-attack",
             "/word-suggestions",
+            "/tutorial",
+            "/daily-challenge",
+            "/admin/word-suggestions",
         )
     ):
         response.headers.setdefault("Cache-Control", "no-store")
@@ -80,7 +88,7 @@ def readyz() -> dict[str, str]:
     return {"status": "ready"}
 
 
-register_pages()
+register_pages(SERVICES.approved_validator)
 register_auth_pages(
     AuthWebServices(
         auth=AUTH,
@@ -93,7 +101,19 @@ register_auth_pages(
         statistics=STATISTICS,
         score_attack=SCORE_ATTACK,
         word_suggestions=WORD_SUGGESTIONS,
+        word_review=WORD_REVIEW,
+        onboarding=ONBOARDING,
     )
+)
+register_admin_pages(
+    auth=AUTH,
+    settings=SETTINGS,
+    word_review=WORD_REVIEW,
+)
+register_daily_pages(
+    auth=AUTH,
+    settings=SETTINGS,
+    daily_challenge=DAILY_CHALLENGE,
 )
 app.on_startup(SERVICES.start)
 app.on_shutdown(SERVICES.close)
