@@ -29,7 +29,7 @@ from uuid import uuid4
 
 from .bots import canonical_kana, final_kana
 from .lexicon import LexiconResult, get_default_validator
-from .themes import ThemeCatalog
+from .themes import ALL_THEME_ID, ThemeCatalog
 
 
 DISCONNECT_GRACE_SECONDS = 15.0
@@ -751,18 +751,11 @@ class LexiconRoomService:
         if snapshot.role_for_user(user_id) is not Role.PLAYER:
             raise RoomAuthorizationError("only a player can submit words")
         validation = self.validator.validate(raw_surface)
-        try:
-            filtered = self.themes.filter(
-                snapshot.theme_key,
-                validation,
-                selected_reading=chosen_reading,
-            )
-        except KeyError:
-            return WordSubmissionResult(
-                WordSubmissionStatus.REJECTED,
-                validation.surface,
-                "部屋に設定されたテーマが見つかりません。",
-            )
+        filtered = self.themes.filter(
+            ALL_THEME_ID,
+            validation,
+            selected_reading=chosen_reading,
+        )
 
         if filtered.requires_reading_choice:
             return WordSubmissionResult(

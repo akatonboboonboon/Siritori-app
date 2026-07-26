@@ -1,6 +1,6 @@
 # 一般Bot語彙の出典と生成方法
 
-テーマを指定しない対局のBotは、開発時に生成した
+すべての対局のBotは、開発時に生成した
 `shiritori/bot_data/words.csv`だけを実行時に読み込みます。
 WordNet、TKG、Sudachiの配布元や外部Webサービスへ、対局中に通信することはありません。
 
@@ -98,7 +98,8 @@ python -m scripts.build_bot_data \
   --theme-output shiritori/theme_data/word_themes.csv
 ```
 
-チェックイン済みの一般CSVと統一テーマCSVの両方が再生成結果と完全一致するかは、書き換えずに確認できます。
+`--theme-output`は廃止済み分類データの再現性を開発履歴として保つためだけに残しています。
+チェックイン済みの一般CSVと旧分類CSVの両方が再生成結果と完全一致するかは、書き換えずに確認できます。
 
 ```bash
 python -m scripts.build_bot_data \

@@ -97,7 +97,7 @@ class LobbyPersistenceTests(unittest.TestCase):
         self.service.set_ready(self.guest.id, lobby.room_code, ready=True)
         return lobby, self.service.start(self.owner.id, lobby.room_code)
 
-    def test_create_and_exact_lookup_survive_repository_restart(self) -> None:
+    def test_ignored_theme_and_lookup_survive_repository_restart(self) -> None:
         created = self.create_room(max_players=4, turn_seconds=None)
 
         with self.database.read_session() as session:
@@ -106,7 +106,8 @@ class LobbyPersistenceTests(unittest.TestCase):
                 RoomMembership,
                 {"room_id": created.id, "user_id": self.owner.id},
             )
-            self.assertEqual(stored.theme_key, "food")
+            self.assertEqual(created.theme_key, "all")
+            self.assertEqual(stored.theme_key, "all")
             self.assertIsNone(stored.turn_seconds)
             self.assertEqual(stored.revision, 0)
             self.assertFalse(owner.ready)
@@ -379,6 +380,8 @@ class LobbyPersistenceTests(unittest.TestCase):
         self.assertEqual(started.active_room.current_turn, 1)
         self.assertIsNone(started.active_room.expected_kana)
         self.assertEqual(started.active_room.history, ())
+        self.assertEqual(lobby.theme_key, "all")
+        self.assertEqual(started.active_room.theme_key, "all")
         with self.database.read_session() as session:
             stored_room = session.get(Room, lobby.id)
             stored_game = session.get(Game, GAME_ID)
@@ -386,7 +389,7 @@ class LobbyPersistenceTests(unittest.TestCase):
             self.assertEqual(stored_room.status, StoredRoomStatus.ACTIVE.value)
             self.assertEqual(stored_room.revision, started.lobby.revision)
             self.assertEqual(stored_game.status, StoredGameStatus.ACTIVE.value)
-            self.assertEqual(stored_game.theme_key, "country")
+            self.assertEqual(stored_game.theme_key, "all")
             self.assertEqual(stored_game.bot_difficulty, "normal")
             self.assertEqual(stored_game.turn_time_seconds, 3)
             self.assertEqual(stored_game.starting_seat_index, 1)

@@ -72,10 +72,7 @@ class ApplicationServices:
         games = GameRepository(database)
         themes = ThemeCatalog()
         lobby_repository = SQLAlchemyLobbyRepository(database)
-        lobby = LobbyService(
-            lobby_repository,
-            theme_resolver=themes.get,
-        )
+        lobby = LobbyService(lobby_repository)
         room_repository = SQLAlchemyRoomRepository(database)
         room_hub = RoomHub()
         rooms = RoomCoordinator(room_repository, hub=room_hub)
@@ -86,8 +83,7 @@ class ApplicationServices:
         }
 
         # The runtime closures intentionally dereference the service object
-        # only after construction. This lets user-owned EasyBot and theme data
-        # be registered at startup without replacing the runtime.
+        # only after construction so a user-owned EasyBot can be registered.
         holder: dict[str, ApplicationServices] = {}
 
         def strategy_resolver(
@@ -98,8 +94,8 @@ class ApplicationServices:
                 snapshot.bot_difficulty
             )
 
-        def word_index_resolver(snapshot: RoomSnapshot) -> WordIndex:
-            return holder["services"].word_index_for(snapshot.theme_key)
+        def word_index_resolver(_snapshot: RoomSnapshot) -> WordIndex:
+            return get_default_word_index()
 
         runtime = RoomRuntime(
             rooms,

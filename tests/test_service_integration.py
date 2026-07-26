@@ -20,7 +20,6 @@ from shiritori.rooms import (
     create_room_snapshot,
 )
 from shiritori.settings import Settings
-from shiritori.themes import ThemeCatalog, ThemeDefinition
 
 
 NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
@@ -56,8 +55,10 @@ class ExplodingLexicon:
         raise AssertionError("unauthorized user reached dictionary validation")
 
 
-class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_room_theme_filters_readings_before_commit(self) -> None:
+class RoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_theme_does_not_filter_dictionary_readings(
+        self,
+    ) -> None:
         result = LexiconResult(
             code=LexiconCode.MULTIPLE_READINGS,
             surface="生物",
@@ -66,15 +67,6 @@ class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 candidate("生物", "せいぶつ", 1),
                 candidate("生物", "なまもの", 2),
             ),
-        )
-        themes = ThemeCatalog(
-            (
-                ThemeDefinition.from_entries(
-                    "food",
-                    "食べ物",
-                    (("生物", "なまもの"),),
-                ),
-            )
         )
         snapshot = create_room_snapshot(
             "themed-room",
@@ -88,7 +80,6 @@ class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
         service = LexiconRoomService(
             RoomCoordinator(repository),
             StubLexicon(result),
-            themes=themes,
         )
 
         choice = await service.submit_user_word(
@@ -96,33 +87,23 @@ class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "alice",
             "生物",
             expected_version=0,
-            operation_id="theme-choice",
-            now=NOW,
-        )
-        rejected = await service.submit_user_word(
-            snapshot.room_id,
-            "alice",
-            "生物",
-            chosen_reading="せいぶつ",
-            expected_version=0,
-            operation_id="theme-wrong-reading",
+            operation_id="legacy-theme-choice",
             now=NOW,
         )
         committed = await service.submit_user_word(
             snapshot.room_id,
             "alice",
             "生物",
-            chosen_reading="なまもの",
+            chosen_reading="せいぶつ",
             expected_version=0,
-            operation_id="theme-correct-reading",
+            operation_id="legacy-theme-reading",
             now=NOW,
         )
 
         self.assertEqual(choice.status, WordSubmissionStatus.READING_REQUIRED)
-        self.assertEqual(choice.reading_choices, ("なまもの",))
-        self.assertEqual(rejected.status, WordSubmissionStatus.REJECTED)
+        self.assertEqual(choice.reading_choices, ("せいぶつ", "なまもの"))
         self.assertEqual(committed.status, WordSubmissionStatus.COMMITTED)
-        self.assertEqual(committed.selected_reading, "なまもの")
+        self.assertEqual(committed.selected_reading, "せいぶつ")
 
     async def test_outsider_is_rejected_before_dictionary_work(self) -> None:
         snapshot = create_room_snapshot(
@@ -147,7 +128,7 @@ class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 now=NOW,
             )
 
-    async def test_unknown_persisted_theme_fails_closed(self) -> None:
+    async def test_unknown_persisted_theme_is_ignored(self) -> None:
         result = LexiconResult(
             code=LexiconCode.ACCEPTED,
             surface="林檎",
@@ -165,7 +146,6 @@ class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
         service = LexiconRoomService(
             RoomCoordinator(InMemoryRoomRepository((snapshot,))),
             StubLexicon(result),
-            themes=ThemeCatalog(),
         )
 
         response = await service.submit_user_word(
@@ -177,8 +157,8 @@ class ThemeRoomIntegrationTests(unittest.IsolatedAsyncioTestCase):
             now=NOW,
         )
 
-        self.assertEqual(response.status, WordSubmissionStatus.REJECTED)
-        self.assertIn("テーマ", response.message)
+        self.assertEqual(response.status, WordSubmissionStatus.COMMITTED)
+        self.assertEqual(response.selected_reading, "りんご")
 
 
 class ServiceWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -216,34 +196,22 @@ class ServiceWiringTests(unittest.IsolatedAsyncioTestCase):
             [snapshot.room_id, snapshot.room_id],
         )
 
-    async def test_lobby_rejects_unregistered_theme(self) -> None:
-        themes = ThemeCatalog(
-            (
-                ThemeDefinition.from_entries(
-                    "food",
-                    "食べ物",
-                    (("林檎", "りんご"),),
-                ),
-            )
-        )
+    async def test_lobby_ignores_legacy_theme_and_theme_resolver(self) -> None:
+        def exploding_theme_resolver(_theme_key: str) -> object:
+            raise AssertionError("retired theme resolver was called")
+
         service = LobbyService(
             InMemoryLobbyRepository(),
             code_factory=lambda: "ABCD23",
-            theme_resolver=themes.get,
+            theme_resolver=exploding_theme_resolver,
         )
 
         room = service.create_pvp_room(
             "owner",
-            name="food room",
-            theme_key="food",
+            name="legacy theme room",
+            theme_key="unknown",
         )
-        self.assertEqual(room.theme_key, "food")
-        with self.assertRaises(ValueError):
-            service.create_pvp_room(
-                "owner",
-                name="unknown room",
-                theme_key="unknown",
-            )
+        self.assertEqual(room.theme_key, "all")
 
 
 class StartupRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
