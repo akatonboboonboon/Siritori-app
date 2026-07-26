@@ -31,10 +31,10 @@ TKGのデータ本体はこのリポジトリへ同梱していません。TKG�
 許可せず、候補と自然さの補助情報に限定して使います。Basic/Core/Generalは粗い分類であり、
 特にGeneral内の並びを使用頻度順とは解釈しません。
 
-### SudachiDict-core 20260428
+### SudachiDict-full 20260723
 
 - 用途: 表記、品詞、ひらがな読みの最終検査
-- PyPI: <https://pypi.org/project/SudachiDict-core/20260428/>
+- PyPI: <https://pypi.org/project/SudachiDict-full/20260723/>
 
 CSVへ出力する全行は、プレイヤー入力と同じ`LexiconValidator`で完全一致検索します。
 最終的な実在語・品詞・読みのauthorityはSudachiです。
@@ -76,15 +76,15 @@ CSV列は次の4列です。
 - `source_ref`: `curated`、`wnja:<synset>`、または`tkg:<entry_id>`
 - `commonness_tier`: `curated`、`basic`、`core`、`general`、`wordnet`
 
-現在の生成結果は28,750語です。
+現在の生成結果は30,547語です。
 
 | tier | 語数 |
 |---|---:|
 | curated | 80 |
-| basic | 309 |
-| core | 1,189 |
-| general | 9,209 |
-| wordnet | 17,963 |
+| basic | 310 |
+| core | 1,195 |
+| general | 9,460 |
+| wordnet | 19,502 |
 
 ## 再生成と一致確認
 
