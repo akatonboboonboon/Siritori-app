@@ -1279,12 +1279,17 @@ class RoomCoordinator:
 
             if not surface or not reading or not canonical_key:
                 raise InvalidMove("word fields must not be empty")
+            required_kana = (
+                canonical_kana(snapshot.expected_kana)
+                if snapshot.expected_kana is not None
+                else None
+            )
             if (
-                snapshot.expected_kana is not None
-                and canonical_kana(reading[0]) != snapshot.expected_kana
+                required_kana is not None
+                and canonical_kana(reading[0]) != required_kana
             ):
                 raise InvalidMove(
-                    f"word must begin with {snapshot.expected_kana!r}"
+                    f"word must begin with {required_kana!r}"
                 )
 
             next_players = self._complete_pending_handbacks(snapshot.players)
@@ -1296,7 +1301,7 @@ class RoomCoordinator:
                     players=next_players,
                     reason="duplicate",
                     now=current_time,
-                    expected_kana=snapshot.expected_kana,
+                    expected_kana=required_kana,
                 )
             else:
                 last_kana = final_kana(reading)

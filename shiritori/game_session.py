@@ -41,6 +41,11 @@ _SMALL_TO_LARGE_KANA = {
     "ゖ": "け",
 }
 
+_DAKUON_CHAIN_EQUIVALENTS = {
+    "ぢ": "じ",
+    "づ": "ず",
+}
+
 _VOWEL_GROUPS = {
     "あ": "あぁかがさざただなはばぱまやゃらわゎゕ",
     "い": "いぃきぎしじちぢにひびぴみりゐ",
@@ -234,9 +239,10 @@ class SessionResult:
 
 
 def canonical_kana(kana: str) -> str:
-    """Convert a small hiragana to its full-sized chaining equivalent."""
+    """Return the canonical kana used only for shiritori connections."""
 
-    return _SMALL_TO_LARGE_KANA.get(kana, kana)
+    expanded = _SMALL_TO_LARGE_KANA.get(kana, kana)
+    return _DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
 
 
 def first_chain_kana(reading: str) -> str:

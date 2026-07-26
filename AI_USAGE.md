@@ -36,6 +36,7 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 | 2026-07-26 | OpenAI Codex | Bot語彙・3難易度 | 応募者本人から開発継続の指示を受け、公式日本語WordNetから一般名詞を抽出し、Sudachi完全一致検査済み27,781語のオフラインCSV、Easy Bot、Hard Botの大語彙向け探索キャッシュ、再生成スクリプトと自動テストを実装した | AI実装完了・本人レビュー待ち | 応募者本人が3難易度を遊び、強さ・不自然な収録語・表示を確認する | [#15](https://github.com/akatonboboonboon/Siritori-app/pull/15) |
 | 2026-07-26 | OpenAI Codex | Bot自然さ改善 | 応募者本人から難しいBotの不自然語と語尾偏重を改善する指示を受け、CodexがCC0のTKG学習者辞書を補助データとして調査し、固定commit・SHA検査、Sudachi指定読み一致、Basic/Core名詞補完、commonness tier、Hard上位8候補探索、再生成・偏り・性能テストを実装した。TKGは実在語判定のauthorityにはしていない | AI実装完了・本人レビュー待ち | 応募者本人がEasy／Normal／Hardを遊び、自然さ・強さ・一文字漢字の表示を確認する | [#17](https://github.com/akatonboboonboon/Siritori-app/pull/17)／commit `e22bf25` |
 | 2026-07-26 | OpenAI Codex | 入力辞書・Bot語彙拡張 | 応募者本人の「対応していない単語を増やしたい。Wikipedia検索も検討」という依頼を受け、SudachiDict-coreからfull 20260723へ変更し、Bot CSVを30,547語へ再生成した。日本語版Wikipedia固定ダンプで辞書カバレッジを測定し、検索ヒットだけでは動詞・文章・曖昧な見出しも通るため、実行時検索は採用しなかった。監査条件・件数・将来の安全な追加条件を文書化した | AI実装完了・本人レビュー待ち | 応募者本人が追加された固有名詞の入力、Renderの起動時間・メモリ、Botの語感を確認する | [#18](https://github.com/akatonboboonboon/Siritori-app/pull/18)／commit `c5a08cf` |
+| 2026-07-26 | OpenAI Codex | `ぢ`・`づ` の接続規則 | 応募者本人が全難易度のBotで `づ` が即死になり、`ぢ` も同様と発見した。Codexが一般Bot辞書の開始仮名件数を監査し、接続判定だけ `ぢ/じ`・`づ/ず` を同一視する修正、旧保存対局の互換処理、ルール文書、回帰テストを実装した。表記・読み・履歴・重複キーは変更していない | AI実装完了・本人レビュー待ち | 応募者本人がBot戦で `会津` と `はなぢ` を入力し、Botの返答と履歴表示を確認する | [#19](https://github.com/akatonboboonboon/Siritori-app/pull/19) |
 | 2026-07-26 | OpenAI Codex | 対局画面の品質修正 | 応募者本人からAI担当範囲を最後まで進める指示を受け、Easy選択、残秒の10秒／5秒警告、送信結果の保持、履歴の差分描画、複数人名と観戦状態の表示を実装した | AI実装完了・本人レビュー待ち | 応募者本人がPC／スマートフォンで表示、読み選択、エラー文、3難易度を手動確認する | [#16](https://github.com/akatonboboonboon/Siritori-app/pull/16)／commit `26e8cb6` |
 | 2026-07-26 | OpenAI Codex | セッション失効・空室処理 | 対局中もDBのセッションを接続時・定期更新時・送信直前に再検証し、失効後の送信を遮断した。最後の接続が消えた瞬間にPvPを削除し、ソロ戦をBotが進める前に中断保存する処理と競合テストを実装した | AI実装完了・本人レビュー待ち | 応募者本人が2ブラウザでログアウト、タブ切断、ソロ再開を手動確認する | [#16](https://github.com/akatonboboonboon/Siritori-app/pull/16)／commit `775c257` |
 | 2026-07-24 | OpenAI Codex | Render準備・検証 | `render.yaml`、起動時Alembic、health/readiness、公開手順を整備した。公式仕様は確認したが、本番デプロイとDashboard表示は確認していない | 準備完了・本番未確認 | Windows sandboxのACLエラーで実ブラウザ確認ができなかったため、応募者本人がDashboardと公開URLを確認する。秘密情報はCodexへ渡さず記録しない | 最終Draft PRへ追記予定 |
@@ -45,7 +46,7 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 - 自由初手、辞書判定、ひらがな読み、複数読み選択、表記＋読み履歴をゲーム状態と公開NiceGUI画面へ接続
 - 認証、SQL永続化、ロビー、部屋、観戦、Bot引継ぎ、ソロ戦保存、サーバー側テーマ制約の自動テストを追加
 - 同じ操作IDの安全な再送と、内容が異なる操作ID再利用の拒否をテスト
-- Full辞書・30,547語の再生成検査を含む全275件の自動テストが成功
+- Full辞書・30,547語の再生成検査を含む全280件の自動テストが成功
 - Edgeの独立した2ブラウザ状態で、部屋作成、参加、準備、開始、単語同期と幅375px表示を確認
 - Render用の`PORT`、`0.0.0.0`、Blueprint、WebSocket、health/readiness設定を公式資料と照合
 - 2026-07-26に公開中のRenderで `/healthz`、`/readyz`、`/`、`/login` のHTTP 200を確認
