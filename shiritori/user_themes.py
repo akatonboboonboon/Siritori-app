@@ -1,4 +1,4 @@
-"""Nine compatible themes backed by one unified offline mapping."""
+"""Sixteen compatible themes backed by one unified offline mapping."""
 
 from __future__ import annotations
 
@@ -18,6 +18,13 @@ THEME_LABELS: Final[dict[str, str]] = {
     "vehicle": "乗り物",
     "fruit": "果物・木の実",
     "vegetable": "野菜・きのこ",
+    "person_job": "人物・職業",
+    "nature": "自然",
+    "place_building": "場所・建物",
+    "body": "体・体の部位",
+    "clothing": "服・身につけるもの",
+    "daily_tools": "道具・生活用品",
+    "music": "音楽・楽器",
 }
 
 _WORD_THEME_ROWS: Final = load_word_theme_rows()

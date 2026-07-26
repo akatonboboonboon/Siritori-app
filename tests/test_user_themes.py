@@ -41,6 +41,13 @@ EXPECTED_THEME_COUNTS = {
     "vehicle": 277,
     "fruit": 121,
     "vegetable": 77,
+    "person_job": 2_726,
+    "nature": 1_534,
+    "place_building": 445,
+    "body": 499,
+    "clothing": 255,
+    "daily_tools": 260,
+    "music": 269,
 }
 
 EXPECTED_FOOD_ADDITIONS = frozenset(
@@ -100,7 +107,7 @@ def _themes_for_surface(surface: str) -> set[str]:
 
 class UserThemeTests(unittest.TestCase):
     def test_theme_ids_labels_and_generated_counts_are_stable(self) -> None:
-        self.assertEqual(len(USER_THEMES), 9)
+        self.assertEqual(len(USER_THEMES), 16)
 
         theme_ids = tuple(theme.theme_id for theme in USER_THEMES)
         labels = tuple(theme.label for theme in USER_THEMES)
@@ -119,10 +126,10 @@ class UserThemeTests(unittest.TestCase):
     ) -> None:
         rows = load_word_theme_rows()
 
-        self.assertEqual(len(rows), 2_872)
+        self.assertEqual(len(rows), 7_371)
         self.assertEqual(
             Counter(row.source_kind for row in rows),
-            Counter({"auto": 2_172, "reviewed": 700}),
+            Counter({"auto": 6_671, "reviewed": 700}),
         )
         self.assertEqual(
             len({(row.surface, row.reading) for row in rows}),

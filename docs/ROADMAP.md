@@ -18,7 +18,7 @@
 - サーバー側テーマ制約、Easy／Normal／Hard Bot、Render + Neon設定、GitHub Actions
 - 公開ゲーム、認証、ソロBot戦、オンライン対戦画面のPC・スマートフォン対応
 
-最終統合後の全256件の自動テストが成功しています。
+最終統合後の全298件の自動テストが成功しています。
 Render Blueprintは準備済みです。Dashboardの秘密情報と公開URLはリポジトリ所有者が確認し、
 秘密情報は受領・記録しません。
 

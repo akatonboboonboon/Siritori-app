@@ -14,15 +14,18 @@ from scripts.build_bot_data import (
     TKG_COMMIT,
     TKG_INDEX_SHA256,
     TkgEntry,
+    _retain_hierarchical_automatic_themes,
     build_bot_data,
     classify_theme_memberships,
     index_tkg_entries,
+    load_reviewed_theme_seeds,
     load_tkg_entries,
     merge_reviewed_theme_rows,
     select_rows,
 )
 from shiritori.lexicon import LexiconCode
 from shiritori.theme_rules import (
+    LEGACY_THEME_IDS,
     PERSON_SYNSET,
     THEME_COMPATIBLE_ROOTS,
     THEME_IDS,
@@ -382,11 +385,11 @@ class BuildBotDataTests(unittest.TestCase):
         )
         self.assertEqual(
             memberships[("person_animal", "person_reading")],
-            (),
+            ("person_job",),
         )
         self.assertEqual(
             memberships[("botanical", "botanical_reading")],
-            ("food", "plant", "fruit", "vegetable"),
+            ("food", "plant", "fruit", "vegetable", "nature"),
         )
         self.assertEqual(
             memberships[("cross_family", "cross_reading")],
@@ -399,6 +402,89 @@ class BuildBotDataTests(unittest.TestCase):
         self.assertEqual(
             memberships[("reviewed_only", "reviewed_only_reading")],
             ("country",),
+        )
+
+    def test_hierarchy_gate_uses_only_reviewed_relationships(self) -> None:
+        cases = (
+            (
+                {"food", "plant", "fruit", "nature"},
+                frozenset(),
+                {"food", "plant", "fruit", "nature"},
+            ),
+            (
+                {"food", "nature"},
+                frozenset(),
+                {"food"},
+            ),
+            (
+                {"person_job", "body"},
+                frozenset(),
+                set(),
+            ),
+            (
+                {"country", "place_building", "nature"},
+                frozenset(),
+                {"country", "place_building", "nature"},
+            ),
+            (
+                {"instrument", "music"},
+                frozenset(),
+                {"instrument", "music"},
+            ),
+            (
+                {"animal", "country", "nature", "place_building"},
+                frozenset(),
+                set(),
+            ),
+            (
+                {"nature"},
+                frozenset({"sport", "vegetable"}),
+                {"nature"},
+            ),
+            (
+                {"nature"},
+                frozenset({"vehicle"}),
+                set(),
+            ),
+            (
+                {"body", "person_job"},
+                frozenset({"body"}),
+                set(),
+            ),
+        )
+
+        for eligible, reviewed, expected in cases:
+            with self.subTest(eligible=eligible, reviewed=reviewed):
+                self.assertEqual(
+                    _retain_hierarchical_automatic_themes(
+                        set(eligible),
+                        reviewed,
+                    ),
+                    expected,
+                )
+
+    def test_legacy_seed_loader_does_not_probe_new_theme_csvs(self) -> None:
+        with (
+            patch(
+                "scripts.build_bot_data.load_theme_rows",
+                return_value=(),
+            ) as load_legacy_rows,
+            patch(
+                "scripts.build_bot_data.load_reviewed_theme_rows",
+                return_value=(),
+            ),
+        ):
+            self.assertEqual(
+                load_reviewed_theme_seeds(Path("theme-data")),
+                (),
+            )
+
+        self.assertEqual(
+            tuple(
+                call.args[0].stem
+                for call in load_legacy_rows.call_args_list
+            ),
+            LEGACY_THEME_IDS,
         )
 
     def test_future_target_root_does_not_widen_compatibility(self) -> None:

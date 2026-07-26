@@ -36,7 +36,7 @@ REVIEWED_THEME_DATA_HEADER: Final = (
     "source_ref",
 )
 THEME_SEPARATOR: Final = "|"
-AUTO_THEME_SOURCE_REF: Final = "wnja:1.1-compatible-roots-v1"
+AUTO_THEME_SOURCE_REF: Final = "wnja:1.1-compatible-roots-v2"
 WORD_THEME_SOURCE_KINDS: Final = ("auto", "reviewed")
 REVIEWED_SOURCE_REF: Final = re.compile(
     r"^(?:wnja:\d{8}-[nvars]|manual:[a-z0-9][a-z0-9-]*)$"

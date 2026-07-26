@@ -1,4 +1,7 @@
-"""Build ranked theme candidates from Japanese WordNet for development.
+"""Rank candidates for the nine legacy reviewed-seed CSVs.
+
+This does not generate the 16-theme runtime map; ``scripts.build_bot_data``
+does that reproducibly from pinned offline inputs.
 
 This is an offline data-preparation tool, not application runtime code. It
 extracts noun descendants from a local Japanese WordNet SQLite database,

@@ -48,7 +48,10 @@ from shiritori.theme_data import (
     load_theme_rows,
 )
 from shiritori.theme_rules import (
+    AUTOMATIC_MULTI_LABEL_LINKS,
     BOTANICAL_THEME_IDS,
+    LEGACY_THEME_IDS,
+    PERSON_EXCLUDED_THEME_IDS,
     PERSON_SYNSET,
     THEME_BLOCKLISTS,
     THEME_COMPATIBLE_ROOTS,
@@ -447,7 +450,7 @@ def load_reviewed_theme_seeds(
     """Load all legacy and explicit reviewed pairs as build-time seeds."""
 
     by_pair: dict[tuple[str, str], dict[str, object]] = {}
-    for theme_id in THEME_IDS:
+    for theme_id in LEGACY_THEME_IDS:
         for row in load_theme_rows(theme_data_directory / f"{theme_id}.csv"):
             if row.surface in THEME_BLOCKLISTS[theme_id]:
                 raise ValueError(
@@ -570,6 +573,64 @@ def merge_reviewed_theme_rows(
         seen_surfaces.add(seed.surface)
         seen_readings.add(seed.reading)
     return merged
+
+
+def _retain_hierarchical_automatic_themes(
+    eligible_theme_ids: set[str],
+    reviewed_theme_ids: frozenset[str] | set[str] = frozenset(),
+) -> set[str]:
+    """Keep reviewed hierarchy links without changing the old-nine projection.
+
+    The legacy automatic gate remains authoritative.  Reviewed legacy labels
+    can anchor a compatible new automatic tag, but reviewed new labels never
+    make an unrelated automatic tag acceptable.  Explicit reviewed labels are
+    unioned by the caller only after this gate.
+    """
+
+    if not eligible_theme_ids:
+        return set()
+    legacy_automatic = eligible_theme_ids.intersection(LEGACY_THEME_IDS)
+    if (
+        len(legacy_automatic) > 1
+        and not legacy_automatic <= BOTANICAL_THEME_IDS
+    ):
+        return set()
+
+    new_automatic = eligible_theme_ids.difference(LEGACY_THEME_IDS)
+    legacy_anchors = legacy_automatic.union(
+        set(reviewed_theme_ids).intersection(LEGACY_THEME_IDS)
+    )
+    if legacy_anchors:
+        frontier = list(legacy_anchors)
+        retained = set(legacy_anchors)
+        candidates = legacy_anchors.union(new_automatic)
+        while frontier:
+            current = frontier.pop()
+            for candidate in candidates - retained:
+                if (
+                    frozenset((current, candidate))
+                    in AUTOMATIC_MULTI_LABEL_LINKS
+                ):
+                    retained.add(candidate)
+                    frontier.append(candidate)
+        return legacy_automatic.union(retained.intersection(new_automatic))
+
+    if not new_automatic:
+        return legacy_automatic
+    frontier = [
+        next(theme_id for theme_id in THEME_IDS if theme_id in new_automatic)
+    ]
+    retained = set(frontier)
+    while frontier:
+        current = frontier.pop()
+        for candidate in new_automatic - retained:
+            if frozenset((current, candidate)) in AUTOMATIC_MULTI_LABEL_LINKS:
+                retained.add(candidate)
+                frontier.append(candidate)
+    if retained != new_automatic:
+        return legacy_automatic
+    return legacy_automatic.union(new_automatic)
+
 
 def classify_theme_memberships(
     connection: sqlite3.Connection,
@@ -696,7 +757,7 @@ def classify_theme_memberships(
         )
     }
 
-    direct_by_surface: dict[str, set[str]] = {}
+    eligible_by_surface: dict[str, set[str]] = {}
     for surface, senses in senses_by_surface.items():
         automatic_theme_ids: set[str] = set()
         for theme_id in THEME_IDS:
@@ -707,7 +768,7 @@ def classify_theme_memberships(
                 for synset in senses
             ):
                 continue
-            if theme_id == "animal" and any(
+            if theme_id in PERSON_EXCLUDED_THEME_IDS and any(
                 (surface, synset) in person_senses for synset in senses
             ):
                 continue
@@ -717,15 +778,8 @@ def classify_theme_memberships(
             ):
                 automatic_theme_ids.add(theme_id)
 
-        # Only the reviewed botanical family can be emitted automatically as
-        # a multi-label union.  Every other cross-family union needs review.
-        if (
-            len(automatic_theme_ids) > 1
-            and not automatic_theme_ids <= BOTANICAL_THEME_IDS
-        ):
-            automatic_theme_ids.clear()
         if automatic_theme_ids:
-            direct_by_surface[surface] = automatic_theme_ids
+            eligible_by_surface[surface] = automatic_theme_ids
 
     frozen_seeds = tuple(seeds)
     reviewed_by_pair = {
@@ -734,8 +788,14 @@ def classify_theme_memberships(
     }
     memberships: dict[tuple[str, str], tuple[str, ...]] = {}
     for surface, reading, _source_ref, _tier in frozen_rows:
-        theme_ids = set(direct_by_surface.get(surface, ()))
-        theme_ids.update(reviewed_by_pair.get((surface, reading), ()))
+        reviewed_theme_ids = reviewed_by_pair.get(
+            (surface, reading), frozenset()
+        )
+        theme_ids = _retain_hierarchical_automatic_themes(
+            set(eligible_by_surface.get(surface, ())),
+            reviewed_theme_ids,
+        )
+        theme_ids.update(reviewed_theme_ids)
         memberships[(surface, reading)] = tuple(
             theme_id for theme_id in THEME_IDS if theme_id in theme_ids
         )
