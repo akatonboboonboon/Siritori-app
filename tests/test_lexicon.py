@@ -126,6 +126,28 @@ class LexiconValidatorTests(unittest.TestCase):
         self.assertEqual(result.readings, ("こーひー",))
         self.assertGreaterEqual(len(result.candidates), 1)
 
+    def test_accepts_proper_nouns_added_by_the_full_dictionary(self) -> None:
+        expected_readings = {
+            "すみっコぐらし": "すみっこぐらし",
+            "鬼滅の刃": "きめつのやいば",
+            "初音ミク": "はつねみく",
+            "ちいかわ": "ちいかわ",
+            "スプラトゥーン": "すぷらとぅーん",
+        }
+
+        for surface, reading in expected_readings.items():
+            with self.subTest(surface=surface):
+                result = self.validator.validate(surface)
+                self.assertEqual(result.code, LexiconCode.ACCEPTED)
+                self.assertEqual(result.readings, (reading,))
+                self.assertTrue(
+                    all(
+                        candidate.part_of_speech[:2]
+                        == ("名詞", "固有名詞")
+                        for candidate in result.candidates
+                    )
+                )
+
     def test_exposes_multiple_readings_instead_of_choosing_one(self) -> None:
         result = self.validator.validate("日本")
 

@@ -223,11 +223,11 @@ def _result(
 
 
 class LexiconValidator:
-    """入力表記をSudachi core辞書の完全一致項目で検証する。"""
+    """入力表記をSudachi full辞書の完全一致項目で検証する。"""
 
     def __init__(self, dictionary: Dictionary | None = None) -> None:
         self._dictionary = (
-            dictionary if dictionary is not None else Dictionary(dict="core")
+            dictionary if dictionary is not None else Dictionary(dict="full")
         )
 
     def validate(self, raw_surface: str | None) -> LexiconResult:

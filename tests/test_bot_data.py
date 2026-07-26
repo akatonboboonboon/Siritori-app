@@ -15,7 +15,7 @@ class BotDataTests(unittest.TestCase):
     def test_checked_in_vocabulary_is_large_unique_and_connected(self) -> None:
         options = load_bot_word_options()
 
-        self.assertGreaterEqual(len(options), 28_000)
+        self.assertGreaterEqual(len(options), 30_000)
         self.assertEqual(
             len({option.surface for option in options}),
             len(options),
@@ -103,7 +103,7 @@ class BotDataTests(unittest.TestCase):
     def test_default_catalog_uses_large_data_and_hard_can_choose(self) -> None:
         catalog = get_default_bot_catalog()
 
-        self.assertGreaterEqual(catalog.accepted_count, 28_000)
+        self.assertGreaterEqual(catalog.accepted_count, 30_000)
         selected = HardBot(seed=9).choose(
             BotContext("り"),
             catalog.index,

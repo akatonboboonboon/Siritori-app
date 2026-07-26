@@ -34,13 +34,14 @@ class DeploymentConfigurationTests(unittest.TestCase):
             {
                 "nicegui==3.14.0",
                 "sudachipy==0.6.11",
-                "sudachidict-core==20260428",
+                "sudachidict-full==20260723",
                 "SQLAlchemy==2.0.51",
                 "alembic==1.18.5",
                 "argon2-cffi==25.1.0",
                 "psycopg[binary]==3.3.4",
             }.issubset(requirements)
         )
+        self.assertNotIn("sudachidict-core==20260428", requirements)
 
     def test_local_secrets_and_databases_are_ignored(self) -> None:
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")

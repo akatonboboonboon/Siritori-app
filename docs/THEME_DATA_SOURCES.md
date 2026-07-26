@@ -53,7 +53,8 @@
 ## 一般Bot語彙
 
 テーマを指定しない対局のBotは、日本語WordNet、TKG Japanese-English
-Learner's Dictionary、Sudachiを役割分担して開発時に生成した28,750語を使用します。
+Learner's Dictionary、SudachiDict-full 20260723を役割分担して開発時に生成した
+30,547語を使用します。
 TKGは実在語判定のauthorityにはせず、自然さの粗い順位とBasic/Core名詞候補だけに
 利用しています。出典、固定commit/SHA-256、安全条件、CSV schema、再生成コマンドは
 [`BOT_DATA_SOURCES.md`](BOT_DATA_SOURCES.md)へ分離して記録しています。
