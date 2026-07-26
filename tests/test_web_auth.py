@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
 
+from shiritori.auth import Account, SessionPrincipal
 from shiritori.settings import Settings
 from shiritori.web_auth import (
     CsrfProtector,
@@ -24,6 +25,7 @@ from shiritori.web_auth import (
     _read_form,
     _safe_next,
     _same_origin,
+    _session_principal_matches_user,
     _set_session_cookie,
     _solo_difficulty_options,
 )
@@ -173,6 +175,27 @@ class GameUiHelperTests(unittest.TestCase):
                 "hard": "むずかしい",
             },
         )
+
+    def test_session_principal_must_still_own_the_play_page(self) -> None:
+        now = datetime(2026, 7, 26, 0, 0, tzinfo=timezone.utc)
+        principal = SessionPrincipal(
+            account=Account(
+                id="alice",
+                username="alice",
+                display_name="Alice",
+                created_at=now,
+            ),
+            session_id="session-alice",
+            expires_at=now + timedelta(hours=1),
+        )
+
+        self.assertTrue(
+            _session_principal_matches_user(principal, "alice")
+        )
+        self.assertFalse(
+            _session_principal_matches_user(principal, "bob")
+        )
+        self.assertFalse(_session_principal_matches_user(None, "alice"))
 
 
 class LoginAttemptLimiterTests(unittest.TestCase):

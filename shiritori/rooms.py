@@ -923,8 +923,18 @@ class RoomCoordinator:
     async def disconnect_client(
         self, room_id: str, client_id: str
     ) -> asyncio.Task[None] | None:
-        """Remove one tab and start grace only after the user's last tab."""
+        """Remove one tab and apply the appropriate absence policy.
 
+        A user receives the reconnect grace only while somebody else is still
+        connected to the room. Once the final connection disappears there is
+        nobody to keep a PvP room alive, and no human who should let a solo Bot
+        match continue, so cleanup/pause is committed before this method
+        returns. Restart recovery deliberately remains grace-based because a
+        freshly restarted process cannot distinguish reconnecting clients from
+        a genuinely empty room yet.
+        """
+
+        outcome: CommandOutcome | None = None
         async with self._lock_for(room_id):
             connection = self.hub.unsubscribe(room_id, client_id)
             if connection is None:
@@ -932,11 +942,30 @@ class RoomCoordinator:
             if self.hub.has_user(room_id, connection.user_id):
                 return None
             self._cancel_disconnect(room_id, connection.user_id)
-            task = asyncio.create_task(
-                self._disconnect_after_grace(room_id, connection.user_id)
-            )
-            self._disconnect_tasks[(room_id, connection.user_id)] = task
-            return task
+
+            if self.hub.connected_user_count(room_id) == 0:
+                self._cancel_room_disconnects(room_id)
+                snapshot = await self.repository.load(room_id)
+                if (
+                    snapshot is None
+                    or snapshot.role_for_user(connection.user_id) is None
+                ):
+                    return None
+                outcome = await self._apply_disconnect_absence(
+                    snapshot,
+                    connection.user_id,
+                    action="disconnect_empty_room",
+                )
+            else:
+                task = asyncio.create_task(
+                    self._disconnect_after_grace(room_id, connection.user_id)
+                )
+                self._disconnect_tasks[(room_id, connection.user_id)] = task
+                return task
+
+        assert outcome is not None
+        await self._publish_outcome(room_id, outcome)
+        return None
 
     async def recover_after_restart(self, room_id: str) -> RoomSnapshot:
         """Re-arm absence grace for human owners after process restart.
@@ -1390,27 +1419,42 @@ class RoomCoordinator:
                 snapshot = await self.repository.load(room_id)
                 if snapshot is None or snapshot.role_for_user(user_id) is None:
                     return
-                operation_id = f"system:disconnect:{uuid4().hex}"
-                _validate_internal_operation_id(operation_id, "system:")
-                fingerprint = _command_fingerprint(
-                    action="disconnect_after_grace",
-                    room_id=room_id,
-                    expected_version=snapshot.state_version,
-                    actor={"kind": "user", "user_id": user_id},
-                    inputs={},
-                )
-                outcome = await self._apply_absence(
+                outcome = await self._apply_disconnect_absence(
                     snapshot,
                     user_id,
-                    operation_id,
-                    fingerprint,
-                    self._now(),
-                    remove_spectator=False,
+                    action="disconnect_after_grace",
                 )
             await self._publish_outcome(room_id, outcome)
         finally:
             if self._disconnect_tasks.get(key) is asyncio.current_task():
                 self._disconnect_tasks.pop(key, None)
+
+    async def _apply_disconnect_absence(
+        self,
+        snapshot: RoomSnapshot,
+        user_id: str,
+        *,
+        action: str,
+    ) -> CommandOutcome:
+        """Commit one server-owned disconnect transition under the room lock."""
+
+        operation_id = f"system:disconnect:{uuid4().hex}"
+        _validate_internal_operation_id(operation_id, "system:")
+        fingerprint = _command_fingerprint(
+            action=action,
+            room_id=snapshot.room_id,
+            expected_version=snapshot.state_version,
+            actor={"kind": "user", "user_id": user_id},
+            inputs={},
+        )
+        return await self._apply_absence(
+            snapshot,
+            user_id,
+            operation_id,
+            fingerprint,
+            self._now(),
+            remove_spectator=False,
+        )
 
     async def _apply_absence(
         self,
@@ -1696,6 +1740,16 @@ class RoomCoordinator:
         task = self._disconnect_tasks.pop((room_id, user_id), None)
         if task is not None and not task.done():
             task.cancel()
+
+    def _cancel_room_disconnects(self, room_id: str) -> None:
+        """Cancel stale per-user grace jobs before empty-room finalization."""
+
+        for key, task in tuple(self._disconnect_tasks.items()):
+            if key[0] != room_id:
+                continue
+            self._disconnect_tasks.pop(key, None)
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
 
     async def _publish_outcome(
         self, room_id: str, outcome: CommandOutcome

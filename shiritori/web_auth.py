@@ -129,6 +129,18 @@ def _feedback_for_version(
     return feedback.message
 
 
+def _session_principal_matches_user(
+    principal: SessionPrincipal | None,
+    expected_user_id: str,
+) -> bool:
+    """Return whether a freshly authenticated session still owns the page."""
+
+    return (
+        principal is not None
+        and principal.account.id == expected_user_id
+    )
+
+
 def _solo_difficulty_options() -> dict[str, str]:
     """Return every Bot difficulty exposed by the application service."""
 
@@ -1289,11 +1301,13 @@ def register_auth_pages(
         attaching = False
         submitting = False
         polling = False
+        session_invalidated = False
 
         def can_submit(snapshot: RoomSnapshot) -> bool:
             seat = snapshot.seat_for_user(user_id)
             return (
-                snapshot.status is RoomStatus.ACTIVE
+                not session_invalidated
+                and snapshot.status is RoomStatus.ACTIVE
                 and seat is not None
                 and snapshot.current_turn == seat.index
                 and seat.controller is SeatController.HUMAN
@@ -1318,6 +1332,8 @@ def register_auth_pages(
 
         def render(snapshot: RoomSnapshot) -> None:
             nonlocal current_snapshot, rendered_history, transient_feedback
+            if session_invalidated:
+                return
             if (
                 current_snapshot is not None
                 and snapshot.state_version < current_snapshot.state_version
@@ -1497,7 +1513,8 @@ def register_auth_pages(
 
         async def on_room_event(event: RoomEvent) -> None:
             if (
-                event.kind is not RoomEventKind.SNAPSHOT
+                session_invalidated
+                or event.kind is not RoomEventKind.SNAPSHOT
                 or event.snapshot is None
                 or client.is_deleted
             ):
@@ -1508,12 +1525,47 @@ def register_auth_pages(
             except Exception:
                 LOGGER.exception("failed to render room event")
 
+        async def invalidate_play_session() -> None:
+            nonlocal pending_submission, session_invalidated
+            if session_invalidated:
+                return
+            session_invalidated = True
+            pending_submission = None
+            poll_timer.deactivate()
+            reading_dialog.close()
+            word_input.disable()
+            submit_button.disable()
+            feedback_label.set_text(
+                "セッションの有効期限が切れました。"
+                "ログインし直してください。"
+            )
+            login_link.set_visibility(True)
+            try:
+                await rooms.disconnect_client(game_id, client.id)
+            except Exception:
+                LOGGER.exception(
+                    "failed to disconnect invalid play session"
+                )
+
+        async def play_session_is_valid() -> bool:
+            if session_invalidated:
+                return False
+            current_principal = await principal_for(request)
+            if _session_principal_matches_user(
+                current_principal, user_id
+            ):
+                return True
+            await invalidate_play_session()
+            return False
+
         async def attach() -> None:
             nonlocal attaching
             if attaching:
                 return
             attaching = True
             try:
+                if not await play_session_is_valid():
+                    return
                 snapshot = await rooms.connect_client(
                     game_id,
                     user_id,
@@ -1541,10 +1593,12 @@ def register_auth_pages(
             """Keep clients in sync even across multiple server workers."""
 
             nonlocal polling
-            if polling or client.is_deleted:
+            if polling or client.is_deleted or session_invalidated:
                 return
             polling = True
             try:
+                if not await play_session_is_valid():
+                    return
                 snapshot = await rooms.load_snapshot(game_id)
                 if snapshot.role_for_user(user_id) is None:
                     feedback_label.set_text(
@@ -1586,6 +1640,8 @@ def register_auth_pages(
             submitting = True
             submit_button.disable()
             try:
+                if not await play_session_is_valid():
+                    return
                 result = await room_words.submit_user_word(
                     game_id,
                     user_id,
@@ -1744,6 +1800,11 @@ def register_auth_pages(
                         ).classes("platform-muted").props(
                             "role='status' aria-live='polite'"
                         )
+                        login_link = ui.link(
+                            "ログインし直す",
+                            f"/login?next=/play/{game_id}",
+                        ).classes("platform-link")
+                        login_link.set_visibility(False)
                     with ui.column().classes("dashboard-card"):
                         ui.label("ことばの履歴").classes("aside-title")
                         history_box = ui.column().classes(
@@ -1764,7 +1825,7 @@ def register_auth_pages(
         submit_button.disable()
         client.on_connect(attach)
         client.on_disconnect(detach)
-        ui.timer(1.0, refresh_snapshot)
+        poll_timer = ui.timer(1.0, refresh_snapshot)
 
     @ui.page("/saved-games")
     async def saved_games_page(request: Request):
