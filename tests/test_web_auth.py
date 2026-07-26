@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Lock
 import time
 from types import SimpleNamespace
@@ -17,8 +18,11 @@ from shiritori.auth import Account, SessionPrincipal
 from shiritori.lobby import LobbyStateError
 from shiritori.rooms import (
     RoomMode,
+    Role,
+    RoomReaction,
     RoomStatus,
     SeatController,
+    TurnRecord,
     create_room_snapshot,
 )
 from shiritori.settings import Settings
@@ -27,13 +31,17 @@ from shiritori.web_auth import (
     LoginAttemptLimiter,
     PasswordWorkLimiter,
     _DeadlinePresentation,
+    _MatchResultPresentation,
+    _SnapshotEffect,
     _VersionedFeedback,
     _auth_rate_limit_keys,
     _invite_rate_limit_keys,
     _can_surrender,
     _deadline_presentation,
     _feedback_for_version,
+    _match_result_presentation,
     _post_match_lobby_destination,
+    _reaction_sender_label,
     _read_form,
     _room_invite_url,
     _room_listing_summary,
@@ -41,8 +49,11 @@ from shiritori.web_auth import (
     _safe_next,
     _same_origin,
     _session_principal_matches_user,
+    _snapshot_effect,
+    _sound_cue_script,
     _set_session_cookie,
     _solo_difficulty_options,
+    _word_suggestion_status_label,
 )
 
 
@@ -212,6 +223,18 @@ class GameUiHelperTests(unittest.TestCase):
         )
         self.assertFalse(_session_principal_matches_user(None, "alice"))
 
+    def test_word_suggestion_status_labels_are_japanese(self) -> None:
+        self.assertEqual(
+            _word_suggestion_status_label("pending"), "審査待ち"
+        )
+        self.assertEqual(
+            _word_suggestion_status_label("approved"), "承認済み"
+        )
+        self.assertEqual(
+            _word_suggestion_status_label("rejected"), "見送り"
+        )
+        self.assertEqual(_word_suggestion_status_label("other"), "確認中")
+
     def test_public_room_summary_exposes_settings_but_not_user_ids(self) -> None:
         room = SimpleNamespace(
             players=(
@@ -321,7 +344,352 @@ class GameUiHelperTests(unittest.TestCase):
         )
 
 
+class GameResultUiHelperTests(unittest.TestCase):
+    def test_result_card_is_personalized_without_private_ids(self) -> None:
+        now = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
+        active = create_room_snapshot(
+            "result-game",
+            ("secret-alice-id", "secret-bob-id"),
+            mode=RoomMode.PVP,
+            spectators=("secret-watcher-id",),
+            now=now,
+            seat_picker=lambda _count: 0,
+        )
+        record = TurnRecord(
+            surface="りんご",
+            reading="りんご",
+            canonical_key="りんご",
+            seat_index=0,
+            actor_user_id="secret-alice-id",
+            by_bot=False,
+            submitted_at=now,
+        )
+        finished = replace(
+            active,
+            status=RoomStatus.FINISHED,
+            state_version=3,
+            current_turn=0,
+            eliminated_seats=(1,),
+            history=(record,),
+            losing_seat=1,
+            end_reason="timeout",
+            deadline_at=None,
+        )
+
+        winner = _match_result_presentation(
+            finished, "secret-alice-id"
+        )
+        loser = _match_result_presentation(
+            finished, "secret-bob-id"
+        )
+        spectator = _match_result_presentation(
+            finished, "secret-watcher-id"
+        )
+
+        self.assertEqual(
+            winner,
+            _MatchResultPresentation(
+                title="勝利！",
+                tone="victory",
+                outcome="あなたが最後まで勝ち残りました。",
+                accepted_word_count=1,
+                end_reason="時間切れ",
+                round_summary="2人で開始・1人脱落",
+                last_word="りんご（りんご）",
+            ),
+        )
+        self.assertEqual(loser.title, "今回は敗北")
+        self.assertEqual(loser.tone, "defeat")
+        self.assertEqual(loser.outcome, "プレイヤー1の勝ちです。")
+        self.assertEqual(spectator.title, "対局終了")
+        self.assertEqual(spectator.tone, "neutral")
+        self.assertEqual(
+            spectator.outcome,
+            "プレイヤー1の勝ちです。",
+        )
+        combined = f"{winner!r}{loser!r}{spectator!r}"
+        self.assertNotIn("secret-alice-id", combined)
+        self.assertNotIn("secret-bob-id", combined)
+        self.assertNotIn("secret-watcher-id", combined)
+
+    def test_solo_result_names_a_permanent_bot(self) -> None:
+        active = create_room_snapshot(
+            "solo-result",
+            ("private-user-id",),
+            mode=RoomMode.SOLO_BOT,
+            permanent_bot_count=1,
+            seat_picker=lambda _count: 0,
+        )
+        finished = replace(
+            active,
+            status=RoomStatus.FINISHED,
+            state_version=1,
+            current_turn=1,
+            eliminated_seats=(0,),
+            losing_seat=0,
+            end_reason="ends_with_n",
+            deadline_at=None,
+        )
+
+        result = _match_result_presentation(
+            finished, "private-user-id"
+        )
+
+        self.assertEqual(result.title, "今回は敗北")
+        self.assertEqual(result.outcome, "Bot 2の勝ちです。")
+        self.assertEqual(result.round_summary, "あなたとBot 1体で対戦")
+        self.assertEqual(result.last_word, "なし")
+        self.assertNotIn("private-user-id", repr(result))
+
+    def test_result_card_rejects_an_active_snapshot(self) -> None:
+        active = create_room_snapshot(
+            "active-game",
+            ("alice", "bob"),
+            mode=RoomMode.PVP,
+            seat_picker=lambda _count: 0,
+        )
+
+        with self.assertRaises(ValueError):
+            _match_result_presentation(active, "alice")
+
+    def test_snapshot_effect_only_fires_for_new_versions(self) -> None:
+        now = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
+        initial = create_room_snapshot(
+            "effect-game",
+            ("alice", "bob", "carol"),
+            mode=RoomMode.PVP,
+            now=now,
+            seat_picker=lambda _count: 0,
+        )
+        record = TurnRecord(
+            surface="すいか",
+            reading="すいか",
+            canonical_key="すいか",
+            seat_index=0,
+            actor_user_id="alice",
+            by_bot=False,
+            submitted_at=now,
+        )
+        accepted = replace(
+            initial,
+            state_version=1,
+            history=(record,),
+            expected_kana="か",
+        )
+        eliminated = replace(
+            accepted,
+            state_version=2,
+            eliminated_seats=(1,),
+            losing_seat=1,
+            end_reason="timeout",
+        )
+        finished = replace(
+            eliminated,
+            status=RoomStatus.FINISHED,
+            state_version=3,
+            current_turn=0,
+            eliminated_seats=(1, 2),
+            losing_seat=2,
+            end_reason="ends_with_n",
+            expected_kana=None,
+        )
+
+        self.assertIsNone(_snapshot_effect(None, initial, "alice"))
+        self.assertEqual(
+            _snapshot_effect(initial, accepted, "alice"),
+            _SnapshotEffect("accepted", "accepted"),
+        )
+        self.assertIsNone(
+            _snapshot_effect(accepted, accepted, "alice")
+        )
+        self.assertEqual(
+            _snapshot_effect(accepted, eliminated, "alice"),
+            _SnapshotEffect("elimination", "elimination"),
+        )
+        self.assertEqual(
+            _snapshot_effect(eliminated, finished, "alice"),
+            _SnapshotEffect("finish", "victory"),
+        )
+        self.assertEqual(
+            _snapshot_effect(eliminated, finished, "spectator"),
+            _SnapshotEffect("finish", "finish"),
+        )
+
+    def test_reaction_sender_labels_never_expose_user_ids(self) -> None:
+        now = datetime(2026, 7, 26, 2, 0, tzinfo=timezone.utc)
+        active = create_room_snapshot(
+            "reaction-labels",
+            ("private-alice-id", "private-bob-id"),
+            mode=RoomMode.PVP,
+            spectators=("private-watcher-id",),
+            now=now,
+            seat_picker=lambda _count: 0,
+        )
+        player_reaction = RoomReaction(
+            emoji="👍",
+            sender_user_id="private-alice-id",
+            sender_role=Role.PLAYER,
+            sent_at=now,
+        )
+        watcher_reaction = RoomReaction(
+            emoji="👏",
+            sender_user_id="private-watcher-id",
+            sender_role=Role.SPECTATOR,
+            sent_at=now,
+        )
+        eliminated_reaction = RoomReaction(
+            emoji="🔥",
+            sender_user_id="private-alice-id",
+            sender_role=Role.SPECTATOR,
+            sent_at=now,
+        )
+        finished = replace(
+            active,
+            status=RoomStatus.FINISHED,
+            current_turn=1,
+            eliminated_seats=(0,),
+            losing_seat=0,
+            end_reason="surrender",
+        )
+
+        labels = (
+            _reaction_sender_label(
+                active, player_reaction, "private-alice-id"
+            ),
+            _reaction_sender_label(
+                active, player_reaction, "private-bob-id"
+            ),
+            _reaction_sender_label(
+                active, watcher_reaction, "private-bob-id"
+            ),
+            _reaction_sender_label(
+                finished, eliminated_reaction, "private-bob-id"
+            ),
+        )
+
+        self.assertEqual(
+            labels,
+            ("あなた", "プレイヤー1", "観戦者", "プレイヤー1（観戦中）"),
+        )
+        self.assertFalse(any("private-" in label for label in labels))
+
+    def test_sound_cues_are_generated_and_fail_closed(self) -> None:
+        script = _sound_cue_script("accepted")
+
+        self.assertIn("AudioContext", script)
+        self.assertIn("createOscillator", script)
+        self.assertIn("catch(_error)", script)
+        self.assertNotIn("http://", script)
+        self.assertNotIn("https://", script)
+        with self.assertRaises(ValueError):
+            _sound_cue_script("not-a-cue")
+
+    def test_game_effect_css_respects_reduced_motion(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "shiritori" / "web_auth.py").read_text(
+            encoding="utf-8"
+        )
+        css = (root / "assets" / "platform.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('app.storage.user', source)
+        self.assertIn('game_sound_muted', source)
+        self.assertIn('game_reduced_motion', source)
+        self.assertIn('delay_seconds=5.0', source)
+        self.assertIn('@media (prefers-reduced-motion: reduce)', css)
+        self.assertIn('.match-result-card', css)
+        self.assertIn('.game-effect--error', css)
+        self.assertIn('rooms.send_reaction(game_id, user_id, emoji)', source)
+        self.assertIn('event.kind is RoomEventKind.REACTION', source)
+        self.assertIn('for emoji in SUPPORTED_REACTIONS', source)
+        self.assertIn('while len(reaction_bubbles) > 4', source)
+        self.assertIn('.reaction-bubble--enter', css)
+        self.assertIn('.reaction-panel', css)
+
+    def test_word_suggestion_page_is_protected_and_intentional(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "shiritori" / "web_auth.py").read_text(
+            encoding="utf-8"
+        )
+        main_source = (root / "main.py").read_text(encoding="utf-8")
+        page_source = source[
+            source.index('@ui.page("/word-suggestions")'):
+            source.index('@ui.page("/join/{room_code}")')
+        ]
+
+        self.assertIn(
+            "word_suggestions: WordSuggestionService | None = None",
+            source,
+        )
+        self.assertIn(
+            '"/login?next=/word-suggestions"',
+            page_source,
+        )
+        self.assertIn(
+            "fresh_principal = await principal_for(request)",
+            page_source,
+        )
+        self.assertIn(
+            "_session_principal_matches_user(",
+            page_source,
+        )
+        self.assertIn("if busy:", page_source)
+        self.assertIn("word_suggestions.submit,", page_source)
+        self.assertIn("word_suggestions.list_mine,", page_source)
+        self.assertIn(
+            "except WordSuggestionValidationError as error:",
+            page_source,
+        )
+        self.assertIn(
+            "except WordSuggestionPendingLimitError as error:",
+            page_source,
+        )
+        self.assertIn("maxlength=30", page_source)
+        self.assertIn("maxlength=60", page_source)
+        self.assertIn("maxlength=200", page_source)
+        self.assertIn("autocomplete=off required", page_source)
+        self.assertIn(
+            "同じ単語と読みはすでに申請済みです。",
+            page_source,
+        )
+        self.assertNotIn("request.query_params", page_source)
+        self.assertNotIn("suggestion.id", page_source)
+        self.assertNotIn("suggestion.user_id", page_source)
+        self.assertIn(
+            'ui.link("単語追加リクエスト", "/word-suggestions")',
+            source,
+        )
+        self.assertIn(
+            '"辞書にない単語を申請",',
+            source,
+        )
+        self.assertIn(
+            "WORD_SUGGESTIONS = SERVICES.word_suggestions",
+            main_source,
+        )
+        self.assertIn('"/word-suggestions",', main_source)
+        self.assertIn(
+            "word_suggestions=WORD_SUGGESTIONS,",
+            main_source,
+        )
+
+    def test_reaction_bubble_uses_parent_live_region_only(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "shiritori" / "web_auth.py").read_text(
+            encoding="utf-8"
+        )
+        reaction_source = source[
+            source.index("def show_room_reaction("):
+            source.index("async def release_reaction_buttons(")
+        ]
+
+        self.assertIn("aria-label='{sender}が", reaction_source)
+        self.assertNotIn("role='status'", reaction_source)
+
+
 class LoginAttemptLimiterTests(unittest.TestCase):
+
     def test_limit_is_bounded_per_key_and_resets(self) -> None:
         limiter = LoginAttemptLimiter(attempts=2, window_seconds=10)
 

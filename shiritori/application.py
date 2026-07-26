@@ -35,6 +35,7 @@ from .score_attack_persistence import SQLAlchemyScoreAttackService
 from .settings import Settings
 from .solo import SoloGameService
 from .statistics import StatisticsRepository
+from .word_suggestions import WordSuggestionService
 from .themes import ALL_THEME_ID, ThemeCatalog, ThemeDefinition
 
 
@@ -50,6 +51,7 @@ class ApplicationServices:
     auth: AuthService
     games: GameRepository
     statistics: StatisticsRepository
+    word_suggestions: WordSuggestionService
     score_attack: SQLAlchemyScoreAttackService
     lobby_repository: SQLAlchemyLobbyRepository
     lobby: LobbyService
@@ -75,6 +77,7 @@ class ApplicationServices:
         auth = AuthService(database)
         games = GameRepository(database)
         statistics = StatisticsRepository(database)
+        word_suggestions = WordSuggestionService(database)
         score_attack = SQLAlchemyScoreAttackService(database)
         themes = ThemeCatalog()
         lobby_repository = SQLAlchemyLobbyRepository(database)
@@ -135,6 +138,7 @@ class ApplicationServices:
             auth=auth,
             games=games,
             statistics=statistics,
+            word_suggestions=word_suggestions,
             score_attack=score_attack,
             lobby_repository=lobby_repository,
             lobby=lobby,

@@ -53,6 +53,12 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.services.runtime.active_room_ids, frozenset())
 
+    async def test_word_suggestions_share_application_database(self) -> None:
+        self.assertIs(
+            self.services.word_suggestions.database,
+            self.services.database,
+        )
+
     async def test_start_drains_all_expired_score_attack_batches(self) -> None:
         class StubScoreAttack:
             def __init__(self) -> None:

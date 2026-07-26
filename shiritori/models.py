@@ -645,6 +645,74 @@ class ScoreAttackRun(Base):
     )
 
 
+class WordSuggestion(Base):
+    """A user-submitted dictionary candidate awaiting human review."""
+
+    __tablename__ = "word_suggestions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    surface: Mapped[str] = mapped_column(String(30), nullable=False)
+    reading: Mapped[str] = mapped_column(String(60), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "surface",
+            "reading",
+            name="uq_word_suggestions_user_surface_reading",
+        ),
+        CheckConstraint(
+            "length(surface) >= 1 AND length(surface) <= 30",
+            name="surface_length",
+        ),
+        CheckConstraint(
+            "length(reading) >= 1 AND length(reading) <= 60",
+            name="reading_length",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(note) <= 200",
+            name="note_length",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="valid_status",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND reviewed_at IS NULL) OR "
+            "(status IN ('approved', 'rejected') AND reviewed_at IS NOT NULL)",
+            name="valid_review_lifecycle",
+        ),
+        Index(
+            "ix_word_suggestions_user_created",
+            "user_id",
+            "created_at",
+        ),
+        Index(
+            "ix_word_suggestions_review_queue",
+            "status",
+            "created_at",
+        ),
+    )
+
+
 class RoomCommandReceipt(Base):
     """Durable result of one coordinator command.
 
@@ -707,6 +775,7 @@ __all__ = [
     "SoloGameSave",
     "StoredGameStatus",
     "User",
+    "WordSuggestion",
     "new_id",
     "utc_now",
 ]

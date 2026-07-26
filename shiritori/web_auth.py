@@ -47,12 +47,16 @@ from .models import RoomRole, RoomStatus as StoredRoomStatus
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
     LexiconRoomService,
+    ReactionRateLimitError,
+    SUPPORTED_REACTIONS,
     Role,
     RoomCoordinator,
     RoomError,
     RoomEvent,
+    RoomReaction,
     RoomEventKind,
     RoomSnapshot,
+    RoomMode,
     RoomStatus,
     RoomVersionConflict,
     SeatController,
@@ -69,6 +73,13 @@ from .score_attack_persistence import (
 from .settings import Settings
 from .solo import SoloGameAuthorizationError, SoloGameService
 from .statistics import StatisticsRepository
+from .word_suggestions import (
+    WordSuggestionPendingLimitError,
+    WordSuggestionService,
+    WordSuggestionUserUnavailableError,
+    WordSuggestionValidationError,
+    WordSuggestionView,
+)
 
 
 _PLATFORM_CSS = (
@@ -90,6 +101,7 @@ class AuthWebServices:
     lobby: LobbyService | None = None
     statistics: StatisticsRepository | None = None
     score_attack: SQLAlchemyScoreAttackService | None = None
+    word_suggestions: WordSuggestionService | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +115,203 @@ class _DeadlinePresentation:
 class _VersionedFeedback:
     state_version: int | None
     message: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchResultPresentation:
+    """Non-sensitive copy for the finished-match result card."""
+
+    title: str
+    tone: str
+    outcome: str
+    accepted_word_count: int
+    end_reason: str
+    round_summary: str
+    last_word: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotEffect:
+    """One visual/audio cue emitted for an authoritative state transition."""
+
+    kind: str
+    sound: str
+
+
+_END_REASON_TEXT = {
+    "ends_with_n": "「ん」で終わった",
+    "duplicate": "同じ読みを使った",
+    "timeout": "時間切れ",
+    "no_legal_move": "出せる単語がなくなった",
+    "surrender": "降参",
+    "disconnect": "接続が戻らなかった",
+}
+_SOUND_CUE_NOTES = {
+    "accepted": ((659, 0.00, 0.08), (880, 0.07, 0.10)),
+    "error": ((247, 0.00, 0.12), (196, 0.09, 0.14)),
+    "elimination": ((392, 0.00, 0.10), (294, 0.09, 0.14)),
+    "victory": (
+        (523, 0.00, 0.10),
+        (659, 0.09, 0.10),
+        (784, 0.18, 0.16),
+    ),
+    "finish": ((440, 0.00, 0.11), (349, 0.10, 0.16)),
+}
+
+
+def _public_seat_label(
+    snapshot: RoomSnapshot,
+    seat_index: int,
+    user_id: str,
+) -> str:
+    """Describe a seat without returning an account identifier."""
+
+    seat = snapshot.players[seat_index]
+    if seat.owner_user_id == user_id:
+        return "あなた"
+    if (
+        seat.owner_user_id is None
+        and seat.controller is SeatController.BOT
+    ):
+        return f"Bot {seat_index + 1}"
+    return f"プレイヤー{seat_index + 1}"
+
+
+def _reaction_sender_label(
+    snapshot: RoomSnapshot,
+    reaction: RoomReaction,
+    user_id: str,
+) -> str:
+    """Return a public reaction sender label without leaking account IDs."""
+
+    if reaction.sender_user_id == user_id:
+        return "あなた"
+    seat = snapshot.seat_for_user(reaction.sender_user_id)
+    if seat is None:
+        return "観戦者"
+    if reaction.sender_role is Role.SPECTATOR:
+        return f"プレイヤー{seat.index + 1}（観戦中）"
+    return f"プレイヤー{seat.index + 1}"
+
+def _match_result_presentation(
+    snapshot: RoomSnapshot,
+    user_id: str,
+) -> _MatchResultPresentation:
+    """Build the finished result card entirely from public seat labels."""
+
+    if snapshot.status is not RoomStatus.FINISHED:
+        raise ValueError("a match result requires a finished snapshot")
+
+    own_seat = snapshot.seat_for_user(user_id)
+    winner_indexes = snapshot.active_seat_indexes
+    if len(winner_indexes) == 1:
+        winner_index = winner_indexes[0]
+        winner = _public_seat_label(snapshot, winner_index, user_id)
+        if own_seat is not None and own_seat.index == winner_index:
+            title = "勝利！"
+            tone = "victory"
+            outcome = "あなたが最後まで勝ち残りました。"
+        elif own_seat is not None:
+            title = "今回は敗北"
+            tone = "defeat"
+            outcome = f"{winner}の勝ちです。"
+        else:
+            title = "対局終了"
+            tone = "neutral"
+            outcome = f"{winner}の勝ちです。"
+    else:
+        title = "対局終了"
+        tone = "neutral"
+        outcome = "勝者は確定しませんでした。"
+
+    if snapshot.mode is RoomMode.SOLO_BOT:
+        round_summary = (
+            f"あなたとBot {len(snapshot.players) - 1}体で対戦"
+        )
+    else:
+        round_summary = (
+            f"{len(snapshot.players)}人で開始・"
+            f"{len(snapshot.eliminated_seats)}人脱落"
+        )
+    last_word = (
+        f"{snapshot.history[-1].surface}"
+        f"（{snapshot.history[-1].reading}）"
+        if snapshot.history
+        else "なし"
+    )
+    return _MatchResultPresentation(
+        title=title,
+        tone=tone,
+        outcome=outcome,
+        accepted_word_count=len(snapshot.history),
+        end_reason=_END_REASON_TEXT.get(
+            snapshot.end_reason,
+            "対局終了条件を満たした",
+        ),
+        round_summary=round_summary,
+        last_word=last_word,
+    )
+
+
+def _snapshot_effect(
+    previous: RoomSnapshot | None,
+    current: RoomSnapshot,
+    user_id: str,
+) -> _SnapshotEffect | None:
+    """Return at most one cue for a new snapshot; polling is intentionally mute."""
+
+    if (
+        previous is None
+        or previous.room_id != current.room_id
+        or current.state_version <= previous.state_version
+    ):
+        return None
+    if (
+        previous.status is not RoomStatus.FINISHED
+        and current.status is RoomStatus.FINISHED
+    ):
+        result = _match_result_presentation(current, user_id)
+        sound = "victory" if result.tone == "victory" else "finish"
+        return _SnapshotEffect("finish", sound)
+    if len(current.eliminated_seats) > len(previous.eliminated_seats):
+        return _SnapshotEffect("elimination", "elimination")
+    if len(current.history) > len(previous.history):
+        return _SnapshotEffect("accepted", "accepted")
+    return None
+
+
+def _sound_cue_script(cue: str) -> str:
+    """Return a self-contained Web Audio cue which fails closed."""
+
+    try:
+        notes = _SOUND_CUE_NOTES[cue]
+    except KeyError as error:
+        raise ValueError("unknown sound cue") from error
+    encoded_notes = ",".join(
+        f"[{frequency},{delay:.2f},{duration:.2f}]"
+        for frequency, delay, duration in notes
+    )
+    return (
+        "(async()=>{try{"
+        "const Audio=window.AudioContext||window.webkitAudioContext;"
+        "if(!Audio){return false;}"
+        "const context=window.__siritoriAudioContext||"
+        "(window.__siritoriAudioContext=new Audio());"
+        "if(context.state==='suspended'){await context.resume();}"
+        f"const notes=[{encoded_notes}];"
+        "for(const [frequency,delay,duration] of notes){"
+        "const start=context.currentTime+delay;"
+        "const oscillator=context.createOscillator();"
+        "const gain=context.createGain();"
+        "oscillator.type='sine';"
+        "oscillator.frequency.setValueAtTime(frequency,start);"
+        "gain.gain.setValueAtTime(0.0001,start);"
+        "gain.gain.exponentialRampToValueAtTime(0.035,start+0.01);"
+        "gain.gain.exponentialRampToValueAtTime(0.0001,start+duration);"
+        "oscillator.connect(gain);gain.connect(context.destination);"
+        "oscillator.start(start);oscillator.stop(start+duration+0.02);"
+        "}return true;}catch(_error){return false;}})()"
+    )
 
 
 def _deadline_presentation(
@@ -158,6 +367,16 @@ def _session_principal_matches_user(
         principal is not None
         and principal.account.id == expected_user_id
     )
+
+
+def _word_suggestion_status_label(status: str) -> str:
+    """Return a Japanese label without trusting persisted display text."""
+
+    return {
+        "pending": "審査待ち",
+        "approved": "承認済み",
+        "rejected": "見送り",
+    }.get(str(status), "確認中")
 
 
 def _solo_difficulty_options() -> dict[str, str]:
@@ -611,6 +830,7 @@ def register_auth_pages(
     lobby = services.lobby
     statistics = services.statistics
     score_attack = services.score_attack
+    word_suggestions = services.word_suggestions
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
@@ -816,6 +1036,9 @@ def register_auth_pages(
                     ui.link("戦績", "/stats").classes("platform-link")
                     ui.link("ランキング", "/rankings").classes("platform-link")
                     ui.link("スコアアタック", "/score-attack").classes(
+                        "platform-link"
+                    )
+                    ui.link("単語追加リクエスト", "/word-suggestions").classes(
                         "platform-link"
                     )
                 with ui.element("section").classes("dashboard-grid"):
@@ -1948,6 +2171,234 @@ def register_auth_pages(
                 render_run(current_run)
                 score_timer = ui.timer(0.5, tick_score_attack)
 
+    @ui.page("/word-suggestions")
+    async def word_suggestions_page(request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            return RedirectResponse(
+                "/login?next=/word-suggestions",
+                status_code=303,
+            )
+        if word_suggestions is None:
+            return RedirectResponse("/lobby", status_code=303)
+
+        user_id = principal.account.id
+        initial_error: str | None = None
+        try:
+            initial_suggestions = await asyncio.to_thread(
+                word_suggestions.list_mine,
+                user_id,
+                limit=50,
+            )
+        except WordSuggestionUserUnavailableError:
+            return RedirectResponse(
+                "/login?next=/word-suggestions",
+                status_code=303,
+            )
+        except Exception:
+            LOGGER.exception("failed to load word suggestions")
+            initial_suggestions = ()
+            initial_error = (
+                "申請履歴を読み込めませんでした。"
+                "少し待ってから再読み込みしてください。"
+            )
+
+        _page_shell()
+        client = ui.context.client
+        busy = False
+
+        def set_feedback(message: str, *, error: bool = False) -> None:
+            feedback_label.set_text(message)
+            feedback_label.classes(
+                add="auth-error" if error else "platform-muted",
+                remove="platform-muted" if error else "auth-error",
+            )
+
+        def render_suggestions(
+            suggestions: tuple[WordSuggestionView, ...],
+        ) -> None:
+            suggestions_box.clear()
+            with suggestions_box:
+                if not suggestions:
+                    ui.label(
+                        "申請履歴はまだありません。"
+                    ).classes("platform-muted")
+                    return
+                for suggestion in suggestions:
+                    with ui.column().classes(
+                        "public-room-card w-full gap-1"
+                    ):
+                        with ui.row().classes(
+                            "w-full items-center justify-between gap-2"
+                        ):
+                            ui.label(suggestion.surface).classes(
+                                "aside-title"
+                            )
+                            ui.label(
+                                _word_suggestion_status_label(
+                                    suggestion.status
+                                )
+                            ).classes("platform-muted")
+                        ui.label(
+                            f"読み: {suggestion.reading}"
+                        ).classes("platform-muted")
+                        if suggestion.note:
+                            ui.label(
+                                f"補足: {suggestion.note}"
+                            ).classes("platform-muted")
+                        created_text = suggestion.created_at.astimezone(
+                            timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M UTC")
+                        ui.label(
+                            f"申請日時: {created_text}"
+                        ).classes("platform-muted")
+
+        async def submit_suggestion(
+            _event: object | None = None,
+        ) -> None:
+            nonlocal busy
+            if busy:
+                return
+            busy = True
+            submit_button.disable()
+            set_feedback("申請内容を確認しています。")
+            try:
+                fresh_principal = await principal_for(request)
+                if not _session_principal_matches_user(
+                    fresh_principal,
+                    user_id,
+                ):
+                    set_feedback(
+                        "ログイン状態を確認できませんでした。"
+                        "もう一度ログインしてください。",
+                        error=True,
+                    )
+                    ui.navigate.to(
+                        "/login?next=/word-suggestions"
+                    )
+                    return
+
+                result = await asyncio.to_thread(
+                    word_suggestions.submit,
+                    user_id,
+                    surface_input.value,
+                    reading_input.value,
+                    note_input.value or None,
+                )
+                latest = await asyncio.to_thread(
+                    word_suggestions.list_mine,
+                    user_id,
+                    limit=50,
+                )
+            except WordSuggestionValidationError as error:
+                field_label = {
+                    "surface": "単語",
+                    "reading": "読み",
+                    "note": "補足",
+                }.get(error.field, "入力")
+                set_feedback(
+                    f"{field_label}: {error}",
+                    error=True,
+                )
+            except WordSuggestionPendingLimitError as error:
+                set_feedback(str(error), error=True)
+            except WordSuggestionUserUnavailableError as error:
+                set_feedback(str(error), error=True)
+            except Exception:
+                LOGGER.exception("word suggestion submission failed")
+                set_feedback(
+                    "申請を保存できませんでした。"
+                    "少し待ってからもう一度お試しください。",
+                    error=True,
+                )
+            else:
+                render_suggestions(latest)
+                surface_input.set_value("")
+                reading_input.set_value("")
+                note_input.set_value("")
+                if result.replayed:
+                    set_feedback(
+                        "同じ単語と読みはすでに申請済みです。"
+                        "既存の申請を履歴に表示しました。"
+                    )
+                else:
+                    set_feedback(
+                        "申請を受け付けました。"
+                        "審査後に結果が更新されます。"
+                    )
+            finally:
+                busy = False
+                if not client.is_deleted:
+                    submit_button.enable()
+
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                with ui.element("header").classes("platform-header"):
+                    with ui.column():
+                        ui.label("単語追加リクエスト").classes(
+                            "auth-title"
+                        )
+                        ui.label(
+                            "辞書にない実在する単語を審査へ送れます。"
+                        ).classes("platform-muted")
+                    ui.link("← ロビー", "/lobby").classes(
+                        "platform-link"
+                    )
+                ui.label(
+                    "申請した単語は自動では追加されません。"
+                    "確認後の辞書更新をお待ちください。"
+                ).classes("auth-copy")
+                with ui.element("section").classes("dashboard-grid"):
+                    with ui.column().classes("dashboard-card"):
+                        ui.label("新しく申請する").classes("aside-title")
+                        # Gameplay failures are never copied here. The user
+                        # must intentionally provide a word and its reading.
+                        surface_input = ui.input(
+                            label="申請する単語",
+                            placeholder="例: 佃煮",
+                        ).props(
+                            "outlined clearable maxlength=30 "
+                            "autocomplete=off required"
+                        ).classes("w-full")
+                        reading_input = ui.input(
+                            label="ひらがなの読み",
+                            placeholder="例: つくだに",
+                        ).props(
+                            "outlined clearable maxlength=60 "
+                            "autocomplete=off required"
+                        ).classes("w-full")
+                        note_input = ui.textarea(
+                            label="補足（任意）",
+                            placeholder="辞書掲載例や用途など",
+                        ).props(
+                            "outlined maxlength=200 autogrow"
+                        ).classes("w-full")
+                        submit_button = ui.button(
+                            "審査を依頼する",
+                            icon="send",
+                            on_click=submit_suggestion,
+                        ).props(
+                            "unelevated no-caps"
+                        ).classes("w-full")
+                        feedback_label = ui.label(
+                            initial_error or (
+                                "単語と読みを入力してください。"
+                            )
+                        ).classes(
+                            "auth-error"
+                            if initial_error
+                            else "platform-muted"
+                        ).props(
+                            "role='status' aria-live='polite'"
+                        )
+                    with ui.column().classes("dashboard-card"):
+                        ui.label("あなたの申請履歴").classes("aside-title")
+                        suggestions_box = ui.column().classes(
+                            "w-full gap-2"
+                        )
+
+        render_suggestions(initial_suggestions)
+
     @ui.page("/join/{room_code}")
     async def room_invite_page(room_code: str, request: Request):
         principal = await principal_for(request)
@@ -2442,10 +2893,26 @@ def register_auth_pages(
         _page_shell()
         user_id = principal.account.id
         client = ui.context.client
+        try:
+            preference_storage = app.storage.user
+            sound_muted = (
+                preference_storage.get("game_sound_muted", False) is True
+            )
+            reduced_motion = (
+                preference_storage.get("game_reduced_motion", False) is True
+            )
+        except RuntimeError:
+            preference_storage = None
+            sound_muted = False
+            reduced_motion = False
         current_snapshot: RoomSnapshot | None = None
         pending_submission: tuple[str, int, str] | None = None
         transient_feedback: _VersionedFeedback | None = None
         rendered_history: tuple[object, ...] | None = None
+        animation_tasks: set[asyncio.Task[None]] = set()
+        reaction_bubbles: OrderedDict[str, object] = OrderedDict()
+        reaction_buttons: list[object] = []
+        reaction_sending = False
         attaching = False
         submitting = False
         surrendering = False
@@ -2453,6 +2920,198 @@ def register_auth_pages(
         post_match_task: asyncio.Task[None] | None = None
         polling = False
         session_invalidated = False
+
+        def persist_game_preferences() -> None:
+            if preference_storage is None:
+                return
+            try:
+                preference_storage["game_sound_muted"] = sound_muted
+                preference_storage["game_reduced_motion"] = reduced_motion
+            except Exception:
+                LOGGER.exception("failed to persist game UI preferences")
+
+        def trigger_sound(cue: str) -> None:
+            if sound_muted or client.is_deleted:
+                return
+            # The generated oscillator cue has no external or copyrighted
+            # asset. Its JavaScript catches autoplay/security failures.
+            client.run_javascript(_sound_cue_script(cue))
+
+        def animate_element(
+            element: object,
+            css_class: str,
+            *,
+            seconds: float = 0.9,
+        ) -> None:
+            if reduced_motion or client.is_deleted:
+                return
+            element.classes(add=css_class)
+
+            async def remove_effect() -> None:
+                await asyncio.sleep(seconds)
+                if client.is_deleted:
+                    return
+                with client:
+                    element.classes(remove=css_class)
+
+            task = asyncio.create_task(remove_effect())
+            animation_tasks.add(task)
+            task.add_done_callback(animation_tasks.discard)
+
+        def apply_snapshot_effect(
+            effect: _SnapshotEffect | None,
+        ) -> None:
+            if effect is None:
+                return
+            if effect.kind == "accepted":
+                animate_element(history_box, "game-effect--accepted")
+            elif effect.kind == "elimination":
+                animate_element(feedback_label, "game-effect--elimination")
+            elif effect.kind == "finish":
+                animate_element(result_panel, "game-effect--finish")
+            trigger_sound(effect.sound)
+
+        def toggle_sound(_event: object | None = None) -> None:
+            nonlocal sound_muted
+            sound_muted = not sound_muted
+            sound_button.set_icon(
+                "volume_off" if sound_muted else "volume_up"
+            )
+            sound_button.set_text(
+                "効果音 OFF" if sound_muted else "効果音 ON"
+            )
+            sound_button.props(
+                "aria-label='効果音をオンにする'"
+                if sound_muted
+                else "aria-label='効果音をオフにする'"
+            )
+            persist_game_preferences()
+            if not sound_muted:
+                trigger_sound("accepted")
+
+        def toggle_reduced_motion(event: object) -> None:
+            nonlocal reduced_motion
+            reduced_motion = getattr(event, "value", False) is True
+            if reduced_motion:
+                game_main.classes(add="motion-reduced")
+            else:
+                game_main.classes(remove="motion-reduced")
+            persist_game_preferences()
+
+        def sync_reaction_buttons() -> None:
+            allowed = (
+                not session_invalidated
+                and not reaction_sending
+                and current_snapshot is not None
+                and current_snapshot.role_for_user(user_id) is not None
+            )
+            for button in reaction_buttons:
+                if allowed:
+                    button.enable()
+                else:
+                    button.disable()
+
+        def show_room_reaction(reaction: RoomReaction) -> None:
+            snapshot = current_snapshot
+            if snapshot is None or client.is_deleted:
+                return
+            sender = _reaction_sender_label(
+                snapshot,
+                reaction,
+                user_id,
+            )
+            token = uuid4().hex
+            with reaction_feed_box:
+                with ui.row().classes(
+                    "reaction-bubble reaction-bubble--enter "
+                    "items-center gap-2"
+                ).props(
+                    f"aria-label='{sender}が"
+                    f"{reaction.emoji}でリアクション'"
+                ) as bubble:
+                    ui.label(reaction.emoji).classes(
+                        "reaction-bubble-emoji"
+                    ).props("aria-hidden='true'")
+                    ui.label(sender).classes("reaction-bubble-sender")
+            reaction_bubbles[token] = bubble
+            while len(reaction_bubbles) > 4:
+                _old_token, old_bubble = reaction_bubbles.popitem(
+                    last=False
+                )
+                old_bubble.delete()
+
+            async def expire_reaction() -> None:
+                await asyncio.sleep(3.2)
+                stored = reaction_bubbles.pop(token, None)
+                if stored is None or client.is_deleted:
+                    return
+                with client:
+                    stored.delete()
+
+            task = asyncio.create_task(expire_reaction())
+            animation_tasks.add(task)
+            task.add_done_callback(animation_tasks.discard)
+
+        async def release_reaction_buttons(delay: float) -> None:
+            nonlocal reaction_sending
+            if delay > 0:
+                await asyncio.sleep(delay)
+            reaction_sending = False
+            if client.is_deleted or session_invalidated:
+                return
+            with client:
+                sync_reaction_buttons()
+
+        async def send_room_reaction(
+            emoji: str,
+            _event: object | None = None,
+        ) -> None:
+            nonlocal reaction_sending
+            snapshot = current_snapshot
+            if (
+                reaction_sending
+                or emoji not in SUPPORTED_REACTIONS
+                or snapshot is None
+                or snapshot.role_for_user(user_id) is None
+                or session_invalidated
+            ):
+                return
+            reaction_sending = True
+            sync_reaction_buttons()
+            cooldown = 0.0
+            try:
+                if not await play_session_is_valid():
+                    return
+                await rooms.send_reaction(game_id, user_id, emoji)
+            except ReactionRateLimitError as error:
+                cooldown = max(0.1, error.retry_after_seconds)
+                reaction_feedback_label.set_text(
+                    f"あと{max(1, math.ceil(cooldown))}秒ほど"
+                    "待ってから送ってください。"
+                )
+            except RoomError:
+                LOGGER.exception("room reaction failed")
+                reaction_feedback_label.set_text(
+                    "リアクションを送れませんでした。"
+                    "対局への接続を確認してください。"
+                )
+            except Exception:
+                LOGGER.exception("unexpected room reaction failure")
+                reaction_feedback_label.set_text(
+                    "リアクションを送れませんでした。"
+                    "少し待ってからお試しください。"
+                )
+            else:
+                cooldown = 1.0
+                reaction_feedback_label.set_text(
+                    "リアクションを送りました。"
+                )
+            finally:
+                task = asyncio.create_task(
+                    release_reaction_buttons(cooldown)
+                )
+                animation_tasks.add(task)
+                task.add_done_callback(animation_tasks.discard)
 
         def can_submit(snapshot: RoomSnapshot) -> bool:
             seat = snapshot.seat_for_user(user_id)
@@ -2493,6 +3152,11 @@ def register_auth_pages(
             transient_message = _feedback_for_version(
                 transient_feedback,
                 snapshot.state_version,
+            )
+            effect = _snapshot_effect(
+                current_snapshot,
+                snapshot,
+                user_id,
             )
             if transient_message is None:
                 transient_feedback = None
@@ -2580,7 +3244,16 @@ def register_auth_pages(
                             actor = f"プレイヤー{record.seat_index + 1}"
                         with ui.row().classes(
                             "game-history-row w-full items-center "
-                            "justify-between gap-3"
+                            "justify-between gap-3 "
+                            + (
+                                "game-history-row--new"
+                                if (
+                                    effect is not None
+                                    and effect.kind == "accepted"
+                                    and index == len(snapshot.history)
+                                )
+                                else ""
+                            )
                         ):
                             ui.label(
                                 f"{index}. {record.surface}"
@@ -2612,9 +3285,27 @@ def register_auth_pages(
                 surrender_button.disable()
             finished = snapshot.status is RoomStatus.FINISHED
             is_solo = snapshot.mode is RoomMode.SOLO_BOT
+            result_panel.set_visibility(finished)
             post_match_panel.set_visibility(finished)
             solo_rematch_button.set_visibility(finished and is_solo)
             waiting_room_button.set_visibility(finished and not is_solo)
+            if finished:
+                result = _match_result_presentation(snapshot, user_id)
+                result_panel.classes(
+                    add=f"match-result--{result.tone}",
+                    remove=(
+                        "match-result--victory match-result--defeat "
+                        "match-result--neutral"
+                    ),
+                )
+                result_title.set_text(result.title)
+                result_outcome.set_text(result.outcome)
+                result_words.set_text(
+                    f"{result.accepted_word_count}語"
+                )
+                result_reason.set_text(result.end_reason)
+                result_round.set_text(result.round_summary)
+                result_last_word.set_text(result.last_word)
             if finished and is_solo:
                 post_match_label.set_text(
                     "Bot数・難易度・制限時間を変えずに、"
@@ -2729,24 +3420,31 @@ def register_auth_pages(
                         else "相手の手を待っています。"
                     )
                 )
+            apply_snapshot_effect(effect)
+            sync_reaction_buttons()
 
         def schedule_return_to_waiting_room() -> None:
             nonlocal post_match_task
             if post_match_task is not None and not post_match_task.done():
                 return
             post_match_task = asyncio.create_task(
-                return_to_waiting_room(delay_seconds=1.5)
+                return_to_waiting_room(delay_seconds=5.0)
             )
 
         async def on_room_event(event: RoomEvent) -> None:
-            if (
-                session_invalidated
-                or event.kind is not RoomEventKind.SNAPSHOT
-                or event.snapshot is None
-                or client.is_deleted
-            ):
+            if session_invalidated or client.is_deleted:
                 return
             try:
+                if event.kind is RoomEventKind.REACTION:
+                    if event.reaction is not None:
+                        with client:
+                            show_room_reaction(event.reaction)
+                    return
+                if (
+                    event.kind is not RoomEventKind.SNAPSHOT
+                    or event.snapshot is None
+                ):
+                    return
                 with client:
                     render(event.snapshot)
                     if (
@@ -2770,6 +3468,7 @@ def register_auth_pages(
             submit_button.disable()
             surrender_button.disable()
             surrender_button.set_visibility(False)
+            sync_reaction_buttons()
             feedback_label.set_text(
                 "セッションの有効期限が切れました。"
                 "ログインし直してください。"
@@ -2947,6 +3646,11 @@ def register_auth_pages(
                     pending_submission = None
                     reading_dialog.close()
                     show_transient_feedback(result.message)
+                    animate_element(
+                        feedback_label,
+                        "game-effect--error",
+                    )
+                    trigger_sound("error")
             finally:
                 submitting = False
                 if current_snapshot is not None:
@@ -3138,19 +3842,72 @@ def register_auth_pages(
                 if not session_invalidated and not client.is_deleted:
                     waiting_room_button.enable()
 
-        with ui.element("main").classes("platform-shell"):
+        with ui.element("main").classes(
+            "platform-shell"
+            + (" motion-reduced" if reduced_motion else "")
+        ) as game_main:
             with ui.column().classes("platform-wrap"):
                 with ui.row().classes(
-                    "w-full items-center justify-between gap-3"
+                    "game-page-header w-full items-center "
+                    "justify-between gap-3"
                 ):
                     with ui.column():
                         game_title = ui.label("対局").classes("auth-title")
                         settings_label = ui.label("").classes(
                             "platform-muted"
                         )
-                    ui.link("ロビーへ", "/lobby").classes(
-                        "platform-link"
-                    )
+                    with ui.column().classes(
+                        "game-preferences items-end gap-1"
+                    ):
+                        ui.link("ロビーへ", "/lobby").classes(
+                            "platform-link"
+                        )
+                        with ui.row().classes(
+                            "items-center justify-end gap-2"
+                        ):
+                            sound_button = ui.button(
+                                (
+                                    "効果音 OFF"
+                                    if sound_muted
+                                    else "効果音 ON"
+                                ),
+                                icon=(
+                                    "volume_off"
+                                    if sound_muted
+                                    else "volume_up"
+                                ),
+                                on_click=toggle_sound,
+                            ).props(
+                                "flat dense no-caps "
+                                + (
+                                    "aria-label='効果音をオンにする'"
+                                    if sound_muted
+                                    else "aria-label='効果音をオフにする'"
+                                )
+                            ).classes("sound-toggle")
+                            sound_button.on(
+                                "click",
+                                js_handler=(
+                                    "()=>{try{const A=window.AudioContext||"
+                                    "window.webkitAudioContext;if(!A)return;"
+                                    "const c=window.__siritoriAudioContext||"
+                                    "(window.__siritoriAudioContext=new A());"
+                                    "if(c.state==='suspended'){"
+                                    "void c.resume().catch(()=>{});}}catch(_){}}"
+                                ),
+                            )
+                            ui.switch(
+                                "演出を減らす",
+                                value=reduced_motion,
+                                on_change=toggle_reduced_motion,
+                            ).props(
+                                "dense aria-label='アニメーションを減らす'"
+                            ).classes("motion-toggle")
+                reaction_feed_box = ui.column().classes(
+                    "reaction-feed gap-2"
+                ).props(
+                    "role='log' aria-live='polite' aria-relevant='additions'"
+                )
                 with ui.element("section").classes("dashboard-grid"):
                     with ui.column().classes("dashboard-card"):
                         status_label = ui.label("接続中").classes(
@@ -3195,6 +3952,81 @@ def register_auth_pages(
                         ).classes("platform-muted").props(
                             "role='status' aria-live='polite'"
                         )
+                        with ui.element("section").classes(
+                            "match-result-card w-full"
+                        ).props(
+                            "role='status' aria-live='polite' "
+                            "aria-atomic='true'"
+                        ) as result_panel:
+                            ui.label("対局リザルト").classes(
+                                "match-result-eyebrow"
+                            )
+                            result_title = ui.label("").classes(
+                                "match-result-title"
+                            )
+                            result_outcome = ui.label("").classes(
+                                "match-result-outcome"
+                            )
+                            with ui.element("div").classes(
+                                "match-result-grid"
+                            ):
+                                with ui.element("div"):
+                                    ui.label(
+                                        "成立したことば"
+                                    ).classes("match-result-metric-label")
+                                    result_words = ui.label("").classes(
+                                        "match-result-metric-value"
+                                    )
+                                with ui.element("div"):
+                                    ui.label("終了理由").classes(
+                                        "match-result-metric-label"
+                                    )
+                                    result_reason = ui.label("").classes(
+                                        "match-result-metric-value"
+                                    )
+                                with ui.element("div"):
+                                    ui.label("対戦概要").classes(
+                                        "match-result-metric-label"
+                                    )
+                                    result_round = ui.label("").classes(
+                                        "match-result-metric-value"
+                                    )
+                                with ui.element("div"):
+                                    ui.label("最後のことば").classes(
+                                        "match-result-metric-label"
+                                    )
+                                    result_last_word = ui.label("").classes(
+                                        "match-result-metric-value"
+                                    )
+                        result_panel.set_visibility(False)
+                        with ui.element("section").classes(
+                            "reaction-panel w-full"
+                        ):
+                            ui.label("リアクション").classes(
+                                "reaction-panel-title"
+                            )
+                            with ui.row().classes(
+                                "reaction-buttons w-full items-center"
+                            ):
+                                for emoji in SUPPORTED_REACTIONS:
+                                    button = ui.button(
+                                        emoji,
+                                        on_click=(
+                                            lambda _event=None, value=emoji:
+                                            send_room_reaction(value)
+                                        ),
+                                    ).props(
+                                        "flat round dense "
+                                        f"aria-label='{emoji}を送る'"
+                                    ).classes("reaction-button")
+                                    reaction_buttons.append(button)
+                            reaction_feedback_label = ui.label(
+                                "対戦中も観戦中も送れます。"
+                            ).classes(
+                                "platform-muted reaction-feedback"
+                            ).props(
+                                "role='status' aria-live='polite'"
+                            )
                         with ui.column().classes(
                             "post-match-actions w-full gap-2"
                         ) as post_match_panel:
@@ -3214,6 +4046,10 @@ def register_auth_pages(
                                 on_click=return_to_waiting_room,
                             ).props("unelevated no-caps").classes("w-full")
                         post_match_panel.set_visibility(False)
+                        ui.link(
+                            "辞書にない単語を申請",
+                            "/word-suggestions",
+                        ).classes("platform-link")
                         login_link = ui.link(
                             "ログインし直す",
                             f"/login?next=/play/{game_id}",
@@ -3259,6 +4095,8 @@ def register_auth_pages(
 
         word_input.disable()
         submit_button.disable()
+        for reaction_button in reaction_buttons:
+            reaction_button.disable()
         client.on_connect(attach)
         client.on_disconnect(detach)
         poll_timer = ui.timer(1.0, refresh_snapshot)

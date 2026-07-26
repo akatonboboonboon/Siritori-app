@@ -26,6 +26,7 @@ ROOM_RUNTIME = SERVICES.runtime
 SOLO = SERVICES.solo
 STATISTICS = SERVICES.statistics
 SCORE_ATTACK = SERVICES.score_attack
+WORD_SUGGESTIONS = SERVICES.word_suggestions
 
 
 @app.middleware("http")
@@ -47,6 +48,7 @@ async def security_headers(request: Request, call_next):
             "/stats",
             "/rankings",
             "/score-attack",
+            "/word-suggestions",
         )
     ):
         response.headers.setdefault("Cache-Control", "no-store")
@@ -90,6 +92,7 @@ register_auth_pages(
         lobby=LOBBY,
         statistics=STATISTICS,
         score_attack=SCORE_ATTACK,
+        word_suggestions=WORD_SUGGESTIONS,
     )
 )
 app.on_startup(SERVICES.start)
