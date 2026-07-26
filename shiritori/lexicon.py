@@ -1,8 +1,9 @@
 """Sudachi辞書を使った、しりとり用の実在語判定。
 
-このモジュールはゲーム状態やNiceGUIから独立させている。入力表記に一致する
-辞書項目だけを採用し、形態素解析で複数語へ分割できるだけの文字列は実在語と
-みなさない。
+このモジュールはゲーム状態やNiceGUIから独立させている。原則として入力表記に
+一致する辞書項目だけを採用し、形態素解析で複数語へ分割できるだけの文字列は
+実在語とみなさない。例外は、固定辞書の正規表記と読みへ結び付けた明示aliasだけ
+である。
 """
 
 from __future__ import annotations
@@ -22,6 +23,14 @@ _INVALID_EDGE_MARKS = frozenset(
     {"々", "〆", "ー", "・", "ゝ", "ゞ", "ヽ", "ヾ"}
 )
 _ALLOWED_NOUN_CATEGORIES = frozenset({"普通名詞", "固有名詞"})
+
+# Sudachi Full 20260723 contains 油淋鶏 with the reading ユーリンチー,
+# but not the user-requested kana surface as an exact lookup. This narrow alias
+# still fails closed unless the pinned canonical dictionary entry exists with
+# exactly the reviewed reading; it is not a general fuzzy-match mechanism.
+_EXACT_SURFACE_ALIASES = {
+    "ユーリンチー": ("油淋鶏", "ゆーりんちー"),
+}
 
 
 class LexiconCode(str, Enum):
@@ -246,7 +255,10 @@ class LexiconValidator:
         if len(surface) == 1 and _is_katakana(surface):
             return _result(LexiconCode.SINGLE_KATAKANA, surface)
 
-        entries = tuple(self._dictionary.lookup(surface))
+        alias = _EXACT_SURFACE_ALIASES.get(surface)
+        lookup_surface = alias[0] if alias is not None else surface
+        expected_alias_reading = alias[1] if alias is not None else None
+        entries = tuple(self._dictionary.lookup(lookup_surface))
         if not entries:
             return _result(LexiconCode.NOT_IN_DICTIONARY, surface)
 
@@ -265,7 +277,13 @@ class LexiconValidator:
         candidates: list[LexiconCandidate] = []
         for entry, part_of_speech in allowed_entries:
             reading = katakana_to_hiragana(entry.reading_form())
-            if not _is_usable_reading(reading):
+            if (
+                not _is_usable_reading(reading)
+                or (
+                    expected_alias_reading is not None
+                    and reading != expected_alias_reading
+                )
+            ):
                 continue
 
             normalized_form = (

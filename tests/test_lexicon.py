@@ -173,6 +173,41 @@ class LexiconValidatorTests(unittest.TestCase):
         result = self.validator.validate("猫犬猫犬猫犬")
         self.assertEqual(result.code, LexiconCode.NOT_IN_DICTIONARY)
 
+    def test_accepts_explicit_yurinchi_alias_and_canonical_surface(
+        self,
+    ) -> None:
+        alias_surface = "\u30e6\u30fc\u30ea\u30f3\u30c1\u30fc"
+        canonical_surface = "\u6cb9\u6dcb\u9d8f"
+        expected_reading = "\u3086\u30fc\u308a\u3093\u3061\u30fc"
+
+        alias_result = self.validator.validate(alias_surface)
+        canonical_result = self.validator.validate(canonical_surface)
+
+        for result in (alias_result, canonical_result):
+            with self.subTest(surface=result.surface):
+                self.assertEqual(result.code, LexiconCode.ACCEPTED)
+                self.assertEqual(result.readings, (expected_reading,))
+
+        self.assertTrue(
+            all(
+                candidate.surface == alias_surface
+                and candidate.lemma == canonical_surface
+                and candidate.normalized_form == canonical_surface
+                for candidate in alias_result.candidates
+            )
+        )
+        self.assertTrue(
+            all(
+                candidate.surface == canonical_surface
+                for candidate in canonical_result.candidates
+            )
+        )
+
+    def test_accepts_yudofu_with_exact_reading(self) -> None:
+        result = self.validator.validate("\u6e6f\u8c46\u8150")
+
+        self.assertEqual(result.code, LexiconCode.ACCEPTED)
+        self.assertEqual(result.readings, ("\u3086\u3069\u3046\u3075",))
 
 if __name__ == "__main__":
     unittest.main()

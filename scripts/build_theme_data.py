@@ -30,7 +30,7 @@ THEME_LIMITS: Final[dict[str, int]] = {
 THEME_BLOCKLISTS: Final[dict[str, frozenset[str]]] = {
     "food": frozenset(
         {
-            # The user keeps these entries explicitly in user_themes.py.
+            # Explicit reviewed additions add these memberships at unified build time.
             "林檎",
             "蜜柑",
             "西瓜",
