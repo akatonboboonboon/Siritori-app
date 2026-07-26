@@ -96,12 +96,11 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
             "owner-tab",
             now=NOW,
         )
-        task = await self.coordinator.disconnect_client(
+        delayed_task = await self.coordinator.disconnect_client(
             snapshot.room_id,
             "owner-tab",
         )
-        assert task is not None
-        await task
+        self.assertIsNone(delayed_task)
 
         paused = await self.service.list_paused(self.owner.id)
         self.assertEqual(len(paused), 1)
@@ -140,12 +139,11 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
             "owner-tab",
             now=NOW,
         )
-        task = await self.coordinator.disconnect_client(
+        delayed_task = await self.coordinator.disconnect_client(
             snapshot.room_id,
             "owner-tab",
         )
-        assert task is not None
-        await task
+        self.assertIsNone(delayed_task)
 
         with self.database.transaction() as session:
             session.execute(

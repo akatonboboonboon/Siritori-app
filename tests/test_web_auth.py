@@ -11,16 +11,23 @@ from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
 
+from shiritori.auth import Account, SessionPrincipal
 from shiritori.settings import Settings
 from shiritori.web_auth import (
     CsrfProtector,
     LoginAttemptLimiter,
     PasswordWorkLimiter,
+    _DeadlinePresentation,
+    _VersionedFeedback,
     _auth_rate_limit_keys,
+    _deadline_presentation,
+    _feedback_for_version,
     _read_form,
     _safe_next,
     _same_origin,
+    _session_principal_matches_user,
     _set_session_cookie,
+    _solo_difficulty_options,
 )
 
 
@@ -93,6 +100,102 @@ class CsrfProtectorTests(unittest.TestCase):
         self.assertFalse(protector.verify(token, "logout", now=101))
         self.assertFalse(protector.verify(token, "login", now=221))
         self.assertFalse(protector.verify("broken", "login", now=101))
+
+
+class GameUiHelperTests(unittest.TestCase):
+    def test_deadline_presentation_uses_ceil_and_warning_thresholds(self) -> None:
+        now = datetime(2026, 7, 26, 0, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            _deadline_presentation(None, now=now),
+            _DeadlinePresentation(
+                text="残り時間: 無制限",
+                level="normal",
+                expired=False,
+            ),
+        )
+        self.assertEqual(
+            _deadline_presentation(
+                now + timedelta(seconds=10, milliseconds=1),
+                now=now,
+            ),
+            _DeadlinePresentation(
+                text="残り時間: 11秒",
+                level="normal",
+                expired=False,
+            ),
+        )
+        self.assertEqual(
+            _deadline_presentation(
+                now + timedelta(seconds=9, milliseconds=1),
+                now=now,
+            ),
+            _DeadlinePresentation(
+                text="残り時間: 10秒",
+                level="warning",
+                expired=False,
+            ),
+        )
+        self.assertEqual(
+            _deadline_presentation(
+                now + timedelta(seconds=4, milliseconds=1),
+                now=now,
+            ),
+            _DeadlinePresentation(
+                text="残り時間: 5秒",
+                level="danger",
+                expired=False,
+            ),
+        )
+        self.assertEqual(
+            _deadline_presentation(now, now=now),
+            _DeadlinePresentation(
+                text="残り時間: 0秒",
+                level="danger",
+                expired=True,
+            ),
+        )
+
+    def test_transient_feedback_is_bound_to_one_state_version(self) -> None:
+        feedback = _VersionedFeedback(7, "辞書にない単語です。")
+
+        self.assertEqual(
+            _feedback_for_version(feedback, 7),
+            "辞書にない単語です。",
+        )
+        self.assertIsNone(_feedback_for_version(feedback, 8))
+        self.assertIsNone(_feedback_for_version(None, 7))
+
+    def test_solo_ui_exposes_all_three_bot_difficulties(self) -> None:
+        self.assertEqual(
+            _solo_difficulty_options(),
+            {
+                "easy": "やさしい",
+                "normal": "ふつう",
+                "hard": "むずかしい",
+            },
+        )
+
+    def test_session_principal_must_still_own_the_play_page(self) -> None:
+        now = datetime(2026, 7, 26, 0, 0, tzinfo=timezone.utc)
+        principal = SessionPrincipal(
+            account=Account(
+                id="alice",
+                username="alice",
+                display_name="Alice",
+                created_at=now,
+            ),
+            session_id="session-alice",
+            expires_at=now + timedelta(hours=1),
+        )
+
+        self.assertTrue(
+            _session_principal_matches_user(principal, "alice")
+        )
+        self.assertFalse(
+            _session_principal_matches_user(principal, "bob")
+        )
+        self.assertFalse(_session_principal_matches_user(None, "alice"))
 
 
 class LoginAttemptLimiterTests(unittest.TestCase):

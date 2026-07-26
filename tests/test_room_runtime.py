@@ -176,6 +176,55 @@ class RoomRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.expire_calls, 1)
         self.assertEqual(sleep.delays, [3.0])
 
+    async def test_last_human_disconnect_pauses_before_bot_delay(self) -> None:
+        clock = MutableClock()
+        sleep = GatedSleep(clock)
+        repository = InMemoryRoomRepository(
+            (
+                RoomSnapshot(
+                    room_id="solo-pause",
+                    mode=RoomMode.SOLO_BOT,
+                    status=RoomStatus.ACTIVE,
+                    players=(
+                        PlayerSeat(0, "alice", SeatController.HUMAN),
+                        PlayerSeat(1, None, SeatController.BOT),
+                    ),
+                    current_turn=1,
+                    expected_kana="り",
+                    turn_seconds=30,
+                    deadline_at=NOW + timedelta(seconds=30),
+                ),
+            )
+        )
+        coordinator = CountingCoordinator(repository, clock=clock)
+        runtime = RoomRuntime(
+            coordinator,
+            strategy_resolver=lambda _snapshot, _seat: NormalBot(seed=1),
+            word_index_resolver=lambda _snapshot: word_index(),
+            bot_delay_seconds=0.35,
+            clock=clock,
+            sleep=sleep,
+        )
+        coordinator.set_activity_notifier(runtime.notify)
+
+        await coordinator.connect_client(
+            "solo-pause", "alice", "alice-tab", now=NOW
+        )
+        await asyncio.wait_for(sleep.started.wait(), timeout=1)
+
+        delayed_task = await coordinator.disconnect_client(
+            "solo-pause", "alice-tab"
+        )
+
+        self.assertIsNone(delayed_task)
+        supervisor = runtime.notify("solo-pause")
+        await asyncio.wait_for(supervisor, timeout=1)
+        snapshot = await coordinator.load_snapshot("solo-pause")
+        self.assertEqual(snapshot.status, RoomStatus.PAUSED)
+        self.assertEqual(snapshot.history, ())
+        self.assertEqual(coordinator.bot_calls, 0)
+        await runtime.close()
+
     async def test_bot_chain_runs_in_background_then_finishes_no_move(
         self,
     ) -> None:

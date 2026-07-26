@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
@@ -738,6 +739,89 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             snapshot.players[0].controller, SeatController.HUMAN
         )
         self.assertEqual(snapshot.state_version, 0)
+
+    async def test_last_connection_deletes_pvp_without_waiting_for_grace(
+        self,
+    ) -> None:
+        repository = InMemoryRoomRepository([pvp_room()])
+        sleep_delays: list[float] = []
+
+        async def tracked_sleep(seconds: float) -> None:
+            sleep_delays.append(seconds)
+            await asyncio.sleep(0)
+
+        coordinator = RoomCoordinator(
+            repository,
+            disconnect_grace_seconds=999,
+            sleep=tracked_sleep,
+            clock=lambda: NOW,
+        )
+        await coordinator.connect_client("pvp", "alice", "alice-only-tab")
+
+        task = await coordinator.disconnect_client("pvp", "alice-only-tab")
+
+        self.assertIsNone(task)
+        self.assertEqual(sleep_delays, [])
+        self.assertEqual(coordinator._disconnect_tasks, {})
+        self.assertIsNone(await repository.load("pvp"))
+
+    async def test_last_connection_cancels_existing_grace_before_delete(
+        self,
+    ) -> None:
+        repository = InMemoryRoomRepository([pvp_room()])
+        coordinator = RoomCoordinator(
+            repository,
+            disconnect_grace_seconds=999,
+            clock=lambda: NOW,
+        )
+        await coordinator.connect_client("pvp", "alice", "alice-tab")
+        await coordinator.connect_client("pvp", "bob", "bob-tab")
+
+        alice_task = await coordinator.disconnect_client(
+            "pvp", "alice-tab"
+        )
+        self.assertIsNotNone(alice_task)
+        bob_task = await coordinator.disconnect_client("pvp", "bob-tab")
+
+        self.assertIsNone(bob_task)
+        assert alice_task is not None
+        await asyncio.gather(alice_task, return_exceptions=True)
+        self.assertTrue(alice_task.cancelled())
+        self.assertEqual(coordinator._disconnect_tasks, {})
+        self.assertIsNone(await repository.load("pvp"))
+
+    async def test_last_connection_pauses_solo_before_grace_or_bot_work(
+        self,
+    ) -> None:
+        active = replace(
+            solo_room(deadline_at=NOW + timedelta(seconds=12)),
+            current_turn=1,
+        )
+        repository = InMemoryRoomRepository([active])
+        sleep_delays: list[float] = []
+
+        async def tracked_sleep(seconds: float) -> None:
+            sleep_delays.append(seconds)
+            await asyncio.sleep(0)
+
+        coordinator = RoomCoordinator(
+            repository,
+            disconnect_grace_seconds=999,
+            sleep=tracked_sleep,
+            clock=lambda: NOW,
+        )
+        await coordinator.connect_client("solo", "alice", "alice-tab")
+
+        task = await coordinator.disconnect_client("solo", "alice-tab")
+
+        self.assertIsNone(task)
+        self.assertEqual(sleep_delays, [])
+        snapshot = await coordinator.load_snapshot("solo")
+        self.assertEqual(snapshot.status, RoomStatus.PAUSED)
+        self.assertEqual(snapshot.current_turn, 1)
+        self.assertEqual(snapshot.history, ())
+        self.assertEqual(snapshot.paused_remaining_seconds, 12)
+        self.assertIsNone(snapshot.deadline_at)
 
     async def test_disconnect_after_grace_enables_temporary_bot(self) -> None:
         repository = InMemoryRoomRepository([pvp_room()])
