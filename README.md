@@ -83,7 +83,7 @@ NiceGUI / FastAPI
 
 - Python 3.13
 - NiceGUI 3.14.0
-- SudachiPy 0.6.11 / SudachiDict-core 20260428
+- SudachiPy 0.6.11 / SudachiDict-full 20260723
 - SQLAlchemy 2.0.51 / Alembic 1.18.5
 - Argon2-cffi 25.1.0
 - Psycopg 3.3.4
@@ -119,7 +119,8 @@ python -m scripts.start
 開発時は、Git対象外の`./siritori-dev.db`を自動的な接続先として使えます。起動後に
 <http://localhost:8080>を開いてください。
 
-SudachiDict-coreの初回ダウンロードは約70MBあるため、インストールに時間がかかる場合があります。
+SudachiDict-fullの初回ダウンロードは約127MBあり、展開後の辞書ファイルは
+約360MBになるため、インストールに時間と空き容量が必要です。
 
 ## テスト
 

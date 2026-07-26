@@ -12,12 +12,12 @@
 - PyPI: <https://pypi.org/project/SudachiPy/0.6.11/>
 - ソース: <https://github.com/WorksApplications/sudachi.rs/tree/develop/python>
 
-## SudachiDict-core 20260428
+## SudachiDict-full 20260723
 
 - 提供者: Works Applications
-- 用途: 表記、読み、品詞を含む日本語core辞書
+- 用途: 表記、読み、品詞を含む日本語full辞書
 - パッケージのライセンス表記: Apache License 2.0
-- PyPI: <https://pypi.org/project/SudachiDict-core/20260428/>
+- PyPI: <https://pypi.org/project/SudachiDict-full/20260723/>
 - ソース: <https://github.com/WorksApplications/SudachiDict>
 - 辞書素材の詳細: <https://github.com/WorksApplications/SudachiDict/blob/develop/LEGAL>
 
