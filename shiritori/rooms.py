@@ -646,10 +646,10 @@ def create_room_snapshot(
             raise ValueError(
                 "solo Bot mode needs one human and at least one Bot"
             )
-    elif permanent_bot_count:
-        raise ValueError("permanent Bots are created only in solo Bot mode")
-    if mode is RoomMode.PVP and len(humans) < 2:
-        raise ValueError("PvP mode needs at least two human players")
+    elif len(humans) + permanent_bot_count < 2:
+        raise ValueError(
+            "PvP mode needs at least two human or Bot seats"
+        )
 
     seats = tuple(
         PlayerSeat(index, user_id, SeatController.HUMAN)
@@ -965,13 +965,21 @@ class RoomCoordinator:
 
         A restarted process has an empty in-memory hub. Each still-absent human
         receives the normal disconnect grace exactly once: an empty PvP room is
-        deleted, an empty solo room is paused, and a room with one reconnecting
-        human hands the other seats to Bots.
+        deleted (including a finished PvP room whose lobby was still open), an
+        empty active solo room is paused, and an active room with one
+        reconnecting human hands the other seats to Bots.
         """
 
         async with self._lock_for(room_id):
             snapshot = await self.load_snapshot(room_id)
-            if snapshot.status is not RoomStatus.ACTIVE:
+            recoverable = (
+                snapshot.status is RoomStatus.ACTIVE
+                or (
+                    snapshot.mode is RoomMode.PVP
+                    and snapshot.status is RoomStatus.FINISHED
+                )
+            )
+            if not recoverable:
                 return snapshot
             for seat in snapshot.players:
                 user_id = seat.owner_user_id
@@ -1030,6 +1038,150 @@ class RoomCoordinator:
                 fingerprint,
                 self._now(now),
                 remove_spectator=True,
+            )
+
+        await self._publish_outcome(room_id, outcome)
+        return outcome
+
+    async def surrender(
+        self,
+        room_id: str,
+        user_id: str,
+        *,
+        expected_version: int,
+        operation_id: str,
+        now: datetime | None = None,
+    ) -> CommandOutcome:
+        """Eliminate an active human-owned seat by explicit surrender.
+
+        Surrender is distinct from disconnecting: the owner permanently leaves
+        the active player order and becomes a spectator for the rest of the
+        match. A temporary Bot takeover does not prevent the authenticated
+        owner from surrendering their seat.
+        """
+
+        _validate_user_operation_id(operation_id)
+        fingerprint = _command_fingerprint(
+            action="surrender",
+            room_id=room_id,
+            expected_version=expected_version,
+            actor={"kind": "user", "user_id": user_id},
+            inputs={},
+        )
+        async with self._lock_for(room_id):
+            duplicate = await self._duplicate_outcome(
+                room_id,
+                operation_id,
+                fingerprint,
+                expected_version,
+            )
+            if duplicate is not None:
+                return duplicate
+            snapshot = await self.load_snapshot(room_id)
+            self._require_version(snapshot, expected_version)
+            if snapshot.status is not RoomStatus.ACTIVE:
+                raise RoomInactive("room is not active")
+
+            seat = snapshot.seat_for_user(user_id)
+            if (
+                seat is None
+                or seat.owner_user_id is None
+                or seat.index in snapshot.eliminated_seats
+            ):
+                raise RoomAuthorizationError(
+                    "only an active human seat owner can surrender"
+                )
+
+            current_time = self._now(now)
+            self._cancel_disconnect(room_id, user_id)
+            if snapshot.mode is RoomMode.SOLO_BOT:
+                active = frozenset(snapshot.active_seat_indexes)
+                permanent_bots = tuple(
+                    candidate.index
+                    for candidate in snapshot.players
+                    if candidate.owner_user_id is None
+                    and candidate.index in active
+                )
+                if not permanent_bots:
+                    raise RoomAuthorizationError(
+                        "solo surrender needs an active permanent Bot"
+                    )
+                survivor = next(
+                    candidate
+                    for offset in range(1, len(snapshot.players) + 1)
+                    if (
+                        candidate
+                        := (seat.index + offset) % len(snapshot.players)
+                    ) in permanent_bots
+                )
+                next_snapshot = replace(
+                    snapshot,
+                    status=RoomStatus.FINISHED,
+                    current_turn=survivor,
+                    eliminated_seats=tuple(
+                        candidate.index
+                        for candidate in snapshot.players
+                        if candidate.index != survivor
+                    ),
+                    expected_kana=None,
+                    deadline_at=None,
+                    paused_remaining_seconds=None,
+                    timed_out_seat=None,
+                    losing_seat=seat.index,
+                    end_reason="surrender",
+                    state_version=snapshot.state_version + 1,
+                )
+            else:
+                eliminated = (*snapshot.eliminated_seats, seat.index)
+                remaining = len(snapshot.players) - len(eliminated)
+                finished = remaining == 1
+                surrendered_current_turn = (
+                    snapshot.current_turn == seat.index
+                )
+                next_turn = (
+                    self._next_active_turn(
+                        snapshot,
+                        after=seat.index,
+                        eliminated_seats=eliminated,
+                    )
+                    if surrendered_current_turn or finished
+                    else snapshot.current_turn
+                )
+                deadline = snapshot.deadline_at
+                if finished:
+                    deadline = None
+                elif surrendered_current_turn:
+                    deadline = (
+                        current_time
+                        + timedelta(seconds=snapshot.turn_seconds)
+                        if snapshot.turn_seconds is not None
+                        else None
+                    )
+                next_snapshot = replace(
+                    snapshot,
+                    status=(
+                        RoomStatus.FINISHED
+                        if finished
+                        else RoomStatus.ACTIVE
+                    ),
+                    current_turn=next_turn,
+                    eliminated_seats=eliminated,
+                    expected_kana=(
+                        None if finished else snapshot.expected_kana
+                    ),
+                    deadline_at=deadline,
+                    paused_remaining_seconds=None,
+                    timed_out_seat=None,
+                    losing_seat=seat.index,
+                    end_reason="surrender",
+                    state_version=snapshot.state_version + 1,
+                )
+
+            outcome = await self._store_snapshot(
+                snapshot,
+                next_snapshot,
+                operation_id,
+                fingerprint,
             )
 
         await self._publish_outcome(room_id, outcome)
@@ -1510,8 +1662,21 @@ class RoomCoordinator:
                 )
             return CommandOutcome(operation_id, snapshot)
 
+        # A connected participant may still be reading the final result. The
+        # finished state needs no temporary Bot takeover; the last subsequent
+        # disconnect will use the empty-PvP branch above and close the room.
+        if (
+            snapshot.mode is RoomMode.PVP
+            and snapshot.status is RoomStatus.FINISHED
+        ):
+            return CommandOutcome(operation_id, snapshot)
+
         seat = snapshot.seat_for_user(user_id)
-        if seat is not None and seat.controller is not SeatController.BOT:
+        if (
+            seat is not None
+            and seat.index not in snapshot.eliminated_seats
+            and seat.controller is not SeatController.BOT
+        ):
             players = tuple(
                 replace(
                     candidate,

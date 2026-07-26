@@ -259,6 +259,17 @@ class SQLAlchemyRoomRepository:
         """Return validated active coordinator IDs for startup recovery."""
         return await asyncio.to_thread(self._list_active_room_ids_sync)
 
+    async def list_recoverable_room_ids(self) -> tuple[str, ...]:
+        """Return coordinator rooms that need startup absence recovery.
+
+        Finished PvP games remain recoverable while their lobby room is still
+        active and undeleted. This lets a restarted process give clients the
+        normal reconnect grace before closing an otherwise orphaned room.
+        Finished solo games are intentionally excluded because their progress
+        remains available as a saved result.
+        """
+        return await asyncio.to_thread(self._list_recoverable_room_ids_sync)
+
     async def find_operation(
         self, room_id: str, operation_id: str
     ) -> CommandReceipt | None:
@@ -377,6 +388,52 @@ class SQLAlchemyRoomRepository:
                 if snapshot.status is not RoomStatus.ACTIVE:
                     raise RoomSnapshotCorruptError(
                         f"game {game.id!r} is active but its room snapshot is not"
+                    )
+                room_ids.append(game.id)
+            return tuple(room_ids)
+
+    def _list_recoverable_room_ids_sync(self) -> tuple[str, ...]:
+        with self.database.read_session() as session:
+            active_games = tuple(session.scalars(
+                select(Game)
+                .where(Game.status == StoredGameStatus.ACTIVE.value)
+            ))
+            finished_pvp_games = tuple(session.scalars(
+                select(Game)
+                .join(Room, Game.room_id == Room.id)
+                .where(
+                    Game.status == StoredGameStatus.FINISHED.value,
+                    Game.mode == GameMode.MULTIPLAYER.value,
+                    Room.status == StoredRoomStatus.ACTIVE.value,
+                    Room.deleted_at.is_(None),
+                )
+            ))
+            room_ids: list[str] = []
+            for game in sorted(
+                (*active_games, *finished_pvp_games),
+                key=lambda candidate: candidate.id,
+            ):
+                state = game.state_json or {}
+                # Games belonging to another subsystem have no coordinator
+                # marker and remain outside this repository.
+                if not isinstance(state, Mapping) or _SCHEMA_KEY not in state:
+                    continue
+                snapshot = _snapshot_from_game(game)
+                expected_status = (
+                    RoomStatus.ACTIVE
+                    if game.status == StoredGameStatus.ACTIVE.value
+                    else RoomStatus.FINISHED
+                )
+                if snapshot.status is not expected_status:
+                    raise RoomSnapshotCorruptError(
+                        f"game {game.id!r} has an invalid recovery status"
+                    )
+                if (
+                    expected_status is RoomStatus.FINISHED
+                    and snapshot.mode is not RoomMode.PVP
+                ):
+                    raise RoomSnapshotCorruptError(
+                        f"game {game.id!r} is not a finished PvP room"
                     )
                 room_ids.append(game.id)
             return tuple(room_ids)

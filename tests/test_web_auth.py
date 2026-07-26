@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 import time
+from types import SimpleNamespace
 import unittest
 
 from fastapi import HTTPException
@@ -12,6 +14,12 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse
 
 from shiritori.auth import Account, SessionPrincipal
+from shiritori.rooms import (
+    RoomMode,
+    RoomStatus,
+    SeatController,
+    create_room_snapshot,
+)
 from shiritori.settings import Settings
 from shiritori.web_auth import (
     CsrfProtector,
@@ -20,9 +28,14 @@ from shiritori.web_auth import (
     _DeadlinePresentation,
     _VersionedFeedback,
     _auth_rate_limit_keys,
+    _invite_rate_limit_keys,
+    _can_surrender,
     _deadline_presentation,
     _feedback_for_version,
     _read_form,
+    _room_invite_url,
+    _room_listing_summary,
+    _room_timer_text,
     _safe_next,
     _same_origin,
     _session_principal_matches_user,
@@ -197,6 +210,74 @@ class GameUiHelperTests(unittest.TestCase):
         )
         self.assertFalse(_session_principal_matches_user(None, "alice"))
 
+    def test_public_room_summary_exposes_settings_but_not_user_ids(self) -> None:
+        room = SimpleNamespace(
+            players=(
+                SimpleNamespace(user_id="secret-alice-id"),
+                SimpleNamespace(user_id="secret-bob-id"),
+            ),
+            max_players=4,
+            turn_seconds=30,
+            fill_empty_seats_with_bots=True,
+            allow_spectators=False,
+        )
+
+        summary = _room_listing_summary(room)
+
+        self.assertEqual(
+            summary,
+            "対戦参加 2/4人・30秒・不足分はNormal Bot・観戦不可",
+        )
+        self.assertNotIn("secret-alice-id", summary)
+        self.assertNotIn("secret-bob-id", summary)
+        self.assertEqual(_room_timer_text(None), "無制限")
+
+    def test_invite_url_is_absolute_and_same_origin(self) -> None:
+        request = request_with_headers(
+            ("host", "siritori.example"),
+            scheme="https",
+        )
+
+        self.assertEqual(
+            _room_invite_url(request, "ABC234"),
+            "https://siritori.example/join/ABC234",
+        )
+
+    def test_surrender_is_available_to_temporary_bot_seat_owner(self) -> None:
+        snapshot = create_room_snapshot(
+            "game",
+            ("alice", "bob", "carol"),
+            mode=RoomMode.PVP,
+        )
+        temporary_bot = replace(
+            snapshot.players[0],
+            controller=SeatController.BOT,
+        )
+        taken_over = replace(
+            snapshot,
+            players=(temporary_bot, *snapshot.players[1:]),
+        )
+
+        self.assertTrue(_can_surrender(taken_over, "alice"))
+        self.assertFalse(_can_surrender(taken_over, "spectator"))
+
+        eliminated = replace(
+            taken_over,
+            current_turn=1,
+            eliminated_seats=(0,),
+        )
+        self.assertFalse(_can_surrender(eliminated, "alice"))
+
+        finished = replace(
+            taken_over,
+            status=RoomStatus.FINISHED,
+            current_turn=2,
+            eliminated_seats=(0, 1),
+            losing_seat=0,
+            end_reason="surrender",
+        )
+        self.assertFalse(_can_surrender(finished, "alice"))
+
 
 class LoginAttemptLimiterTests(unittest.TestCase):
     def test_limit_is_bounded_per_key_and_resets(self) -> None:
@@ -351,6 +432,28 @@ class RequestSecurityTests(unittest.TestCase):
         self.assertNotEqual(first_ip, second_ip)
         self.assertEqual(first_account, second_account)
         self.assertLessEqual(len(first_account), 72)
+
+    def test_invite_rate_keys_separate_accounts_and_ips(self) -> None:
+        first = request_with_headers(
+            ("host", "example.test"), client_host="192.0.2.1"
+        )
+        second = request_with_headers(
+            ("host", "example.test"), client_host="192.0.2.2"
+        )
+
+        first_ip, first_account = _invite_rate_limit_keys(
+            first, "account-a"
+        )
+        second_ip, same_account = _invite_rate_limit_keys(
+            second, "account-a"
+        )
+        _, other_account = _invite_rate_limit_keys(
+            first, "account-b"
+        )
+
+        self.assertNotEqual(first_ip, second_ip)
+        self.assertEqual(first_account, same_account)
+        self.assertNotEqual(first_account, other_account)
 
     def test_next_path_cannot_be_an_open_redirect(self) -> None:
         self.assertEqual(_safe_next("/rooms/ABC"), "/rooms/ABC")

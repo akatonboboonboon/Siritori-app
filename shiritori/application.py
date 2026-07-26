@@ -203,11 +203,13 @@ class ApplicationServices:
 
         if self._started:
             return
-        active_room_ids = await self.room_repository.list_active_room_ids()
+        recoverable_room_ids = (
+            await self.room_repository.list_recoverable_room_ids()
+        )
         await asyncio.gather(
             *(
                 self.rooms.recover_after_restart(room_id)
-                for room_id in active_room_ids
+                for room_id in recoverable_room_ids
             )
         )
         self._started = True

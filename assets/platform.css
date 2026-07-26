@@ -208,6 +208,65 @@ body {
   font-weight: 800;
 }
 
+.dashboard-card .q-btn,
+.dashboard-card .q-field__control,
+.dashboard-card .q-toggle,
+.room-invite-card .q-btn,
+.confirm-dialog .q-btn {
+  min-height: 44px;
+}
+
+.room-setting-help {
+  margin-top: -8px;
+  font-size: 0.82rem;
+}
+
+.public-room-list {
+  width: 100%;
+  margin-top: 18px;
+}
+
+.public-room-card {
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid #e5e3ef;
+  border-radius: 16px;
+  background: #fafafe;
+}
+
+.public-room-card > * {
+  min-width: 0;
+}
+
+.public-room-card .platform-muted,
+.invite-panel .q-field__native,
+.room-invite-card .platform-muted {
+  overflow-wrap: anywhere;
+}
+
+.invite-panel {
+  width: 100%;
+  margin-top: 18px;
+}
+
+.invite-copy-button,
+.surrender-button {
+  min-height: 44px;
+}
+
+.room-invite-card,
+.confirm-dialog {
+  width: min(560px, 100%);
+}
+
+.room-invite-card {
+  margin: 18px auto 0;
+}
+
+.confirm-dialog {
+  padding: 24px;
+}
+
 @media (max-width: 620px) {
   .dashboard-grid {
     grid-template-columns: 1fr;
@@ -216,5 +275,19 @@ body {
   .platform-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .public-room-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .public-room-card .platform-link {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .confirm-dialog {
+    padding: 18px;
   }
 }

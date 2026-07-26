@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+import hashlib
 import re
 import secrets
 from threading import RLock
 from typing import Protocol, runtime_checkable
+import unicodedata
 from uuid import uuid4
 
 from .models import RoomRole, RoomStatus as StoredRoomStatus
@@ -22,6 +24,7 @@ from .rooms import (
     RoomMode,
     RoomSnapshot as ActiveRoomSnapshot,
     RoomStatus as ActiveRoomStatus,
+    SeatController,
     SeatPicker,
     create_room_snapshot,
 )
@@ -29,7 +32,7 @@ from .themes import ALL_THEME_ID
 
 
 INVITE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-DEFAULT_INVITE_CODE_LENGTH = 6
+DEFAULT_INVITE_CODE_LENGTH = 10
 MAX_INVITE_CODE_ATTEMPTS = 12
 _INVITE_CODE_PATTERN = re.compile(r"^[A-Z0-9]{4,12}$")
 _THEME_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -49,6 +52,10 @@ class InviteCodeConflict(LobbyError):
 
 class InviteCodeGenerationError(LobbyError):
     """Unique invite-code generation exhausted its bounded retry budget."""
+
+
+class LobbyNameConflict(LobbyError):
+    """Another non-closed room already uses the normalized room name."""
 
 
 class LobbyCapacityError(LobbyError):
@@ -100,6 +107,24 @@ def normalize_invite_code(raw_code: str) -> str:
     if not _INVITE_CODE_PATTERN.fullmatch(code):
         raise ValueError("invite code must be 4-12 ASCII letters or digits")
     return code
+
+
+def normalize_room_name(raw_name: str) -> str:
+    """Return the canonical display name used for storage and presentation."""
+
+    if not isinstance(raw_name, str):
+        raise ValueError("room name must be text")
+    name = " ".join(unicodedata.normalize("NFKC", raw_name).split())
+    if not 1 <= len(name) <= 64:
+        raise ValueError("room name must contain 1-64 characters")
+    return name
+
+
+def room_name_key(raw_name: str) -> str:
+    """Return the case-insensitive identity key for a room display name."""
+
+    canonical_identity = normalize_room_name(raw_name).casefold()
+    return hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()
 
 
 def generate_invite_code(
@@ -173,6 +198,8 @@ class LobbyRoomSnapshot:
     turn_seconds: int | None
     revision: int
     members: tuple[LobbyMember, ...]
+    is_public: bool = False
+    fill_empty_seats_with_bots: bool = False
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -181,14 +208,18 @@ class LobbyRoomSnapshot:
         if normalized_code != self.room_code:
             raise ValueError("room_code must already be canonical")
         _require_user_id(self.owner_user_id)
-        if not isinstance(self.name, str) or not 1 <= len(self.name) <= 64:
-            raise ValueError("room name must contain 1-64 characters")
+        if normalize_room_name(self.name) != self.name:
+            raise ValueError("room name must already be canonical")
         if not isinstance(self.status, StoredRoomStatus):
             raise ValueError("status must be a stored RoomStatus")
         if type(self.max_players) is not int or not 2 <= self.max_players <= 8:
             raise ValueError("max_players must be from 2 to 8")
         validate_theme_key(self.theme_key)
         validate_turn_seconds(self.turn_seconds)
+        if type(self.is_public) is not bool:
+            raise ValueError("is_public must be boolean")
+        if type(self.fill_empty_seats_with_bots) is not bool:
+            raise ValueError("fill_empty_seats_with_bots must be boolean")
         if type(self.revision) is not int or self.revision < 0:
             raise ValueError("revision must be a non-negative integer")
 
@@ -230,7 +261,10 @@ class LobbyRoomSnapshot:
 
     @property
     def all_players_ready(self) -> bool:
-        return len(self.players) >= 2 and all(player.ready for player in self.players)
+        minimum_players = 1 if self.fill_empty_seats_with_bots else 2
+        return len(self.players) >= minimum_players and all(
+            player.ready for player in self.players
+        )
 
     def member_for(self, user_id: str) -> LobbyMember | None:
         return next(
@@ -276,11 +310,20 @@ class LobbyRepository(Protocol):
         allow_spectators: bool,
         theme_key: str,
         turn_seconds: int | None,
+        is_public: bool = False,
+        fill_empty_seats_with_bots: bool = False,
     ) -> LobbyRoomSnapshot:
         """Create the room and owner membership in one transaction."""
 
     def get_by_code(self, room_code: str) -> LobbyRoomSnapshot | None:
         """Look up exactly one canonical, unique invite code."""
+
+    def list_public_waiting(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        """List public waiting rooms in stable creation order."""
 
     def find_active_game_id(
         self,
@@ -360,18 +403,20 @@ class LobbyService:
         allow_spectators: bool = True,
         theme_key: str | None = None,
         turn_seconds: int | None = None,
+        is_public: bool = False,
+        fill_empty_seats_with_bots: bool = False,
     ) -> LobbyRoomSnapshot:
         """Create an unrestricted room; legacy theme arguments are ignored."""
         owner = _require_user_id(owner_user_id)
-        if not isinstance(name, str):
-            raise ValueError("room name must be text")
-        clean_name = name.strip()
-        if not 1 <= len(clean_name) <= 64:
-            raise ValueError("room name must contain 1-64 characters")
+        clean_name = normalize_room_name(name)
         if type(max_players) is not int or not 2 <= max_players <= 8:
             raise ValueError("max_players must be from 2 to 8")
         if type(allow_spectators) is not bool:
             raise ValueError("allow_spectators must be boolean")
+        if type(is_public) is not bool:
+            raise ValueError("is_public must be boolean")
+        if type(fill_empty_seats_with_bots) is not bool:
+            raise ValueError("fill_empty_seats_with_bots must be boolean")
         seconds = validate_turn_seconds(turn_seconds)
 
         for _ in range(self.max_code_attempts):
@@ -385,12 +430,30 @@ class LobbyService:
                     allow_spectators=allow_spectators,
                     theme_key=ALL_THEME_ID,
                     turn_seconds=seconds,
+                    is_public=is_public,
+                    fill_empty_seats_with_bots=fill_empty_seats_with_bots,
                 )
             except InviteCodeConflict:
                 continue
         raise InviteCodeGenerationError(
             "could not allocate a unique invite code; retry later"
         )
+
+    def list_public_waiting(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        rooms = self.repository.list_public_waiting(limit=limit)
+        if len(rooms) > limit or any(
+            not room.is_public
+            or room.status is not StoredRoomStatus.WAITING
+            for room in rooms
+        ):
+            raise RuntimeError("repository returned an invalid public room listing")
+        return rooms
 
     def get_room(self, raw_room_code: str) -> LobbyRoomSnapshot:
         code = normalize_invite_code(raw_room_code)
@@ -499,7 +562,7 @@ class LobbyService:
             raise LobbyStateError("only a waiting room can start")
         if room.owner_user_id != owner:
             raise LobbyAuthorizationError("only the room owner can start")
-        if len(room.players) < 2:
+        if not room.fill_empty_seats_with_bots and len(room.players) < 2:
             raise LobbyNotReadyError("PvP needs at least two players")
         if not room.all_players_ready:
             raise LobbyNotReadyError("all players must be ready")
@@ -512,10 +575,16 @@ class LobbyService:
             if self.seat_picker is not None
             else {}
         )
+        permanent_bot_count = (
+            room.max_players - len(room.players)
+            if room.fill_empty_seats_with_bots
+            else 0
+        )
         active_room = create_room_snapshot(
             game_id,
             (player.user_id for player in room.players),
             mode=RoomMode.PVP,
+            permanent_bot_count=permanent_bot_count,
             spectators=(member.user_id for member in room.spectators),
             turn_seconds=room.turn_seconds,
             theme_key=room.theme_key,
@@ -562,6 +631,7 @@ class InMemoryLobbyRepository:
     def __init__(self) -> None:
         self._rooms_by_id: dict[str, LobbyRoomSnapshot] = {}
         self._room_id_by_code: dict[str, str] = {}
+        self._room_id_by_name_key: dict[str, str] = {}
         self._starts_by_game_id: dict[str, LobbyStartResult] = {}
         self._game_id_by_room_id: dict[str, str] = {}
         self._lock = RLock()
@@ -576,10 +646,23 @@ class InMemoryLobbyRepository:
         allow_spectators: bool,
         theme_key: str,
         turn_seconds: int | None,
+        is_public: bool = False,
+        fill_empty_seats_with_bots: bool = False,
     ) -> LobbyRoomSnapshot:
         with self._lock:
             if room_code in self._room_id_by_code:
                 raise InviteCodeConflict(room_code)
+            name_key = room_name_key(name)
+            existing_id = self._room_id_by_name_key.get(name_key)
+            existing = (
+                self._rooms_by_id.get(existing_id)
+                if existing_id is not None
+                else None
+            )
+            if existing is not None and existing.status is not StoredRoomStatus.CLOSED:
+                raise LobbyNameConflict(name)
+            if existing_id is not None:
+                self._room_id_by_name_key.pop(name_key, None)
             room = LobbyRoomSnapshot(
                 id=str(uuid4()),
                 room_code=room_code,
@@ -598,15 +681,32 @@ class InMemoryLobbyRepository:
                         seat_index=0,
                     ),
                 ),
+                is_public=is_public,
+                fill_empty_seats_with_bots=fill_empty_seats_with_bots,
             )
             self._rooms_by_id[room.id] = room
             self._room_id_by_code[room.room_code] = room.id
+            self._room_id_by_name_key[name_key] = room.id
             return room
 
     def get_by_code(self, room_code: str) -> LobbyRoomSnapshot | None:
         with self._lock:
             room_id = self._room_id_by_code.get(room_code)
             return self._rooms_by_id.get(room_id) if room_id is not None else None
+
+    def list_public_waiting(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        with self._lock:
+            return tuple(
+                room
+                for room in self._rooms_by_id.values()
+                if room.is_public and room.status is StoredRoomStatus.WAITING
+            )[:limit]
 
     def find_active_game_id(
         self,
@@ -727,13 +827,18 @@ class InMemoryLobbyRepository:
                 raise LobbyAuthorizationError("only the room owner can start")
             if not room.all_players_ready:
                 raise LobbyNotReadyError("all players must be ready")
-            expected_users = tuple(player.user_id for player in room.players)
-            actual_users = tuple(
-                seat.owner_user_id for seat in active_room.players
+            expected_bot_count = (
+                room.max_players - len(room.players)
+                if room.fill_empty_seats_with_bots
+                else 0
             )
             if (
                 active_room.room_id != game_id
-                or actual_users != expected_users
+                or not _active_player_layout_matches(
+                    room,
+                    active_room,
+                    expected_bot_count=expected_bot_count,
+                )
                 or active_room.turn_seconds != turn_seconds
                 or active_room.theme_key != room.theme_key
                 or active_room.bot_difficulty != "normal"
@@ -779,6 +884,9 @@ class InMemoryLobbyRepository:
             if not remaining_players:
                 self._rooms_by_id.pop(room.id, None)
                 self._room_id_by_code.pop(room.room_code, None)
+                name_key = room_name_key(room.name)
+                if self._room_id_by_name_key.get(name_key) == room.id:
+                    self._room_id_by_name_key.pop(name_key, None)
                 return LobbyLeaveResult(None, deleted=True)
 
             players_by_old_seat = sorted(
@@ -826,13 +934,44 @@ def _active_start_matches(
         and active.room_id == result.game_id
         and active.mode is RoomMode.PVP
         and active.status is ActiveRoomStatus.ACTIVE
-        and tuple(seat.owner_user_id for seat in active.players)
-        == tuple(player.user_id for player in room.players)
+        and _active_player_layout_matches(
+            room,
+            active,
+            expected_bot_count=(
+                room.max_players - len(room.players)
+                if room.fill_empty_seats_with_bots
+                else 0
+            ),
+        )
         and active.spectators
         == tuple(member.user_id for member in room.spectators)
         and active.theme_key == room.theme_key
         and active.bot_difficulty == "normal"
         and active.turn_seconds == room.turn_seconds
+    )
+
+
+def _active_player_layout_matches(
+    room: LobbyRoomSnapshot,
+    active: ActiveRoomSnapshot,
+    *,
+    expected_bot_count: int,
+) -> bool:
+    humans = room.players
+    if len(active.players) != len(humans) + expected_bot_count:
+        return False
+    human_seats = active.players[: len(humans)]
+    bot_seats = active.players[len(humans) :]
+    return (
+        tuple(seat.owner_user_id for seat in human_seats)
+        == tuple(player.user_id for player in humans)
+        and all(seat.controller is SeatController.HUMAN for seat in human_seats)
+        and all(
+            seat.owner_user_id is None
+            and seat.controller is SeatController.BOT
+            and not seat.handback_pending
+            for seat in bot_seats
+        )
     )
 
 
@@ -848,6 +987,7 @@ __all__ = [
     "LobbyLeaveResult",
     "LobbyMember",
     "LobbyMemberError",
+    "LobbyNameConflict",
     "LobbyNotReadyError",
     "LobbyRepository",
     "LobbyRevisionConflict",
@@ -859,6 +999,8 @@ __all__ = [
     "SpectatorsDisabledError",
     "generate_invite_code",
     "normalize_invite_code",
+    "normalize_room_name",
+    "room_name_key",
     "validate_theme_key",
     "validate_turn_seconds",
 ]

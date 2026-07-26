@@ -10,6 +10,7 @@ from shiritori.lobby import (
     InviteCodeGenerationError,
     LobbyAuthorizationError,
     LobbyCapacityError,
+    LobbyNameConflict,
     LobbyMemberError,
     LobbyNotReadyError,
     LobbyRepository,
@@ -20,16 +21,21 @@ from shiritori.lobby import (
     SpectatorsDisabledError,
     generate_invite_code,
     normalize_invite_code,
+    normalize_room_name,
+    room_name_key,
     validate_turn_seconds,
 )
 from shiritori.models import RoomRole, RoomStatus as StoredRoomStatus
-from shiritori.rooms import RoomStatus as ActiveRoomStatus
+from shiritori.rooms import (
+    RoomStatus as ActiveRoomStatus,
+    SeatController,
+)
 
 
 class InviteCodeTests(unittest.TestCase):
     def test_default_code_uses_unambiguous_secure_alphabet(self) -> None:
         code = generate_invite_code()
-        self.assertEqual(len(code), 6)
+        self.assertEqual(len(code), 10)
         self.assertTrue(set(code).issubset(set(INVITE_CODE_ALPHABET)))
         self.assertTrue({"0", "1", "I", "O"}.isdisjoint(code))
 
@@ -45,6 +51,8 @@ class InviteCodeTests(unittest.TestCase):
 
     def test_normalization_is_case_insensitive_but_never_fuzzy(self) -> None:
         self.assertEqual(normalize_invite_code("  abcd23 "), "ABCD23")
+        self.assertEqual(
+            normalize_invite_code("abcd234567"), "ABCD234567")
         for invalid in ("ABC", "ABCD-23", "ABCD 23", "ABCD23extraextra", "ＡＢＣＤ"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_invite_code(invalid)
@@ -56,6 +64,19 @@ class InviteCodeTests(unittest.TestCase):
         for invalid in (2, 181, True, 3.0):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 validate_turn_seconds(invalid)  # type: ignore[arg-type]
+
+    def test_room_name_normalization_has_one_display_and_identity_form(self) -> None:
+        self.assertEqual(
+            normalize_room_name(" \tＷｅｅｋｅｎｄ　ＭＡＴＣＨ\n"),
+            "Weekend MATCH",
+        )
+        self.assertEqual(
+            room_name_key(" \tＷｅｅｋｅｎｄ　ＭＡＴＣＨ\n"),
+            room_name_key("weekend match"),
+        )
+        for invalid in ("", " \t\n", "x" * 65, 42):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize_room_name(invalid)  # type: ignore[arg-type]
 
 
 class LobbyServiceTests(unittest.TestCase):
@@ -100,6 +121,8 @@ class LobbyServiceTests(unittest.TestCase):
         self.assertEqual(room.theme_key, "all")
         self.assertEqual(room.turn_seconds, 30)
         self.assertEqual(room.revision, 0)
+        self.assertFalse(room.is_public)
+        self.assertFalse(room.fill_empty_seats_with_bots)
         self.assertEqual(
             room.players,
             (room.member_for("owner"),),
@@ -138,12 +161,75 @@ class LobbyServiceTests(unittest.TestCase):
             {"max_players": 1},
             {"max_players": True},
             {"allow_spectators": 1},
+            {"is_public": 1},
+            {"fill_empty_seats_with_bots": 1},
             {"turn_seconds": 2},
             {"turn_seconds": True},
         )
         for overrides in invalid_cases:
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 self.create_room(**overrides)
+
+    def test_duplicate_name_uses_normalized_casefolded_identity(self) -> None:
+        first = self.create_room(
+            name=" \tＷｅｅｋｅｎｄ　ＭＡＴＣＨ\n",
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+
+        self.assertEqual(first.name, "Weekend MATCH")
+        self.assertTrue(first.is_public)
+        self.assertTrue(first.fill_empty_seats_with_bots)
+        with self.assertRaises(LobbyNameConflict):
+            self.create_room(name="weekend match")
+        other = self.create_room(name="Weekend matches")
+        self.assertNotEqual(first.id, other.id)
+
+    def test_active_room_keeps_name_reserved(self) -> None:
+        room = self.create_room(fill_empty_seats_with_bots=True)
+        self.service.set_ready("owner", room.room_code, ready=True)
+        self.service.start("owner", room.room_code)
+
+        with self.assertRaises(LobbyNameConflict):
+            self.create_room(name="WEEKEND MATCH")
+
+    def test_deleted_waiting_room_releases_name(self) -> None:
+        room = self.create_room(name="Reusable")
+        deleted = self.service.leave("owner", room.room_code)
+        self.assertTrue(deleted.deleted)
+
+        replacement = self.create_room(name="  Ｒｅｕｓａｂｌｅ  ")
+        self.assertEqual(replacement.name, "Reusable")
+        self.assertNotEqual(replacement.id, room.id)
+
+    def test_public_waiting_listing_is_filtered_stable_and_limited(self) -> None:
+        first = self.create_room(name="First", is_public=True)
+        self.create_room(name="Private", is_public=False)
+        active = self.create_room(
+            name="Active",
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.set_ready("owner", active.room_code, ready=True)
+        self.service.start("owner", active.room_code)
+        deleted = self.create_room(name="Deleted", is_public=True)
+        self.service.leave("owner", deleted.room_code)
+        last = self.create_room(name="Last", is_public=True)
+
+        self.assertEqual(
+            tuple(room.id for room in self.service.list_public_waiting()),
+            (first.id, last.id),
+        )
+        self.assertEqual(
+            self.service.list_public_waiting(limit=1),
+            (first,),
+        )
+        for invalid in (0, 101, True, 1.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.service.list_public_waiting(limit=invalid)  # type: ignore[arg-type]
+                with self.assertRaises(ValueError):
+                    self.repository.list_public_waiting(limit=invalid)  # type: ignore[arg-type]
 
     def test_obsolete_theme_key_format_is_ignored(self) -> None:
         room = self.create_room(theme_key="../food")
@@ -204,7 +290,10 @@ class LobbyServiceTests(unittest.TestCase):
         with self.assertRaises(LobbyMemberError):
             self.service.join_as_player("watcher", open_room.room_code)
 
-        closed_room = self.create_room(allow_spectators=False)
+        closed_room = self.create_room(
+            name="No spectators",
+            allow_spectators=False,
+        )
         with self.assertRaises(SpectatorsDisabledError):
             self.service.join_as_spectator("other-watcher", closed_room.room_code)
 
@@ -234,6 +323,115 @@ class LobbyServiceTests(unittest.TestCase):
             self.service.start("guest", room.room_code)
         with self.assertRaises(LobbyNotReadyError):
             self.service.start("owner", room.room_code)
+
+    def test_fill_empty_seats_starts_one_human_with_permanent_bots(self) -> None:
+        room = self.create_room(
+            max_players=4,
+            fill_empty_seats_with_bots=True,
+        )
+        with self.assertRaises(LobbyNotReadyError):
+            self.service.start("owner", room.room_code)
+
+        self.service.set_ready("owner", room.room_code, ready=True)
+        result = self.service.start("owner", room.room_code)
+
+        self.assertEqual(len(result.active_room.players), 4)
+        self.assertEqual(
+            tuple(seat.owner_user_id for seat in result.active_room.players),
+            ("owner", None, None, None),
+        )
+        self.assertEqual(
+            tuple(seat.controller for seat in result.active_room.players),
+            (
+                SeatController.HUMAN,
+                SeatController.BOT,
+                SeatController.BOT,
+                SeatController.BOT,
+            ),
+        )
+        self.assertTrue(
+            all(
+                not seat.handback_pending
+                for seat in result.active_room.players[1:]
+            )
+        )
+        self.assertEqual(result.active_room.bot_difficulty, "normal")
+
+    def test_fill_empty_seats_requires_every_present_human_ready(self) -> None:
+        room = self.create_room(
+            max_players=4,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.join_as_player("guest", room.room_code)
+        self.service.set_ready("owner", room.room_code, ready=True)
+        with self.assertRaises(LobbyNotReadyError):
+            self.service.start("owner", room.room_code)
+
+        self.service.set_ready("guest", room.room_code, ready=True)
+        result = self.service.start("owner", room.room_code)
+        self.assertEqual(
+            tuple(seat.owner_user_id for seat in result.active_room.players),
+            ("owner", "guest", None, None),
+        )
+
+    def test_fill_empty_seats_adds_no_bot_when_room_is_full(self) -> None:
+        room = self.create_room(
+            max_players=2,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.join_as_player("guest", room.room_code)
+        self.service.set_ready("owner", room.room_code, ready=True)
+        self.service.set_ready("guest", room.room_code, ready=True)
+
+        result = self.service.start("owner", room.room_code)
+
+        self.assertEqual(
+            tuple(seat.owner_user_id for seat in result.active_room.players),
+            ("owner", "guest"),
+        )
+        self.assertTrue(
+            all(
+                seat.controller is SeatController.HUMAN
+                for seat in result.active_room.players
+            )
+        )
+
+    def test_repository_rejects_corrupt_permanent_bot_layout(self) -> None:
+        class CorruptingRepository(InMemoryLobbyRepository):
+            def activate_waiting(self, **kwargs):  # type: ignore[no-untyped-def]
+                active_room = kwargs["active_room"]
+                seats = active_room.players
+                kwargs["active_room"] = replace(
+                    active_room,
+                    players=(
+                        seats[0],
+                        replace(
+                            seats[1],
+                            owner_user_id="impostor",
+                            controller=SeatController.HUMAN,
+                        ),
+                        *seats[2:],
+                    ),
+                )
+                return super().activate_waiting(**kwargs)
+
+        repository = CorruptingRepository()
+        service = LobbyService(
+            repository,
+            code_factory=lambda: "BOTS22",
+            game_id_factory=lambda: "bot-layout-game",
+            seat_picker=lambda _: 0,
+        )
+        room = service.create_pvp_room(
+            "owner",
+            name="Bot layout",
+            max_players=3,
+            fill_empty_seats_with_bots=True,
+        )
+        service.set_ready("owner", room.room_code, ready=True)
+
+        with self.assertRaises(LobbyRevisionConflict):
+            service.start("owner", room.room_code)
 
     def test_start_persists_random_turn_free_first_word_and_spectators(self) -> None:
         room = self.create_room(theme_key="country", turn_seconds=3)

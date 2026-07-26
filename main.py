@@ -40,6 +40,8 @@ async def security_headers(request: Request, call_next):
             "/lobby",
             "/saved-games",
             "/play/",
+            "/join/",
+            "/room/",
         )
     ):
         response.headers.setdefault("Cache-Control", "no-store")

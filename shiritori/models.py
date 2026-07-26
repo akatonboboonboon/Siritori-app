@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any
+import unicodedata
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -24,6 +26,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -47,6 +50,15 @@ def new_id() -> str:
     """Return a database-portable UUID string."""
 
     return str(uuid4())
+
+
+def default_room_name_key(context: Any) -> str:
+    """Derive a canonical key for legacy code that constructs ``Room``."""
+
+    raw_name = str(context.get_current_parameters().get("name", ""))
+    normalized = " ".join(unicodedata.normalize("NFKC", raw_name).split())
+    canonical = normalized.casefold()
+    return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class RoomStatus(StrEnum):
@@ -148,12 +160,21 @@ class Room(Base):
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    name_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=default_room_name_key
+    )
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default=RoomStatus.WAITING.value
     )
     max_players: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     allow_spectators: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
+    )
+    is_public: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    fill_empty_seats_with_bots: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
     )
     theme_key: Mapped[str] = mapped_column(
         String(32), nullable=False, default="all"
@@ -187,6 +208,13 @@ class Room(Base):
         ),
         CheckConstraint("revision >= 0", name="revision_nonnegative"),
         Index("ix_rooms_status_updated", "status", "updated_at"),
+        Index(
+            "uq_rooms_active_name_key",
+            "name_key",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
     )
 
 
