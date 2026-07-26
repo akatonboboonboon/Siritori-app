@@ -5,7 +5,7 @@
 
 - **Render Free Web Service**: NiceGUIアプリを1プロセスで実行する
 - **Neon Free PostgreSQL**: アカウント、部屋、対局状態、単語履歴、戦績、
-  スコアアタックを永続化する
+  スコアアタック、単語追加リクエストを永続化する
 
 Redisや常駐ワーカーは最初の構成には追加しません。必要性が実測できた段階で導入します。
 
@@ -22,6 +22,7 @@ Render Free Web Service
   ├─ 辞書・ゲームルール
   ├─ RoomCoordinator / SoloGameService
   ├─ StatisticsRepository / ScoreAttackService
+  ├─ WordSuggestionService
   ├─ RoomHub（接続中だけのメモリ状態）
   └─ 対局タイマー / Bot
         |
@@ -31,7 +32,8 @@ Neon Free PostgreSQL
   ├─ users / sessions / leaderboard_visible
   ├─ rooms / members / seats
   ├─ games / moves / match_participations
-  └─ score_attack_runs / theme_key（テーマ列はスキーマ・履歴用）
+  ├─ score_attack_runs / word_suggestions
+  └─ theme_key（テーマ列はスキーマ・履歴用）
 ```
 
 NiceGUIは1つのUvicorn workerで動かします。無料プランでは水平スケールを前提にせず、
@@ -49,6 +51,7 @@ NiceGUIは1つのUvicorn workerで動かします。無料プランでは水平�
 - 一人用Bot戦を含む厳密な`Game`スナップショットと中断状態
 - スコアアタックの固定期限、状態バージョン、履歴、サーバー算出スコア
 - ランキングへの公開同意
+- 本人だけが参照できる審査制の単語追加リクエストと審査状態
 
 単語の送信は1トランザクションで処理します。ゲーム行をロックし、手番、接続条件、
 重複、制限時刻、状態バージョンを再確認してから履歴追加と次手番への更新を同時に
@@ -154,6 +157,23 @@ Renderの再起動で消えても、PostgreSQLから復元できることを必�
 回復対象として再接続猶予を設定します。誰も戻らなければ既存のバージョン付き削除で
 Gameを`abandoned`、Roomを`closed/deleted`にし、部屋名を再利用可能にします。
 
+### 非永続リアクション
+
+リアクションは`👍`、`👏`、`😮`、`😂`、`🔥`の固定allowlistだけを受け付けます。
+`RoomCoordinator.send_reaction`は部屋ロック内で最新スナップショットを読み、
+送信者が現在のプレイヤーまたは観戦者であることを毎回確認します。部屋外の
+ログインユーザーや未対応の絵文字は配信前に拒否します。
+
+同じ部屋・同じユーザーは1秒に1回までとし、期限切れキーを除去する上限付きの
+プロセスメモリで連打を抑えます。許可後は`RoomHub.publish_ephemeral`で接続中の
+クライアントへ期限付き配信します。遅い接続や切断があっても対局処理を止めません。
+
+リアクションはGameスナップショット、状態バージョン、履歴、戦績、タイマー、Bot処理を
+変更せず、PostgreSQLにも保存しません。再読み込みやRender再起動で消えることは仕様です。
+送信者表示も「あなた」「プレイヤーN」「観戦者」の公開ラベルへ変換します。
+将来Renderを複数インスタンスへ増やす場合だけ、プロセスをまたぐ一時配信用Pub/Subを
+追加します。
+
 ## 認証とセッション
 
 パスワードは平文や復号可能な形式で保存せず、Argon2idでハッシュ化して
@@ -177,6 +197,27 @@ NiceGUIの `storage_secret` はCookie署名に必要なため、安定した秘�
 回数制限を適用します。リクエスト本文に上限を設け、重いArgon2id処理の同時実行数も
 制限します。CSRF署名に加えて許可したOriginを確認し、認証失敗の文面から登録状況を
 推測できないようにします。本番用秘密値に既定値やプレースホルダーは許可しません。
+
+## 単語追加リクエスト
+
+`WordSuggestionService`はログイン中の有効ユーザーだけを受け付け、`word_suggestions`へ
+申請を永続化します。単語は30文字、明示的なひらがな読みは60文字、任意の1行補足は
+200文字を上限にNFKC／NFC正規化と文字種検証を行います。本人のユーザー行をロックして
+審査待ちを20件までに直列化し、DBの`(user_id, surface, reading)`一意制約を
+同時送信時の最終防衛線にします。完全に同じ申請の再送は既存行を返します。
+
+各行は`pending`、`approved`、`rejected`の審査状態と作成・更新・審査時刻を持ちます。
+保護画面`/word-suggestions`へ返すのは本人の単語、読み、補足、状態、時刻だけで、申請IDやユーザーID、
+他人の申請は含めません。
+
+`WordReviewService`は`ADMIN_USERNAMES`の登録済み有効アカウントだけを毎回DBで再認可し、
+同じ表記と読みの申請群を1トランザクションで承認または却下します。申請状態、担当者付き監査行、
+承認語を同時に保存し、commit後だけプロセス内の`ApprovedWordCatalog`へ公開します。
+`ApprovedLexiconValidator`はSudachiを先に使い、未収録または対象外の場合だけ承認語の完全一致へ
+fallbackします。構造違反は上書きせず、通常対局と公開1人用の人間入力へ適用します。
+Bot候補CSVとBot索引は変更しません。ランキング対象の`SQLAlchemyScoreAttackService`と
+`SQLAlchemyDailyChallengeService`は、同じルール版の途中で審査結果により語彙が変わらないよう、
+固定したSudachi validatorを使います。
 
 ## 切断、再接続、復旧
 
@@ -224,9 +265,10 @@ Render Freeではpre-deploy commandを利用できないため、`python -m scri
 アプリを無理に起動しません。
 部屋名キー・公開設定・空席Bot補充設定を追加するマイグレーションも同じ処理でNeonへ
 自動適用されます。戦績・ランキング用の`0003_match_statistics`、スコアアタック用の
-`0004_score_attack_runs`、複数ラウンド用の`0005_room_current_game`も自動適用します。
-既存の環境変数をそのまま使い、追加の環境変数やNeon Consoleでの手作業による
-列・索引・テーブル作成は不要です。
+`0004_score_attack_runs`、複数ラウンド用の`0005_room_current_game`、
+単語追加リクエスト用の`0006_word_suggestions`、審査・日次挑戦・チュートリアル用の
+`0007_final_features`も自動適用します。Neon Consoleでの手作業による列・索引・
+テーブル作成は不要です。管理画面を有効にする場合は`ADMIN_USERNAMES`を追加します。
 
 ## デプロイ環境変数
 
@@ -240,6 +282,7 @@ README、ログへ書きません。本番デプロイとDashboardの値はま�
 | `DIRECT_DATABASE_URL` | Neonのdirect migration URL |
 | `NICEGUI_STORAGE_SECRET` | NiceGUIのCookie署名用ランダム秘密値 |
 | `SESSION_SECRET` | アプリ独自セッション用ランダム秘密値 |
+| `ADMIN_USERNAMES` | 単語審査を許可する登録済みユーザー名。複数はカンマ区切り |
 | `APP_ENV` | 本番では `production` |
 
 `PORT` はRenderが自動設定するため手動登録しません。DB接続文字列や秘密値をローカルで
@@ -264,6 +307,22 @@ README、ログへ書きません。本番デプロイとDashboardの値はま�
 使って復旧時に計算します。公開前や発表前には、URLへ一度アクセスして両サービスを
 起動させます。
 
+## 結果カードとクライアント演出
+
+リザルトカードはDBの`FINISHED`スナップショットだけから組み立て、勝敗、成立語数、
+終了理由、対戦概要、最後の単語を表示します。本人の席は「あなた」、他の人間は
+「プレイヤーN」、Botは「Bot N」とする公開用ラベルへ変換し、内部ユーザーIDや
+対局IDを画面用データへ含めません。プレイヤーには本人基準の勝利／敗北、観戦者には
+中立の結果を返します。
+
+アニメーションと効果音は、状態バージョンが進んだ正解・脱落・終了と、画面で確定した
+入力エラーにだけ反応します。ポーリングや同じスナップショットの再描画では再生しません。
+音は外部ファイルではなくWeb Audio APIの短い発振音としてブラウザ内で生成します。
+効果音OFFと「演出を減らす」は`app.storage.user`へUI設定として保存しますが、
+認証や対局状態の正本には使いません。CSSでも`prefers-reduced-motion: reduce`を尊重し、
+結果の4項目グリッドは狭い画面で1列へ切り替えます。
+
+
 ## PC・スマートフォンへの影響
 
 PCとスマートフォンは同じNiceGUIページとAPIを利用します。端末別のゲーム状態は持たず、
@@ -278,7 +337,8 @@ PCとスマートフォンは同じNiceGUIページとAPIを利用します。�
 ## 現時点の画面境界
 
 公開ゲーム、認証、ロビー、部屋、対戦・進行中観戦、Bot／時間の設定、戦績、
-opt-inランキング、スコアアタック、終了後の再戦・待機復帰まで実装対象です。
+opt-inランキング、スコアアタック、終了後の再戦・待機復帰、リアクション、
+結果カードと演出、単語追加リクエストまで実装対象です。
 テーマ選択とテーマ名表示は全画面から廃止し、保存済み`theme_key`も画面や判定に使いません。
 タイマー警告の表現は応募者本人の確認領域です。
 PCと実スマートフォン、公開URLでの最終QAは公開前に本人が行います。

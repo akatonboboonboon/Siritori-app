@@ -16,18 +16,21 @@ from .customize import (
     SECONDARY_COLOR,
 )
 from .game_session import GameSession, SessionCode, SessionResult
+from .lexicon import LexiconValidator
 
 _STYLES = (Path(__file__).parent.parent / "assets" / "styles.css").read_text(encoding="utf-8")
 _FEEDBACK_TONES = "feedback--neutral feedback--success feedback--error feedback--danger"
 _STATUS_TONES = "status-pill--active status-pill--ended"
 
 
-def register_pages() -> None:
+def register_pages(
+    validator: LexiconValidator | None = None,
+) -> None:
     """Register the public dictionary-backed game page."""
 
     @ui.page("/")
     def game_page() -> None:
-        game = GameSession()
+        game = GameSession(validator)
         ui.page_title(APP_TITLE)
         ui.colors(primary=PRIMARY_COLOR, secondary=SECONDARY_COLOR, accent=ACCENT_COLOR)
         ui.add_head_html(

@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 import os
+import unicodedata
 
 
 class SettingsError(RuntimeError):
@@ -48,6 +49,7 @@ class Settings:
     direct_database_url: str
     nicegui_storage_secret: str
     session_secret: str
+    admin_username_keys: frozenset[str] = frozenset()
     session_cookie_name: str = "siritori_session"
     csrf_cookie_name: str = "siritori_csrf"
 
@@ -84,6 +86,19 @@ class Settings:
         direct_database_url = values.get("DIRECT_DATABASE_URL", "").strip()
         storage_secret = values.get("NICEGUI_STORAGE_SECRET", "")
         session_secret = values.get("SESSION_SECRET", "")
+        admin_username_keys: set[str] = set()
+        for raw_username in values.get("ADMIN_USERNAMES", "").split(","):
+            username = unicodedata.normalize("NFKC", raw_username).strip()
+            if not username:
+                continue
+            username_key = username.casefold()
+            if not 3 <= len(username) <= 32 or len(username_key) > 64:
+                raise SettingsError(
+                    "ADMIN_USERNAMES must contain valid registered usernames"
+                )
+            admin_username_keys.add(username_key)
+        if len(admin_username_keys) > 20:
+            raise SettingsError("ADMIN_USERNAMES supports at most 20 accounts")
 
         if app_env == "production":
             missing = [
@@ -141,6 +156,7 @@ class Settings:
             direct_database_url=direct_database_url,
             nicegui_storage_secret=storage_secret,
             session_secret=session_secret,
+            admin_username_keys=frozenset(admin_username_keys),
         )
 
 

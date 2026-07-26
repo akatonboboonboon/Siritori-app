@@ -24,7 +24,7 @@ import inspect
 import json
 import re
 import secrets
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 from uuid import uuid4
 
 from .bots import canonical_kana, final_kana
@@ -38,6 +38,10 @@ _BOT_DIFFICULTIES = frozenset({"easy", "normal", "hard"})
 _COMMAND_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RESERVED_OPERATION_PREFIXES = ("runtime:", "system:")
 _COMMAND_FINGERPRINT_VERSION = 1
+SUPPORTED_REACTIONS: Final[tuple[str, ...]] = ("👍", "👏", "😮", "😂", "🔥")
+REACTION_COOLDOWN_SECONDS: Final = 1.0
+REACTION_RATE_LIMIT_CAPACITY: Final = 2048
+REACTION_DELIVERY_TIMEOUT_SECONDS: Final = 0.25
 
 
 class Role(str, Enum):
@@ -64,6 +68,7 @@ class SeatController(str, Enum):
 class RoomEventKind(str, Enum):
     SNAPSHOT = "snapshot"
     CLOSED = "closed"
+    REACTION = "reaction"
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,11 +250,27 @@ class RoomSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RoomReaction:
+    emoji: str
+    sender_user_id: str
+    sender_role: Role
+    sent_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.emoji not in SUPPORTED_REACTIONS:
+            raise ValueError("reaction emoji is not supported")
+        if not self.sender_user_id:
+            raise ValueError("reaction sender_user_id is required")
+        _require_utc(self.sent_at, "reaction sent_at")
+
+
+@dataclass(frozen=True, slots=True)
 class RoomEvent:
     kind: RoomEventKind
     room_id: str
     snapshot: RoomSnapshot | None
     reason: str | None = None
+    reaction: RoomReaction | None = None
 
 
 RoomCallback = Callable[[RoomEvent], None | Awaitable[None]]
@@ -355,6 +376,33 @@ class RoomHub:
             if connection.callback is not None
         )
         await _deliver_callbacks(callbacks, event)
+
+    async def publish_ephemeral(
+        self,
+        event: RoomEvent,
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        """Deliver an ephemeral event without trusting callbacks to finish."""
+
+        if timeout_seconds <= 0:
+            raise ValueError("ephemeral delivery timeout must be positive")
+        callbacks = tuple(
+            connection.callback
+            for connection in self._connections.get(
+                event.room_id, {}
+            ).values()
+            if connection.callback is not None
+        )
+        try:
+            await asyncio.wait_for(
+                _deliver_callbacks(callbacks, event),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            # wait_for cancels the callback gather, so repeated reactions
+            # cannot leave one additional pending task per delivery.
+            return
 
 
 class RepositoryStatus(str, Enum):
@@ -577,6 +625,35 @@ class RoomNotFound(RoomError):
 
 class RoomAuthorizationError(RoomError):
     pass
+
+
+class UnsupportedReactionError(RoomError):
+    """Only the server-defined emoji allowlist may be broadcast."""
+
+
+class ReactionRateLimitError(RoomError):
+    """The same room member sent another reaction before cooldown expiry."""
+
+    def __init__(self, retry_after_seconds: float) -> None:
+        retry_after_seconds = max(0.0, retry_after_seconds)
+        super().__init__(
+            "reaction cooldown is active; "
+            f"retry after {retry_after_seconds:.3f} seconds"
+        )
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ReactionCapacityError(ReactionRateLimitError):
+    """The bounded limiter is full of cooldowns that have not expired."""
+
+    def __init__(self, retry_after_seconds: float) -> None:
+        retry_after_seconds = max(0.0, retry_after_seconds)
+        RoomError.__init__(
+            self,
+            "reaction limiter is at capacity; "
+            f"retry after {retry_after_seconds:.3f} seconds",
+        )
+        self.retry_after_seconds = retry_after_seconds
 
 
 class RoomVersionConflict(RoomError):
@@ -810,18 +887,34 @@ class RoomCoordinator:
         *,
         hub: RoomHub | None = None,
         disconnect_grace_seconds: float = DISCONNECT_GRACE_SECONDS,
+        reaction_cooldown_seconds: float = REACTION_COOLDOWN_SECONDS,
+        reaction_rate_limit_capacity: int = REACTION_RATE_LIMIT_CAPACITY,
+        reaction_delivery_timeout_seconds: float = REACTION_DELIVERY_TIMEOUT_SECONDS,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if disconnect_grace_seconds < 0:
             raise ValueError("disconnect grace must be non-negative")
+        if reaction_cooldown_seconds <= 0:
+            raise ValueError("reaction cooldown must be positive")
+        if (
+            type(reaction_rate_limit_capacity) is not int
+            or reaction_rate_limit_capacity < 1
+        ):
+            raise ValueError("reaction rate-limit capacity must be positive")
+        if reaction_delivery_timeout_seconds <= 0:
+            raise ValueError("reaction delivery timeout must be positive")
         self.repository = repository
         self.hub = hub or RoomHub()
         self.disconnect_grace_seconds = disconnect_grace_seconds
+        self.reaction_cooldown_seconds = reaction_cooldown_seconds
+        self.reaction_rate_limit_capacity = reaction_rate_limit_capacity
+        self.reaction_delivery_timeout_seconds = reaction_delivery_timeout_seconds
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._locks: dict[str, asyncio.Lock] = {}
         self._disconnect_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._reaction_sent_at: dict[tuple[str, str], datetime] = {}
         self._activity_notifier: Callable[[str], object] | None = None
 
     def set_activity_notifier(
@@ -850,6 +943,85 @@ class RoomCoordinator:
         if snapshot is None:
             raise RoomNotFound(f"room {room_id!r} does not exist")
         return snapshot
+
+    async def send_reaction(
+        self,
+        room_id: str,
+        user_id: str,
+        emoji: str,
+        *,
+        now: datetime | None = None,
+    ) -> RoomReaction:
+        """Broadcast one allowlisted, ephemeral room reaction.
+
+        Authorization is checked against the freshly loaded repository
+        snapshot. Reactions never update that snapshot, its history, or its
+        state version, and deliberately do not wake automatic Bot work.
+        """
+
+        if type(emoji) is not str or emoji not in SUPPORTED_REACTIONS:
+            raise UnsupportedReactionError(
+                "reaction must be one of: " + " ".join(SUPPORTED_REACTIONS)
+            )
+        async with self._lock_for(room_id):
+            snapshot = await self.load_snapshot(room_id)
+            role = snapshot.role_for_user(user_id)
+            if role is None:
+                raise RoomAuthorizationError("user is not a room member")
+
+            sent_at = self._now(now)
+            self._prune_reaction_rate_limits(sent_at)
+            key = (room_id, user_id)
+            previous = self._reaction_sent_at.get(key)
+            if previous is not None:
+                elapsed = (sent_at - previous).total_seconds()
+                if elapsed < self.reaction_cooldown_seconds:
+                    raise ReactionRateLimitError(
+                        self.reaction_cooldown_seconds - elapsed
+                    )
+
+            if (
+                key not in self._reaction_sent_at
+                and len(self._reaction_sent_at)
+                >= self.reaction_rate_limit_capacity
+            ):
+                retry_after = min(
+                    self.reaction_cooldown_seconds
+                    - (sent_at - previous_sent_at).total_seconds()
+                    for previous_sent_at in self._reaction_sent_at.values()
+                )
+                raise ReactionCapacityError(retry_after)
+
+            self._reaction_sent_at[key] = sent_at
+            reaction = RoomReaction(
+                emoji=emoji,
+                sender_user_id=user_id,
+                sender_role=role,
+                sent_at=sent_at,
+            )
+            event = RoomEvent(
+                RoomEventKind.REACTION,
+                room_id,
+                None,
+                reaction=reaction,
+            )
+
+        await self.hub.publish_ephemeral(
+            event,
+            timeout_seconds=self.reaction_delivery_timeout_seconds,
+        )
+        return reaction
+
+    def _prune_reaction_rate_limits(
+        self,
+        now: datetime,
+    ) -> None:
+        """Expire cooldowns and keep the process-local cache strictly bounded."""
+
+        cutoff = now - timedelta(seconds=self.reaction_cooldown_seconds)
+        for key, sent_at in tuple(self._reaction_sent_at.items()):
+            if sent_at <= cutoff:
+                self._reaction_sent_at.pop(key, None)
 
     async def connect_client(
         self,

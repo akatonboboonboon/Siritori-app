@@ -7,7 +7,7 @@ the authoritative store in production; SQLite is only a local test backend.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any
@@ -17,6 +17,7 @@ from uuid import uuid4
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -645,6 +646,338 @@ class ScoreAttackRun(Base):
     )
 
 
+class WordSuggestion(Base):
+    """A user-submitted dictionary candidate awaiting human review."""
+
+    __tablename__ = "word_suggestions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    surface: Mapped[str] = mapped_column(String(30), nullable=False)
+    reading: Mapped[str] = mapped_column(String(60), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "surface",
+            "reading",
+            name="uq_word_suggestions_user_surface_reading",
+        ),
+        CheckConstraint(
+            "length(surface) >= 1 AND length(surface) <= 30",
+            name="surface_length",
+        ),
+        CheckConstraint(
+            "length(reading) >= 1 AND length(reading) <= 60",
+            name="reading_length",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(note) <= 200",
+            name="note_length",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="valid_status",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND reviewed_at IS NULL) OR "
+            "(status IN ('approved', 'rejected') AND reviewed_at IS NOT NULL)",
+            name="valid_review_lifecycle",
+        ),
+        Index(
+            "ix_word_suggestions_user_created",
+            "user_id",
+            "created_at",
+        ),
+        Index(
+            "ix_word_suggestions_review_queue",
+            "status",
+            "created_at",
+        ),
+    )
+
+
+class UserOnboarding(Base):
+    """Versioned completion state for the account-level tutorial."""
+
+    __tablename__ = "user_onboarding"
+
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    tutorial_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        CheckConstraint(
+            "tutorial_version >= 1",
+            name="tutorial_version_positive",
+        ),
+    )
+
+
+class WordSuggestionReview(Base):
+    """Immutable reviewer audit row for one finalized suggestion."""
+
+    __tablename__ = "word_suggestion_reviews"
+
+    suggestion_id: Mapped[str] = mapped_column(
+        ForeignKey("word_suggestions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    reviewer_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    review_note: Mapped[str | None] = mapped_column(String(200))
+    reviewed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    suggestion: Mapped[WordSuggestion] = relationship()
+    reviewer: Mapped[User] = relationship()
+
+    __table_args__ = (
+        CheckConstraint(
+            "decision IN ('approved', 'rejected')",
+            name="valid_decision",
+        ),
+        CheckConstraint(
+            "review_note IS NULL OR length(review_note) <= 200",
+            name="review_note_length",
+        ),
+        Index(
+            "ix_word_suggestion_reviews_reviewer_time",
+            "reviewer_user_id",
+            "reviewed_at",
+        ),
+    )
+
+
+class ApprovedWord(Base):
+    """One administrator-approved human-play lexicon entry."""
+
+    __tablename__ = "approved_words"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=new_id,
+    )
+    surface: Mapped[str] = mapped_column(String(30), nullable=False)
+    reading: Mapped[str] = mapped_column(String(60), nullable=False)
+    approved_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_suggestion_id: Mapped[str | None] = mapped_column(
+        ForeignKey("word_suggestions.id", ondelete="SET NULL"),
+        unique=True,
+    )
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+
+    approved_by: Mapped[User] = relationship()
+    source_suggestion: Mapped[WordSuggestion | None] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "surface",
+            "reading",
+            name="uq_approved_words_surface_reading",
+        ),
+        CheckConstraint(
+            "length(surface) >= 1 AND length(surface) <= 30",
+            name="surface_length",
+        ),
+        CheckConstraint(
+            "length(reading) >= 1 AND length(reading) <= 60",
+            name="reading_length",
+        ),
+        Index("ix_approved_words_surface", "surface"),
+    )
+
+
+class DailyChallengeRun(Base):
+    """One server-timed official attempt for one JST challenge date."""
+
+    __tablename__ = "daily_challenge_runs"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=new_id,
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    challenge_date: Mapped[date] = mapped_column(Date, nullable=False)
+    condition_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="active",
+    )
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(
+        "snapshot",
+        JSON,
+        nullable=False,
+    )
+    state_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    rules_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+    )
+    duration_seconds: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=180,
+    )
+    score: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    accepted_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    finish_reason: Mapped[str | None] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "challenge_date",
+            name="uq_daily_challenge_runs_user_date",
+        ),
+        CheckConstraint(
+            "length(condition_key) = 64",
+            name="condition_key_sha256",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'finished')",
+            name="valid_status",
+        ),
+        CheckConstraint(
+            "state_version >= 0",
+            name="state_version_nonnegative",
+        ),
+        CheckConstraint(
+            "rules_version >= 1",
+            name="rules_version_positive",
+        ),
+        CheckConstraint(
+            "duration_seconds = 180",
+            name="fixed_duration",
+        ),
+        CheckConstraint("score >= 0", name="score_nonnegative"),
+        CheckConstraint(
+            "accepted_count >= 0",
+            name="accepted_count_nonnegative",
+        ),
+        CheckConstraint(
+            "finish_reason IS NULL OR "
+            "finish_reason IN ('timeout', 'ends_with_n', 'duplicate')",
+            name="valid_finish_reason",
+        ),
+        CheckConstraint(
+            "(status = 'active' AND deadline_at IS NOT NULL "
+            "AND finished_at IS NULL AND finish_reason IS NULL) OR "
+            "(status = 'finished' AND deadline_at IS NULL "
+            "AND finished_at IS NOT NULL AND finish_reason IS NOT NULL)",
+            name="valid_lifecycle",
+        ),
+        CheckConstraint(
+            "deadline_at IS NULL OR deadline_at > started_at",
+            name="deadline_after_start",
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at",
+            name="finish_after_start",
+        ),
+        Index(
+            "uq_daily_challenge_runs_active_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_daily_challenge_runs_ranking",
+            "challenge_date",
+            "condition_key",
+            "rules_version",
+            "status",
+            "score",
+            "accepted_count",
+            "finished_at",
+        ),
+    )
+
+
 class RoomCommandReceipt(Base):
     """Durable result of one coordinator command.
 
@@ -688,9 +1021,12 @@ class RoomCommandReceipt(Base):
         Index("ix_room_command_receipts_created", "created_at"),
     )
 
+
 __all__ = [
     "ActorKind",
+    "ApprovedWord",
     "Base",
+    "DailyChallengeRun",
     "Game",
     "GameMode",
     "LoginSession",
@@ -707,6 +1043,9 @@ __all__ = [
     "SoloGameSave",
     "StoredGameStatus",
     "User",
+    "UserOnboarding",
+    "WordSuggestion",
+    "WordSuggestionReview",
     "new_id",
     "utc_now",
 ]
