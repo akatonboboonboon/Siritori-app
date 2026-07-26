@@ -26,6 +26,11 @@ _SMALL_TO_LARGE_KANA = {
     "ゖ": "け",
 }
 
+_DAKUON_CHAIN_EQUIVALENTS = {
+    "ぢ": "じ",
+    "づ": "ず",
+}
+
 
 class GameStatus(str, Enum):
     """Overall game status."""
@@ -87,9 +92,10 @@ def is_hiragana_only(word: str) -> bool:
 
 
 def canonical_kana(character: str) -> str:
-    """Convert a small hiragana to the full-sized kana used for chaining."""
+    """Return the canonical kana used only for shiritori connections."""
 
-    return _SMALL_TO_LARGE_KANA.get(character, character)
+    expanded = _SMALL_TO_LARGE_KANA.get(character, character)
+    return _DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
 
 
 class GameState:

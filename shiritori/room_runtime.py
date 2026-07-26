@@ -19,7 +19,13 @@ from hashlib import sha256
 import inspect
 from typing import Protocol, runtime_checkable
 
-from .bots import BotContext, BotStrategy, WordIndex, WordOption
+from .bots import (
+    BotContext,
+    BotStrategy,
+    WordIndex,
+    WordOption,
+    canonical_kana,
+)
 from .rooms import (
     CommandOutcome,
     PlayerSeat,
@@ -141,7 +147,9 @@ class RoomRuntime:
             or getattr(coordinator, "finish_no_legal_move", None)
         )
         self._on_error = on_error
-        self._opening_kana = tuple(dict.fromkeys(opening_kana))
+        self._opening_kana = tuple(
+            dict.fromkeys(canonical_kana(kana) for kana in opening_kana)
+        )
 
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._signals: dict[str, asyncio.Event] = {}

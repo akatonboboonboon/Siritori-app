@@ -33,6 +33,7 @@ from .auth import (
     UsernameUnavailableError,
     canonicalize_username,
 )
+from .bots import canonical_kana
 from .database import GameRepository
 from .lobby import LobbyError, LobbyService
 from .models import RoomRole, RoomStatus as StoredRoomStatus
@@ -1387,7 +1388,9 @@ def register_auth_pages(
                     f"対局中・残り{len(snapshot.active_seat_indexes)}人"
                 )
             expected_label.set_text(
-                snapshot.expected_kana or "自由"
+                canonical_kana(snapshot.expected_kana)
+                if snapshot.expected_kana is not None
+                else "自由"
             )
             current_seat = snapshot.players[snapshot.current_turn]
             if current_seat.controller is SeatController.BOT:

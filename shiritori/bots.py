@@ -30,6 +30,11 @@ _SMALL_TO_LARGE_KANA = {
     "ゖ": "け",
 }
 
+_DAKUON_CHAIN_EQUIVALENTS = {
+    "ぢ": "じ",
+    "づ": "ず",
+}
+
 _VOWEL_BY_KANA = {
     **{kana: "あ" for kana in "あかがさざただなはばぱまゃやらゎわ"},
     **{kana: "い" for kana in "いきぎしじちぢにひびぴみりゐ"},
@@ -40,9 +45,10 @@ _VOWEL_BY_KANA = {
 
 
 def canonical_kana(character: str) -> str:
-    """Return the full-sized hiragana used for chaining."""
+    """Return the canonical kana used only for shiritori connections."""
 
-    return _SMALL_TO_LARGE_KANA.get(character, character)
+    expanded = _SMALL_TO_LARGE_KANA.get(character, character)
+    return _DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
 
 
 def final_kana(reading: str) -> str:
@@ -110,6 +116,11 @@ class BotContext:
     def __post_init__(self) -> None:
         if not self.expected_kana:
             raise ValueError("expected_kana is required")
+        object.__setattr__(
+            self,
+            "expected_kana",
+            canonical_kana(self.expected_kana),
+        )
 
 
 @runtime_checkable
