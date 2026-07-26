@@ -221,6 +221,17 @@ class LobbyServiceTests(unittest.TestCase):
             (first.id, last.id),
         )
         self.assertEqual(
+            tuple(room.id for room in self.service.list_public_rooms()),
+            (first.id, active.id, last.id),
+        )
+        self.assertEqual(
+            tuple(
+                room.id
+                for room in self.service.list_public_rooms(limit=2)
+            ),
+            (first.id, active.id),
+        )
+        self.assertEqual(
             self.service.list_public_waiting(limit=1),
             (first,),
         )
@@ -230,6 +241,10 @@ class LobbyServiceTests(unittest.TestCase):
                     self.service.list_public_waiting(limit=invalid)  # type: ignore[arg-type]
                 with self.assertRaises(ValueError):
                     self.repository.list_public_waiting(limit=invalid)  # type: ignore[arg-type]
+                with self.assertRaises(ValueError):
+                    self.service.list_public_rooms(limit=invalid)  # type: ignore[arg-type]
+                with self.assertRaises(ValueError):
+                    self.repository.list_public_rooms(limit=invalid)  # type: ignore[arg-type]
 
     def test_obsolete_theme_key_format_is_ignored(self) -> None:
         room = self.create_room(theme_key="../food")
@@ -296,6 +311,55 @@ class LobbyServiceTests(unittest.TestCase):
         )
         with self.assertRaises(SpectatorsDisabledError):
             self.service.join_as_spectator("other-watcher", closed_room.room_code)
+
+    def test_active_public_spectator_joins_are_atomic_and_idempotent(
+        self,
+    ) -> None:
+        room = self.create_room(
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.set_ready("owner", room.room_code, ready=True)
+        started = self.service.start("owner", room.room_code)
+
+        def join(user_id: str) -> str:
+            joined = self.service.join_as_spectator(
+                user_id,
+                room.room_code,
+            )
+            return joined.member_for(user_id).role.value  # type: ignore[union-attr]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(
+                executor.map(join, ("watcher-a", "watcher-b"))
+            )
+
+        self.assertEqual(outcomes, ("spectator", "spectator"))
+        current = self.service.get_room(room.room_code)
+        self.assertEqual(
+            tuple(member.user_id for member in current.spectators),
+            ("watcher-a", "watcher-b"),
+        )
+        self.assertEqual(current.revision, started.lobby.revision + 2)
+        for user_id in ("watcher-a", "watcher-b"):
+            self.assertEqual(
+                self.service.active_game_id(user_id, room.room_code),
+                started.game_id,
+            )
+
+        same = self.service.join_as_spectator(
+            "watcher-a",
+            room.room_code,
+        )
+        self.assertEqual(same.revision, current.revision)
+        persisted_start = self.repository._starts_by_game_id[started.game_id]
+        self.assertEqual(
+            persisted_start.active_room.spectators,
+            ("watcher-a", "watcher-b"),
+        )
+        self.assertEqual(persisted_start.active_room.state_version, 2)
+        with self.assertRaises(LobbyStateError):
+            self.service.join_as_player("late-player", room.room_code)
 
     def test_only_players_can_change_readiness(self) -> None:
         room = self.create_room()
@@ -459,8 +523,116 @@ class LobbyServiceTests(unittest.TestCase):
             tuple(seat.owner_user_id for seat in result.active_room.players),
             ("owner", "guest"),
         )
+        self.assertEqual(self.service.list_public_rooms(), ())
+        joined = self.service.join_as_spectator(
+            "late",
+            room.room_code,
+        )
+        self.assertEqual(
+            tuple(member.user_id for member in joined.spectators),
+            ("watcher", "late"),
+        )
+        self.assertEqual(
+            self.service.active_game_id("late", room.room_code),
+            result.game_id,
+        )
+
+    def test_finished_round_returns_to_waiting_and_starts_new_game(self) -> None:
+        repository = InMemoryLobbyRepository()
+        game_ids = iter(("round-0001", "round-0002"))
+        service = LobbyService(
+            repository,
+            code_factory=lambda: "ROUND22",
+            game_id_factory=lambda: next(game_ids),
+            seat_picker=lambda _: 0,
+        )
+        room = service.create_pvp_room(
+            "owner",
+            name="Rematch room",
+            max_players=2,
+            turn_seconds=30,
+        )
+        service.join_as_player("guest", room.room_code)
+        service.join_as_spectator("watcher", room.room_code)
+        service.set_ready("owner", room.room_code, ready=True)
+        service.set_ready("guest", room.room_code, ready=True)
+        first = service.start("owner", room.room_code)
+
         with self.assertRaises(LobbyStateError):
+            service.return_to_waiting("owner", first.game_id)
+
+        finished = replace(
+            first.active_room,
+            status=ActiveRoomStatus.FINISHED,
+            deadline_at=None,
+            end_reason="no_legal_move",
+            state_version=first.active_room.state_version + 1,
+        )
+        repository.record_finished_game(finished)
+
+        with self.assertRaises(LobbyAuthorizationError):
+            service.return_to_waiting("outsider", first.game_id)
+        waiting = service.return_to_waiting("watcher", first.game_id)
+        self.assertEqual(waiting.status, StoredRoomStatus.WAITING)
+        self.assertEqual(waiting.room_code, room.room_code)
+        self.assertEqual(waiting.revision, first.lobby.revision + 1)
+        self.assertEqual(
+            tuple(member.user_id for member in waiting.members),
+            ("owner", "guest", "watcher"),
+        )
+        self.assertTrue(
+            all(not player.ready for player in waiting.players)
+        )
+        self.assertEqual(
+            tuple(member.user_id for member in waiting.spectators),
+            ("watcher",),
+        )
+
+        # An exact transport retry is a read-only success.
+        self.assertEqual(
+            service.return_to_waiting("owner", first.game_id),
+            waiting,
+        )
+        with self.assertRaises(LobbyNotReadyError):
+            service.start("owner", room.room_code)
+
+        service.set_ready("owner", room.room_code, ready=True)
+        service.set_ready("guest", room.room_code, ready=True)
+        second = service.start("owner", room.room_code)
+        self.assertEqual(second.game_id, "round-0002")
+        self.assertNotEqual(second.game_id, first.game_id)
+        self.assertEqual(second.active_room.history, ())
+        self.assertEqual(second.active_room.expected_kana, None)
+        self.assertEqual(
+            service.open_room_for_game("watcher", first.game_id),
+            second.lobby,
+        )
+        with self.assertRaises(LobbyRoomNotFound):
+            service.open_room_for_game("outsider", first.game_id)
+        with self.assertRaises(LobbyRoomNotFound):
+            service.open_room_for_game("watcher", "missing-game")
+        with self.assertRaises(LobbyStateError):
+            service.return_to_waiting("owner", first.game_id)
+
+    def test_active_room_with_spectators_disabled_is_not_joinable(
+        self,
+    ) -> None:
+        room = self.create_room(
+            is_public=True,
+            allow_spectators=False,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.set_ready("owner", room.room_code, ready=True)
+        self.service.start("owner", room.room_code)
+
+        self.assertEqual(self.service.list_public_rooms(), ())
+        with self.assertRaises(SpectatorsDisabledError):
             self.service.join_as_spectator("late", room.room_code)
+        with self.assertRaises(SpectatorsDisabledError):
+            self.repository.join_active_spectator(
+                room_id=room.id,
+                user_id="late",
+            )
 
     def test_active_game_lookup_is_member_only_and_requires_started_room(self) -> None:
         room = self.create_room()

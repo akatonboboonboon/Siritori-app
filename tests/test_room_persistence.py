@@ -13,11 +13,19 @@ import unittest
 from alembic import command
 from alembic.config import Config
 from argon2 import PasswordHasher
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 
 from shiritori.auth import AuthService
 from shiritori.database import Database, GameRepository
-from shiritori.models import Game, GameMode, Room, StoredGameStatus
+from shiritori.models import (
+    Game,
+    GameMode,
+    MatchParticipation,
+    MatchResult,
+    Room,
+    RoomMembership,
+    StoredGameStatus,
+)
 from shiritori.room_persistence import (
     RoomAlreadyInitialized,
     RoomOperationConflictError,
@@ -120,6 +128,10 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
             room_id=lobby.id,
             current_turn_index=1,
         )
+        with self.database.transaction() as session:
+            stored_lobby = session.get(Room, lobby.id)
+            stored_lobby.status = "active"
+            stored_lobby.current_game_id = game.id
         self.lobby_id = lobby.id
         self.game_id = game.id
         self.initial = RoomSnapshot(
@@ -456,12 +468,9 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RoomSnapshotCorruptError):
             await self.repository.list_active_room_ids()
 
-    async def test_recovery_list_keeps_finished_pvp_until_lobby_is_deleted(
+    async def test_finished_pvp_atomically_reopens_and_is_not_recoverable(
         self,
     ) -> None:
-        with self.database.transaction() as session:
-            session.get(Room, self.lobby_id).status = "active"
-
         await self.repository.initialize(self.initial)
         finished = replace(
             self.initial,
@@ -483,10 +492,19 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(await self.repository.list_active_room_ids(), ())
-        self.assertEqual(
-            await self.repository.list_recoverable_room_ids(),
-            (self.game_id,),
-        )
+        self.assertEqual(await self.repository.list_recoverable_room_ids(), ())
+        with self.database.read_session() as session:
+            lobby = session.get(Room, self.lobby_id)
+            memberships = tuple(
+                session.scalars(
+                    select(RoomMembership).where(
+                        RoomMembership.room_id == self.lobby_id
+                    )
+                )
+            )
+            self.assertEqual(lobby.status, "waiting")
+            self.assertIsNone(lobby.current_game_id)
+            self.assertTrue(all(not member.ready for member in memberships))
 
         with self.database.transaction() as session:
             lobby = session.get(Room, self.lobby_id)
@@ -497,6 +515,164 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
             await self.repository.list_recoverable_room_ids(),
             (),
         )
+
+    async def test_finish_records_human_results_once_and_preserves_them(
+        self,
+    ) -> None:
+        await self.repository.initialize(self.initial)
+        finished = replace(
+            self.initial,
+            status=RoomStatus.FINISHED,
+            current_turn=1,
+            state_version=1,
+            eliminated_seats=(0,),
+            expected_kana=None,
+            deadline_at=None,
+            losing_seat=0,
+            end_reason="surrender",
+        )
+
+        first = await cas(
+            self.repository,
+            self.game_id,
+            0,
+            "finish-with-results",
+            finished,
+        )
+        replay = await cas(
+            self.repository,
+            self.game_id,
+            0,
+            "finish-with-results",
+            finished,
+        )
+
+        self.assertEqual(first.status, RepositoryStatus.APPLIED)
+        self.assertEqual(replay.status, RepositoryStatus.DUPLICATE)
+        with self.database.read_session() as session:
+            rows = tuple(
+                session.scalars(
+                    select(MatchParticipation)
+                    .where(MatchParticipation.game_id == self.game_id)
+                    .order_by(MatchParticipation.seat_index)
+                )
+            )
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                tuple(
+                    (
+                        row.user_id,
+                        row.result,
+                        row.placement,
+                        row.word_count,
+                    )
+                    for row in rows
+                ),
+                (
+                    (
+                        self.owner.id,
+                        MatchResult.LOSS.value,
+                        2,
+                        1,
+                    ),
+                    (
+                        self.guest.id,
+                        MatchResult.WIN.value,
+                        1,
+                        0,
+                    ),
+                ),
+            )
+            self.assertTrue(
+                all(row.mode == GameMode.MULTIPLAYER.value for row in rows)
+            )
+            self.assertTrue(all(row.player_count == 2 for row in rows))
+            self.assertTrue(all(row.end_reason == "surrender" for row in rows))
+
+        deleted = await delete(
+            self.repository,
+            self.game_id,
+            1,
+            "delete-finished-room",
+        )
+        self.assertEqual(deleted.status, RepositoryStatus.APPLIED)
+        self.assertFalse(deleted.receipt.deleted)
+        self.assertEqual(deleted.receipt.snapshot, finished)
+        replayed_delete = await delete(
+            self.repository,
+            self.game_id,
+            1,
+            "delete-finished-room",
+        )
+        self.assertEqual(replayed_delete.status, RepositoryStatus.DUPLICATE)
+        self.assertFalse(replayed_delete.receipt.deleted)
+        with self.database.read_session() as session:
+            rows = tuple(
+                session.scalars(
+                    select(MatchParticipation).where(
+                        MatchParticipation.game_id == self.game_id
+                    )
+                )
+            )
+            game = session.get(Game, self.game_id)
+            lobby = session.get(Room, self.lobby_id)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(game.finished_at, rows[0].finished_at)
+            self.assertEqual(game.status, StoredGameStatus.FINISHED.value)
+            self.assertEqual(lobby.status, "waiting")
+            self.assertIsNone(lobby.current_game_id)
+            self.assertIsNone(lobby.deleted_at)
+
+    async def test_multi_seat_bot_winner_records_only_humans_with_places(
+        self,
+    ) -> None:
+        initial = replace(
+            self.initial,
+            players=(
+                self.initial.players[0],
+                self.initial.players[1],
+                PlayerSeat(2, None, SeatController.BOT),
+            ),
+            current_turn=0,
+            spectators=(),
+        )
+        await self.repository.initialize(initial)
+        finished = replace(
+            initial,
+            status=RoomStatus.FINISHED,
+            current_turn=2,
+            state_version=1,
+            eliminated_seats=(0, 1),
+            expected_kana=None,
+            deadline_at=None,
+            losing_seat=1,
+            end_reason="ends_with_n",
+        )
+        await cas(
+            self.repository,
+            self.game_id,
+            0,
+            "bot-wins-three-seats",
+            finished,
+        )
+
+        with self.database.read_session() as session:
+            rows = tuple(
+                session.scalars(
+                    select(MatchParticipation)
+                    .where(MatchParticipation.game_id == self.game_id)
+                    .order_by(MatchParticipation.seat_index)
+                )
+            )
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                tuple((row.result, row.placement) for row in rows),
+                (
+                    (MatchResult.LOSS.value, 3),
+                    (MatchResult.LOSS.value, 2),
+                ),
+            )
+            self.assertTrue(all(row.player_count == 3 for row in rows))
 
     async def test_delete_closes_lobby_and_receipt_survives_restart(self) -> None:
         await self.repository.initialize(self.initial)
@@ -516,6 +692,16 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(game.state_version, 1)
             self.assertEqual(lobby.status, "closed")
             self.assertIsNotNone(lobby.deleted_at)
+            self.assertEqual(
+                tuple(
+                    session.scalars(
+                        select(MatchParticipation).where(
+                            MatchParticipation.game_id == self.game_id
+                        )
+                    )
+                ),
+                (),
+            )
 
         restarted_database = Database(self.database_url)
         restarted = SQLAlchemyRoomRepository(restarted_database)

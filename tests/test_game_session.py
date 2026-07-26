@@ -406,12 +406,14 @@ class DeadlineTests(unittest.TestCase):
 
     def test_exact_deadline_times_out_before_validation(self) -> None:
         self.clock.advance(10)
+        deadline = self.game.deadline_at
 
         result = self.game.submit("林檎")
 
         self.assertEqual(result.code, SessionCode.TIMED_OUT)
         self.assertEqual(self.game.status, SessionStatus.LOST_BY_TIMEOUT)
         self.assertEqual(self.game.history, ())
+        self.assertEqual(self.game.ended_at, deadline)
         self.assertIsNone(self.game.deadline_at)
 
     def test_expire_if_due_is_idempotent(self) -> None:

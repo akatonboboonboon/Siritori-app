@@ -31,8 +31,10 @@ from .rooms import (
     RoomHub,
     RoomSnapshot,
 )
+from .score_attack_persistence import SQLAlchemyScoreAttackService
 from .settings import Settings
 from .solo import SoloGameService
+from .statistics import StatisticsRepository
 from .themes import ALL_THEME_ID, ThemeCatalog, ThemeDefinition
 
 
@@ -47,6 +49,8 @@ class ApplicationServices:
     database: Database
     auth: AuthService
     games: GameRepository
+    statistics: StatisticsRepository
+    score_attack: SQLAlchemyScoreAttackService
     lobby_repository: SQLAlchemyLobbyRepository
     lobby: LobbyService
     room_repository: SQLAlchemyRoomRepository
@@ -70,6 +74,8 @@ class ApplicationServices:
         database = Database(settings.database_url)
         auth = AuthService(database)
         games = GameRepository(database)
+        statistics = StatisticsRepository(database)
+        score_attack = SQLAlchemyScoreAttackService(database)
         themes = ThemeCatalog()
         lobby_repository = SQLAlchemyLobbyRepository(database)
         lobby = LobbyService(lobby_repository)
@@ -128,6 +134,8 @@ class ApplicationServices:
             database=database,
             auth=auth,
             games=games,
+            statistics=statistics,
+            score_attack=score_attack,
             lobby_repository=lobby_repository,
             lobby=lobby,
             room_repository=room_repository,
@@ -203,6 +211,13 @@ class ApplicationServices:
 
         if self._started:
             return
+        while True:
+            finalized = await asyncio.to_thread(
+                self.score_attack.finalize_expired_active_runs,
+                limit=100,
+            )
+            if len(finalized) < 100:
+                break
         recoverable_room_ids = (
             await self.room_repository.list_recoverable_room_ids()
         )

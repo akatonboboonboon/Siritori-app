@@ -1466,9 +1466,10 @@ class RoomCoordinator:
                         history=(*snapshot.history, record),
                         reason="ends_with_n",
                         now=current_time,
-                        # A word ending in ん cannot continue the chain, so the
-                        # next surviving player receives a free opening.
-                        expected_kana=None,
+                        # In an elimination match the next survivor inherits
+                        # the kana this player had to answer with. The losing
+                        # word itself cannot continue because it ends in ん.
+                        expected_kana=required_kana,
                     )
                 else:
                     next_turn = self._next_active_turn(
@@ -2032,7 +2033,7 @@ def _require_receipt_match(
         receipt.command_kind != command_kind
         or receipt.fingerprint != fingerprint
         or receipt.expected_version != expected_version
-        or receipt.deleted != (receipt.command_kind == "delete")
+        or (receipt.deleted and receipt.command_kind != "delete")
     ):
         raise RoomOperationConflictError(room_id, receipt.operation_id)
 

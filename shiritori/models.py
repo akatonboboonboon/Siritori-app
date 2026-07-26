@@ -97,6 +97,12 @@ class ActorKind(StrEnum):
     SYSTEM = "system"
 
 
+class MatchResult(StrEnum):
+    WIN = "win"
+    LOSS = "loss"
+    DRAW = "draw"
+
+
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
@@ -116,6 +122,9 @@ class User(Base):
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
     )
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    leaderboard_visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     sessions: Mapped[list[LoginSession]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
@@ -159,6 +168,15 @@ class Room(Base):
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    current_game_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "games.id",
+            name="fk_rooms_current_game_id_games",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        unique=True,
+    )
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     name_key: Mapped[str] = mapped_column(
         String(64), nullable=False, default=default_room_name_key
@@ -192,7 +210,14 @@ class Room(Base):
     memberships: Mapped[list[RoomMembership]] = relationship(
         back_populates="room", cascade="all, delete-orphan"
     )
-    games: Mapped[list[Game]] = relationship(back_populates="room")
+    games: Mapped[list[Game]] = relationship(
+        back_populates="room",
+        foreign_keys="Game.room_id",
+    )
+    current_game: Mapped[Game | None] = relationship(
+        foreign_keys=[current_game_id],
+        post_update=True,
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -284,6 +309,10 @@ class Game(Base):
     room_id: Mapped[str | None] = mapped_column(
         ForeignKey("rooms.id", ondelete="SET NULL")
     )
+    rematch_of_game_id: Mapped[str | None] = mapped_column(
+        ForeignKey("games.id", ondelete="RESTRICT"),
+        unique=True,
+    )
     created_by_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
@@ -326,7 +355,10 @@ class Game(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    room: Mapped[Room | None] = relationship(back_populates="games")
+    room: Mapped[Room | None] = relationship(
+        back_populates="games",
+        foreign_keys=[room_id],
+    )
     moves: Mapped[list[Move]] = relationship(
         back_populates="game",
         cascade="all, delete-orphan",
@@ -447,6 +479,172 @@ class SoloGameSave(Base):
         Index("ix_solo_saves_user_updated", "user_id", "updated_at"),
     )
 
+
+class MatchParticipation(Base):
+    """One immutable human result recorded when an authoritative game finishes."""
+
+    __tablename__ = "match_participations"
+
+    game_id: Mapped[str] = mapped_column(
+        ForeignKey("games.id", ondelete="RESTRICT"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    seat_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    result: Mapped[str] = mapped_column(String(8), nullable=False)
+    placement: Mapped[int | None] = mapped_column(Integer)
+    player_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    word_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    end_reason: Mapped[str | None] = mapped_column(String(64))
+    finished_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    game: Mapped[Game] = relationship()
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('multiplayer', 'solo')", name="valid_mode"
+        ),
+        CheckConstraint(
+            "result IN ('win', 'loss', 'draw')", name="valid_result"
+        ),
+        CheckConstraint(
+            "seat_index >= 0 AND seat_index < 8", name="seat_index_range"
+        ),
+        CheckConstraint(
+            "placement IS NULL OR (placement >= 1 AND placement <= 8)",
+            name="placement_range",
+        ),
+        CheckConstraint(
+            "player_count >= 2 AND player_count <= 8",
+            name="player_count_range",
+        ),
+        CheckConstraint("word_count >= 0", name="word_count_nonnegative"),
+        Index(
+            "ix_match_participations_user_finished",
+            "user_id",
+            "finished_at",
+        ),
+        Index(
+            "ix_match_participations_pvp_result",
+            "mode",
+            "result",
+            "user_id",
+        ),
+    )
+
+
+class ScoreAttackRun(Base):
+    """One authoritative, resumable three-minute score attack run."""
+
+    __tablename__ = "score_attack_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active"
+    )
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(
+        "snapshot", JSON, nullable=False
+    )
+    state_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    rules_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+    duration_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=180
+    )
+    score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    accepted_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    finish_reason: Mapped[str | None] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'finished')", name="valid_status"
+        ),
+        CheckConstraint(
+            "state_version >= 0", name="state_version_nonnegative"
+        ),
+        CheckConstraint(
+            "rules_version >= 1", name="rules_version_positive"
+        ),
+        CheckConstraint(
+            "duration_seconds = 180", name="fixed_duration"
+        ),
+        CheckConstraint("score >= 0", name="score_nonnegative"),
+        CheckConstraint(
+            "accepted_count >= 0", name="accepted_count_nonnegative"
+        ),
+        CheckConstraint(
+            "finish_reason IS NULL OR "
+            "finish_reason IN ('timeout', 'ends_with_n', 'duplicate')",
+            name="valid_finish_reason",
+        ),
+        CheckConstraint(
+            "(status = 'active' AND deadline_at IS NOT NULL "
+            "AND finished_at IS NULL AND finish_reason IS NULL) OR "
+            "(status = 'finished' AND deadline_at IS NULL "
+            "AND finished_at IS NOT NULL AND finish_reason IS NOT NULL)",
+            name="valid_lifecycle",
+        ),
+        CheckConstraint(
+            "deadline_at IS NULL OR deadline_at > started_at",
+            name="deadline_after_start",
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at",
+            name="finish_after_start",
+        ),
+        Index(
+            "uq_score_attack_runs_active_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_score_attack_runs_user_finished",
+            "user_id",
+            "finished_at",
+        ),
+        Index(
+            "ix_score_attack_runs_ranking",
+            "rules_version",
+            "status",
+            "score",
+            "accepted_count",
+            "finished_at",
+        ),
+    )
+
+
 class RoomCommandReceipt(Base):
     """Durable result of one coordinator command.
 
@@ -496,6 +694,8 @@ __all__ = [
     "Game",
     "GameMode",
     "LoginSession",
+    "MatchParticipation",
+    "MatchResult",
     "Move",
     "PresenceState",
     "Room",
@@ -503,6 +703,7 @@ __all__ = [
     "RoomMembership",
     "RoomRole",
     "RoomStatus",
+    "ScoreAttackRun",
     "SoloGameSave",
     "StoredGameStatus",
     "User",

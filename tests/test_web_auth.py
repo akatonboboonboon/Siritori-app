@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse
 
 from shiritori.auth import Account, SessionPrincipal
+from shiritori.lobby import LobbyStateError
 from shiritori.rooms import (
     RoomMode,
     RoomStatus,
@@ -32,6 +33,7 @@ from shiritori.web_auth import (
     _can_surrender,
     _deadline_presentation,
     _feedback_for_version,
+    _post_match_lobby_destination,
     _read_form,
     _room_invite_url,
     _room_listing_summary,
@@ -277,6 +279,46 @@ class GameUiHelperTests(unittest.TestCase):
             end_reason="surrender",
         )
         self.assertFalse(_can_surrender(finished, "alice"))
+
+    def test_post_match_destination_follows_newer_active_round(self) -> None:
+        room = SimpleNamespace(room_code="ABC234")
+
+        class StartedNextRound:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, str]] = []
+
+            def return_to_waiting(
+                self,
+                user_id: str,
+                game_id: str,
+            ) -> object:
+                self.calls.append(("return", user_id, game_id))
+                raise LobbyStateError("game is not the room's current round")
+
+            def open_room_for_game(
+                self,
+                user_id: str,
+                game_id: str,
+            ) -> object:
+                self.calls.append(("lookup", user_id, game_id))
+                return room
+
+        lobby = StartedNextRound()
+        self.assertIs(
+            _post_match_lobby_destination(
+                lobby,  # type: ignore[arg-type]
+                "watcher",
+                "finished-round",
+            ),
+            room,
+        )
+        self.assertEqual(
+            lobby.calls,
+            [
+                ("return", "watcher", "finished-round"),
+                ("lookup", "watcher", "finished-round"),
+            ],
+        )
 
 
 class LoginAttemptLimiterTests(unittest.TestCase):

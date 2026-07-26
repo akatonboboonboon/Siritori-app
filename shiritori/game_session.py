@@ -24,7 +24,8 @@ from shiritori.lexicon import (
 )
 
 
-SNAPSHOT_VERSION = 1
+LEGACY_SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 _SMALL_TO_LARGE_KANA = {
     "ぁ": "あ",
@@ -67,6 +68,13 @@ class SessionStatus(str, Enum):
     LOST_BY_N = "lost_by_n"
     LOST_BY_DUPLICATE = "lost_by_duplicate"
     LOST_BY_TIMEOUT = "lost_by_timeout"
+
+
+class DeadlinePolicy(str, Enum):
+    """How a configured deadline advances during one session."""
+
+    PER_TURN = "per_turn"
+    FIXED_MATCH = "fixed_match"
 
 
 class SessionCode(str, Enum):
@@ -296,6 +304,23 @@ def validate_time_limit(time_limit_seconds: int | None) -> int | None:
     return time_limit_seconds
 
 
+def validate_deadline_policy(
+    deadline_policy: DeadlinePolicy | str,
+) -> DeadlinePolicy:
+    """Return one supported deadline policy without coercing other types."""
+
+    if not isinstance(deadline_policy, (DeadlinePolicy, str)):
+        raise ValueError(
+            "deadline_policy must be 'per_turn' or 'fixed_match'"
+        )
+    try:
+        return DeadlinePolicy(deadline_policy)
+    except ValueError as error:
+        raise ValueError(
+            "deadline_policy must be 'per_turn' or 'fixed_match'"
+        ) from error
+
+
 class GameSession:
     """Authoritative dictionary-backed state for one shiritori match."""
 
@@ -304,6 +329,7 @@ class GameSession:
         validator: LexiconValidator | None = None,
         *,
         time_limit_seconds: int | None = None,
+        deadline_policy: DeadlinePolicy | str = DeadlinePolicy.PER_TURN,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._validator = (
@@ -311,6 +337,14 @@ class GameSession:
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.time_limit_seconds = validate_time_limit(time_limit_seconds)
+        self.deadline_policy = validate_deadline_policy(deadline_policy)
+        if (
+            self.deadline_policy is DeadlinePolicy.FIXED_MATCH
+            and self.time_limit_seconds is None
+        ):
+            raise ValueError(
+                "fixed_match deadline_policy requires a time limit"
+            )
         self._history: list[HistoryEntry] = []
         self._used_canonical_keys: set[str] = set()
         self._pending_reading: PendingReading | None = None
@@ -490,6 +524,7 @@ class GameSession:
             "snapshot_version": SNAPSHOT_VERSION,
             "status": self.status.value,
             "time_limit_seconds": self.time_limit_seconds,
+            "deadline_policy": self.deadline_policy.value,
             "started_at": self.started_at.isoformat(),
             "ended_at": (
                 self.ended_at.isoformat()
@@ -531,6 +566,21 @@ class GameSession:
             status = SessionStatus(raw_status)
             raw_limit = snapshot["time_limit_seconds"]
             time_limit = validate_time_limit(raw_limit)  # type: ignore[arg-type]
+            if version == LEGACY_SNAPSHOT_VERSION:
+                if "deadline_policy" in snapshot:
+                    raise ValueError
+                deadline_policy = DeadlinePolicy.PER_TURN
+            elif version == SNAPSHOT_VERSION:
+                deadline_policy = validate_deadline_policy(
+                    snapshot["deadline_policy"]  # type: ignore[arg-type]
+                )
+            else:
+                raise ValueError
+            if (
+                deadline_policy is DeadlinePolicy.FIXED_MATCH
+                and time_limit is None
+            ):
+                raise ValueError
             started_at = _parse_datetime(
                 snapshot["started_at"], "started_at"
             )
@@ -545,7 +595,7 @@ class GameSession:
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid game session snapshot") from error
 
-        if version != SNAPSHOT_VERSION:
+        if version not in {LEGACY_SNAPSHOT_VERSION, SNAPSHOT_VERSION}:
             raise ValueError(f"unsupported snapshot version: {version}")
         if not isinstance(raw_history, list):
             raise ValueError("snapshot history must be a list")
@@ -609,12 +659,14 @@ class GameSession:
         session = cls(
             validator=validator,
             time_limit_seconds=time_limit,
+            deadline_policy=deadline_policy,
             clock=clock,
         )
         logical_now = session.started_at
         _validate_snapshot_timeline(
             status=status,
             time_limit_seconds=time_limit,
+            deadline_policy=deadline_policy,
             started_at=started_at,
             ended_at=ended_at,
             deadline_at=deadline_at,
@@ -716,7 +768,8 @@ class GameSession:
                 lexicon_result=lexicon_result,
             )
 
-        self._start_deadline(now)
+        if self.deadline_policy is DeadlinePolicy.PER_TURN:
+            self._start_deadline(now)
         return SessionResult(
             code=SessionCode.ACCEPTED,
             message=f"「{candidate.surface}」を受け付けました。",
@@ -741,8 +794,9 @@ class GameSession:
     def _expire_if_due(self, now: datetime) -> SessionResult | None:
         if self._deadline_at is None or now < self._deadline_at:
             return None
+        expired_at = self._deadline_at
         self.status = SessionStatus.LOST_BY_TIMEOUT
-        self.ended_at = now
+        self.ended_at = expired_at
         self._deadline_at = None
         self._pending_reading = None
         return SessionResult(
@@ -863,6 +917,7 @@ def _validate_snapshot_timeline(
     *,
     status: SessionStatus,
     time_limit_seconds: int | None,
+    deadline_policy: DeadlinePolicy,
     started_at: datetime,
     ended_at: datetime | None,
     deadline_at: datetime | None,
@@ -905,13 +960,17 @@ def _validate_snapshot_timeline(
             )
 
     if status is SessionStatus.ACTIVE and time_limit_seconds is not None:
-        deadline_base = history[-1].timestamp if history else started_at
+        deadline_base = (
+            started_at
+            if deadline_policy is DeadlinePolicy.FIXED_MATCH
+            else history[-1].timestamp if history else started_at
+        )
         expected_deadline = deadline_base + timedelta(
             seconds=time_limit_seconds
         )
         if deadline_at != expected_deadline:
             raise ValueError(
-                "active deadline does not match the current turn"
+                "active deadline does not match its deadline policy"
             )
 
 def _candidate_to_snapshot(

@@ -24,6 +24,8 @@ ROOMS = SERVICES.rooms
 ROOM_WORDS = SERVICES.room_words
 ROOM_RUNTIME = SERVICES.runtime
 SOLO = SERVICES.solo
+STATISTICS = SERVICES.statistics
+SCORE_ATTACK = SERVICES.score_attack
 
 
 @app.middleware("http")
@@ -42,6 +44,9 @@ async def security_headers(request: Request, call_next):
             "/play/",
             "/join/",
             "/room/",
+            "/stats",
+            "/rankings",
+            "/score-attack",
         )
     ):
         response.headers.setdefault("Cache-Control", "no-store")
@@ -83,6 +88,8 @@ register_auth_pages(
         rooms=ROOMS,
         room_words=ROOM_WORDS,
         lobby=LOBBY,
+        statistics=STATISTICS,
+        score_attack=SCORE_ATTACK,
     )
 )
 app.on_startup(SERVICES.start)
