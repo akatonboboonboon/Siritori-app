@@ -26,7 +26,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q .
 ```
 
-今回の変更を含む全339件の自動テストが成功しています。
+今回の変更を含む全388件の自動テストが成功しています。
 同じテストを各PRとmainのGitHub Actionsでも再実行します。
 
 ローカル起動:

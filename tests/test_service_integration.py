@@ -9,7 +9,11 @@ import unittest
 
 from shiritori.application import ApplicationServices
 from shiritori.lexicon import LexiconCandidate, LexiconCode, LexiconResult
-from shiritori.lobby import InMemoryLobbyRepository, LobbyService
+from shiritori.lobby import (
+    InMemoryLobbyRepository,
+    LobbyNameConflict,
+    LobbyService,
+)
 from shiritori.rooms import (
     InMemoryRoomRepository,
     LexiconRoomService,
@@ -280,7 +284,7 @@ class StartupRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await services.close()
             temporary_directory.cleanup()
 
-    async def test_restart_closes_finished_pvp_and_releases_room_name(
+    async def test_restart_preserves_finished_pvp_for_rematch(
         self,
     ) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
@@ -342,20 +346,41 @@ class StartupRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             restarted.rooms.disconnect_grace_seconds = 0
             await restarted.start()
 
-            for _ in range(100):
-                await asyncio.sleep(0.01)
-                try:
-                    await restarted.rooms.load_snapshot(started.game_id)
-                except RoomNotFound:
-                    break
-            else:
-                self.fail("finished PvP room was not removed after restart")
-
-            replacement = restarted.lobby.create_pvp_room(
-                owner.id,
-                name="reusable finished room",
+            preserved = await restarted.rooms.load_snapshot(
+                started.game_id
             )
-            self.assertEqual(replacement.name, "reusable finished room")
+            self.assertEqual(preserved, finished)
+            waiting = restarted.lobby.get_room(lobby.room_code)
+            self.assertEqual(waiting.status.value, "waiting")
+            self.assertTrue(
+                all(not player.ready for player in waiting.players)
+            )
+            self.assertEqual(
+                restarted.lobby.return_to_waiting(
+                    owner.id,
+                    started.game_id,
+                ),
+                waiting,
+            )
+            with self.assertRaises(LobbyNameConflict):
+                restarted.lobby.create_pvp_room(
+                    owner.id,
+                    name="reusable finished room",
+                )
+
+            restarted.lobby.set_ready(
+                owner.id, lobby.room_code, ready=True
+            )
+            restarted.lobby.set_ready(
+                guest.id, lobby.room_code, ready=True
+            )
+            rematch = restarted.lobby.start(owner.id, lobby.room_code)
+            self.assertNotEqual(rematch.game_id, started.game_id)
+            self.assertEqual(rematch.active_room.history, ())
+            self.assertEqual(
+                await restarted.rooms.load_snapshot(started.game_id),
+                finished,
+            )
         finally:
             if restarted is not None:
                 await restarted.close()

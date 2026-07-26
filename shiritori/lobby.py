@@ -2,9 +2,9 @@
 
 The web layer supplies an authenticated user ID, but this module deliberately
 does not know how authentication works.  Persistence implementations must make
-``join_waiting``, ``activate_waiting``, and ``leave_waiting`` atomic: the
-service performs the same checks for useful errors, while the repository
-repeats them while holding its database lock.
+``join_waiting``, ``join_active_spectator``, ``activate_waiting``, and
+``leave_waiting`` atomic: the service performs the same checks for useful
+errors, while the repository repeats them while holding its database lock.
 """
 
 from __future__ import annotations
@@ -325,6 +325,13 @@ class LobbyRepository(Protocol):
     ) -> tuple[LobbyRoomSnapshot, ...]:
         """List public waiting rooms in stable creation order."""
 
+    def list_public_rooms(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        """List public waiting rooms and active rooms open to spectators."""
+
     def find_active_game_id(
         self,
         *,
@@ -332,6 +339,14 @@ class LobbyRepository(Protocol):
         user_id: str,
     ) -> str | None:
         """Return a validated active game only to one of its room members."""
+
+    def find_open_room_by_game_id(
+        self,
+        *,
+        historical_game_id: str,
+        user_id: str,
+    ) -> LobbyRoomSnapshot | None:
+        """Resolve a finished PvP game's current open room for a member."""
 
     def join_waiting(
         self,
@@ -341,6 +356,14 @@ class LobbyRepository(Protocol):
         role: RoomRole,
     ) -> LobbyRoomSnapshot:
         """Atomically check state/permissions/capacity and add the member."""
+
+    def join_active_spectator(
+        self,
+        *,
+        room_id: str,
+        user_id: str,
+    ) -> LobbyRoomSnapshot:
+        """Atomically add a spectator to a public active lobby and game."""
 
     def set_ready(
         self,
@@ -363,6 +386,17 @@ class LobbyRepository(Protocol):
         turn_seconds: int | None,
     ) -> LobbyStartResult:
         """Re-check owner/readiness/revision and persist room plus game."""
+
+    def return_finished_to_waiting(
+        self,
+        *,
+        requesting_user_id: str,
+        finished_game_id: str,
+    ) -> LobbyRoomSnapshot:
+        """Atomically return a finished current round to the waiting lobby.
+
+        Exact retries for the same finished round must be idempotent.
+        """
 
     def leave_waiting(
         self,
@@ -455,6 +489,30 @@ class LobbyService:
             raise RuntimeError("repository returned an invalid public room listing")
         return rooms
 
+    def list_public_rooms(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        """Return public rooms that can accept a player or spectator."""
+
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        rooms = self.repository.list_public_rooms(limit=limit)
+        if len(rooms) > limit or any(
+            not room.is_public
+            or (
+                room.status is not StoredRoomStatus.WAITING
+                and not (
+                    room.status is StoredRoomStatus.ACTIVE
+                    and room.allow_spectators
+                )
+            )
+            for room in rooms
+        ):
+            raise RuntimeError("repository returned an invalid public room listing")
+        return rooms
+
     def get_room(self, raw_room_code: str) -> LobbyRoomSnapshot:
         code = normalize_invite_code(raw_room_code)
         room = self.repository.get_by_code(code)
@@ -490,6 +548,35 @@ class LobbyService:
             raise RuntimeError("repository returned an invalid game ID")
         return game_id
 
+    def open_room_for_game(
+        self,
+        user_id: str,
+        historical_game_id: str,
+    ) -> LobbyRoomSnapshot:
+        """Resolve the continuing room for an authorized historical round.
+
+        Missing games, closed rooms, and non-members deliberately share the
+        same public error so an opaque game ID cannot disclose room membership.
+        """
+
+        member_id = _require_user_id(user_id)
+        game_id = _require_user_id(historical_game_id)
+        if len(game_id) > 36:
+            raise ValueError("historical_game_id is too long")
+        room = self.repository.find_open_room_by_game_id(
+            historical_game_id=game_id,
+            user_id=member_id,
+        )
+        if room is None:
+            raise LobbyRoomNotFound("room not found")
+        if (
+            room.status
+            not in (StoredRoomStatus.WAITING, StoredRoomStatus.ACTIVE)
+            or room.member_for(member_id) is None
+        ):
+            raise RuntimeError("repository returned an unauthorized open room")
+        return room
+
     def join_as_player(
         self, user_id: str, raw_room_code: str
     ) -> LobbyRoomSnapshot:
@@ -508,13 +595,24 @@ class LobbyService:
     ) -> LobbyRoomSnapshot:
         member_id = _require_user_id(user_id)
         room = self.get_room(raw_room_code)
-        if room.status is not StoredRoomStatus.WAITING:
-            raise LobbyStateError("new members can join only while waiting")
         existing = room.member_for(member_id)
         if existing is not None:
             if existing.role is role:
                 return room
             raise LobbyMemberError("a member cannot change roles by joining again")
+        if room.status is StoredRoomStatus.ACTIVE:
+            if role is RoomRole.PLAYER:
+                raise LobbyStateError(
+                    "players cannot join after the match has started"
+                )
+            if not room.allow_spectators:
+                raise SpectatorsDisabledError("spectators are disabled")
+            return self.repository.join_active_spectator(
+                room_id=room.id,
+                user_id=member_id,
+            )
+        if room.status is not StoredRoomStatus.WAITING:
+            raise LobbyStateError("new members can join only while waiting")
         if role is RoomRole.PLAYER and len(room.players) >= room.max_players:
             raise LobbyCapacityError("the room has no open player seat")
         if role is RoomRole.SPECTATOR and not room.allow_spectators:
@@ -602,6 +700,32 @@ class LobbyService:
             theme_key=room.theme_key,
             turn_seconds=room.turn_seconds,
         )
+
+    def return_to_waiting(
+        self,
+        user_id: str,
+        finished_game_id: str,
+    ) -> LobbyRoomSnapshot:
+        """Return one finished current round to its persistent waiting lobby.
+
+        Persistence resolves the room from the opaque game ID and repeats the
+        membership/current-round checks under one lock. This method never
+        rewrites the finished game; the next ``start`` creates a new game ID.
+        """
+
+        member_id = _require_user_id(user_id)
+        game_id = _require_user_id(finished_game_id)
+        if len(game_id) > 36:
+            raise ValueError("finished_game_id is too long")
+        room = self.repository.return_finished_to_waiting(
+            requesting_user_id=member_id,
+            finished_game_id=game_id,
+        )
+        if room.status is not StoredRoomStatus.WAITING:
+            raise RuntimeError("repository returned a non-waiting rematch lobby")
+        if room.member_for(member_id) is None:
+            raise RuntimeError("repository returned a lobby without the requester")
+        return room
 
     def leave(
         self,
@@ -708,6 +832,36 @@ class InMemoryLobbyRepository:
                 if room.is_public and room.status is StoredRoomStatus.WAITING
             )[:limit]
 
+    def list_public_rooms(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        with self._lock:
+            return tuple(
+                room
+                for room in self._rooms_by_id.values()
+                if room.is_public
+                and self._is_public_room_joinable(room)
+            )[:limit]
+
+    def _is_public_room_joinable(
+        self,
+        room: LobbyRoomSnapshot,
+    ) -> bool:
+        if room.status is StoredRoomStatus.WAITING:
+            return True
+        if (
+            room.status is not StoredRoomStatus.ACTIVE
+            or not room.allow_spectators
+        ):
+            return False
+        game_id = self._game_id_by_room_id.get(room.id)
+        started = self._starts_by_game_id.get(game_id) if game_id else None
+        return started is not None and _active_start_matches(room, started)
+
     def find_active_game_id(
         self,
         *,
@@ -730,19 +884,43 @@ class InMemoryLobbyRepository:
                 return None
 
             game_id = self._game_id_by_room_id.get(room.id)
-            matching = tuple(
-                result
-                for result in self._starts_by_game_id.values()
-                if result.lobby.id == room.id
+            started = (
+                self._starts_by_game_id.get(game_id)
+                if game_id is not None
+                else None
             )
             if (
                 game_id is None
-                or len(matching) != 1
-                or matching[0].game_id != game_id
-                or not _active_start_matches(room, matching[0])
+                or started is None
+                or not _active_start_matches(room, started)
             ):
                 return None
             return game_id
+
+    def find_open_room_by_game_id(
+        self,
+        *,
+        historical_game_id: str,
+        user_id: str,
+    ) -> LobbyRoomSnapshot | None:
+        with self._lock:
+            started = self._starts_by_game_id.get(historical_game_id)
+            if (
+                started is None
+                or started.game_id != historical_game_id
+                or started.active_room.status
+                is not ActiveRoomStatus.FINISHED
+            ):
+                return None
+            room = self._rooms_by_id.get(started.lobby.id)
+            if (
+                room is None
+                or room.status
+                not in (StoredRoomStatus.WAITING, StoredRoomStatus.ACTIVE)
+                or room.member_for(user_id) is None
+            ):
+                return None
+            return room
 
     def join_waiting(
         self,
@@ -777,6 +955,59 @@ class InMemoryLobbyRepository:
             )
             self._rooms_by_id[room_id] = updated
             return updated
+
+    def join_active_spectator(
+        self,
+        *,
+        room_id: str,
+        user_id: str,
+    ) -> LobbyRoomSnapshot:
+        with self._lock:
+            room = self._rooms_by_id.get(room_id)
+            if room is None or room.status is StoredRoomStatus.CLOSED:
+                raise LobbyRoomNotFound("room not found")
+            if room.status is not StoredRoomStatus.ACTIVE:
+                raise LobbyStateError("room is not active")
+            existing = room.member_for(user_id)
+            if existing is not None:
+                if existing.role is RoomRole.SPECTATOR:
+                    return room
+                raise LobbyMemberError("member already has a different role")
+            if not room.allow_spectators:
+                raise SpectatorsDisabledError("spectators are disabled")
+
+            game_id = self._game_id_by_room_id.get(room.id)
+            started = (
+                self._starts_by_game_id.get(game_id)
+                if game_id is not None
+                else None
+            )
+            if started is None or not _active_start_matches(room, started):
+                raise LobbyStateError("active game is unavailable")
+
+            member = LobbyMember(
+                user_id,
+                RoomRole.SPECTATOR,
+                seat_index=None,
+            )
+            updated_room = replace(
+                room,
+                members=(*room.members, member),
+                revision=room.revision + 1,
+            )
+            updated_active = replace(
+                started.active_room,
+                spectators=(*started.active_room.spectators, user_id),
+                state_version=started.active_room.state_version + 1,
+            )
+            updated_start = LobbyStartResult(
+                updated_room,
+                started.game_id,
+                updated_active,
+            )
+            self._rooms_by_id[room.id] = updated_room
+            self._starts_by_game_id[started.game_id] = updated_start
+            return updated_room
 
     def set_ready(
         self,
@@ -858,6 +1089,78 @@ class InMemoryLobbyRepository:
             self._starts_by_game_id[game_id] = result
             self._game_id_by_room_id[room_id] = game_id
             return result
+
+    def record_finished_game(
+        self,
+        finished_room: ActiveRoomSnapshot,
+    ) -> None:
+        """Record an external coordinator finish in this reference store.
+
+        Production persists room turns through ``SQLAlchemyRoomRepository``.
+        The in-memory lobby has no separate coordinator store, so tests and
+        local prototypes use this hook before returning a room to waiting.
+        """
+
+        if (
+            finished_room.mode is not RoomMode.PVP
+            or finished_room.status is not ActiveRoomStatus.FINISHED
+        ):
+            raise ValueError("finished_room must be a finished PvP snapshot")
+        with self._lock:
+            game_id = finished_room.room_id
+            started = self._starts_by_game_id.get(game_id)
+            if started is None:
+                raise LobbyRoomNotFound("game not found")
+            if self._game_id_by_room_id.get(started.lobby.id) != game_id:
+                raise LobbyStateError("game is not the room's current round")
+            if finished_room.state_version < started.active_room.state_version:
+                raise LobbyRevisionConflict(self._rooms_by_id[started.lobby.id])
+            self._starts_by_game_id[game_id] = LobbyStartResult(
+                lobby=started.lobby,
+                game_id=game_id,
+                active_room=finished_room,
+            )
+
+    def return_finished_to_waiting(
+        self,
+        *,
+        requesting_user_id: str,
+        finished_game_id: str,
+    ) -> LobbyRoomSnapshot:
+        with self._lock:
+            started = self._starts_by_game_id.get(finished_game_id)
+            if started is None:
+                raise LobbyRoomNotFound("finished game not found")
+            room = self._rooms_by_id.get(started.lobby.id)
+            if room is None or room.status is StoredRoomStatus.CLOSED:
+                raise LobbyRoomNotFound("room not found")
+            if room.member_for(requesting_user_id) is None:
+                raise LobbyAuthorizationError(
+                    "only a current room member can request a rematch"
+                )
+            if self._game_id_by_room_id.get(room.id) != finished_game_id:
+                raise LobbyStateError("game is not the room's current round")
+            if started.active_room.status is not ActiveRoomStatus.FINISHED:
+                raise LobbyStateError("current game has not finished")
+            if room.status is StoredRoomStatus.WAITING:
+                return room
+            if room.status is not StoredRoomStatus.ACTIVE:
+                raise LobbyStateError("room cannot return to waiting")
+
+            members = tuple(
+                replace(member, ready=False)
+                if member.role is RoomRole.PLAYER and member.ready
+                else member
+                for member in room.members
+            )
+            waiting = replace(
+                room,
+                status=StoredRoomStatus.WAITING,
+                members=members,
+                revision=room.revision + 1,
+            )
+            self._rooms_by_id[room.id] = waiting
+            return waiting
 
     def leave_waiting(
         self,

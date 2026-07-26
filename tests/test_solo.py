@@ -1,24 +1,37 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
 
 from argon2 import PasswordHasher
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from shiritori.auth import AuthService
 from shiritori.bots import EasyBot, HardBot, NormalBot
 from shiritori.database import Database
-from shiritori.models import Game
+from shiritori.models import Game, MatchParticipation
 from shiritori.room_persistence import (
     RoomSnapshotCorruptError,
     SQLAlchemyRoomRepository,
 )
 from shiritori.room_runtime import RoomRuntime
-from shiritori.rooms import RoomCoordinator, RoomStatus
-from shiritori.solo import SoloGameService
+from shiritori.rooms import (
+    InMemoryRoomRepository,
+    RoomCoordinator,
+    RoomMode,
+    RoomStatus,
+    create_room_snapshot,
+)
+from shiritori.solo import (
+    SoloGameAuthorizationError,
+    SoloGameNotFound,
+    SoloGameService,
+    SoloGameStateError,
+)
 from shiritori.themes import ThemeCatalog
 
 
@@ -145,6 +158,125 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(game)
             self.assertEqual(game.theme_key, "all")
 
+    async def test_rematch_keeps_finished_game_and_copies_settings(self) -> None:
+        source = await self.service.create(
+            self.owner.id,
+            bot_count=3,
+            bot_difficulty="hard",
+            turn_seconds=45,
+            now=NOW,
+        )
+        with self.assertRaises(SoloGameStateError):
+            await self.service.rematch(
+                self.owner.id,
+                source.room_id,
+                now=NOW,
+            )
+
+        finished_outcome = await self.coordinator.surrender(
+            source.room_id,
+            self.owner.id,
+            expected_version=source.state_version,
+            operation_id="finish-for-rematch",
+            now=NOW,
+        )
+        finished = finished_outcome.snapshot
+        self.assertEqual(finished.status, RoomStatus.FINISHED)
+        with self.assertRaises(SoloGameAuthorizationError):
+            await self.service.rematch(
+                "different-user",
+                source.room_id,
+                now=NOW,
+            )
+        with self.assertRaises(SoloGameNotFound):
+            await self.service.rematch(
+                self.owner.id,
+                "missing-finished-game",
+                now=NOW,
+            )
+
+        pvp = create_room_snapshot(
+            "finished-pvp-game",
+            (self.owner.id, "guest"),
+            mode=RoomMode.PVP,
+            now=NOW,
+        )
+        finished_pvp = replace(
+            pvp,
+            status=RoomStatus.FINISHED,
+            deadline_at=None,
+            end_reason="no_legal_move",
+            state_version=1,
+        )
+        pvp_service = SoloGameService(
+            self.database,
+            RoomCoordinator(
+                InMemoryRoomRepository([finished_pvp]),
+                clock=lambda: NOW,
+            ),
+            self.runtime,
+            ThemeCatalog(),
+            strategy_resolver=lambda _: NormalBot(seed=3),
+        )
+        with self.assertRaises(SoloGameAuthorizationError):
+            await pvp_service.rematch(
+                self.owner.id,
+                finished_pvp.room_id,
+                now=NOW,
+            )
+
+        retried, duplicate = await asyncio.gather(
+            self.service.rematch(
+                self.owner.id,
+                source.room_id,
+                now=NOW,
+            ),
+            self.service.rematch(
+                self.owner.id,
+                source.room_id,
+                now=NOW,
+            ),
+        )
+
+        self.assertNotEqual(retried.room_id, source.room_id)
+        self.assertEqual(duplicate.room_id, retried.room_id)
+        self.assertEqual(retried.status, RoomStatus.ACTIVE)
+        self.assertEqual(retried.state_version, 0)
+        self.assertEqual(retried.history, ())
+        self.assertIsNone(retried.expected_kana)
+        self.assertEqual(retried.bot_difficulty, "hard")
+        self.assertEqual(retried.turn_seconds, 45)
+        self.assertEqual(retried.theme_key, source.theme_key)
+        self.assertEqual(
+            sum(
+                seat.owner_user_id is None
+                for seat in retried.players
+            ),
+            3,
+        )
+        self.assertEqual(
+            await self.coordinator.load_snapshot(source.room_id),
+            finished,
+        )
+        with self.database.read_session() as session:
+            participations = tuple(
+                session.scalars(
+                    select(MatchParticipation).where(
+                        MatchParticipation.game_id == source.room_id
+                    )
+                )
+            )
+        self.assertEqual(len(participations), 1)
+        with self.database.read_session() as session:
+            rematches = tuple(
+                session.scalars(
+                    select(Game).where(
+                        Game.rematch_of_game_id == source.room_id
+                    )
+                )
+            )
+        self.assertEqual(len(rematches), 1)
+        self.assertEqual(rematches[0].id, retried.room_id)
 
     async def test_paused_listing_rejects_projection_drift(self) -> None:
         snapshot = await self.service.create(self.owner.id, now=NOW)

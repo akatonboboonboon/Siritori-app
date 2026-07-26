@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from .bots import BotStrategy
 from .database import Database
@@ -25,6 +26,7 @@ from .rooms import (
     RoomCallback,
     RoomCoordinator,
     RoomMode,
+    RoomNotFound,
     RoomSnapshot,
     RoomStatus,
     SeatController,
@@ -46,6 +48,10 @@ class SoloGameNotFound(SoloGameError):
 
 class SoloGameAuthorizationError(SoloGameError):
     pass
+
+
+class SoloGameStateError(SoloGameError):
+    """Raised when a solo lifecycle command targets the wrong state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +159,124 @@ class SoloGameService:
         self.runtime.notify(snapshot.room_id)
         return snapshot
 
+    async def rematch(
+        self,
+        user_id: str,
+        finished_game_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> RoomSnapshot:
+        """Create a fresh game with the settings of one owned finished game.
+
+        The finished snapshot is read only and maps to exactly one fresh game
+        ID. Concurrent transport retries therefore converge on the same child
+        without overwriting or recording the completed match a second time.
+        """
+
+        owner = _identifier(user_id, "user_id")
+        finished_id = _identifier(finished_game_id, "finished_game_id")
+        try:
+            finished = await self.coordinator.load_snapshot(finished_id)
+        except RoomNotFound as error:
+            raise SoloGameNotFound(finished_id) from error
+        if finished.mode is not RoomMode.SOLO_BOT:
+            raise SoloGameAuthorizationError("game is not a solo Bot match")
+        if finished.seat_for_user(owner) is None:
+            raise SoloGameAuthorizationError(
+                "user does not own this solo game"
+            )
+        if finished.status is not RoomStatus.FINISHED:
+            raise SoloGameStateError(
+                "only a finished solo Bot match can be retried"
+            )
+
+        existing_id = await asyncio.to_thread(
+            self._find_rematch_id_sync,
+            finished_id,
+        )
+        if existing_id is not None:
+            return await self._load_existing_rematch(
+                owner,
+                finished,
+                existing_id,
+            )
+
+        permanent_bot_count = sum(
+            seat.owner_user_id is None for seat in finished.players
+        )
+        self._strategy_resolver(finished.bot_difficulty)
+        theme = self.themes.get(finished.theme_key)
+        created_at = now or datetime.now(timezone.utc)
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        created_at = created_at.astimezone(timezone.utc)
+        rematch = create_room_snapshot(
+            str(uuid4()),
+            (owner,),
+            mode=RoomMode.SOLO_BOT,
+            permanent_bot_count=permanent_bot_count,
+            turn_seconds=finished.turn_seconds,
+            theme_key=theme.theme_id,
+            bot_difficulty=finished.bot_difficulty,
+            now=created_at,
+        )
+        try:
+            await asyncio.to_thread(
+                self._insert_snapshot,
+                owner,
+                rematch,
+                created_at,
+                rematch_of_game_id=finished_id,
+            )
+        except IntegrityError:
+            existing_id = await asyncio.to_thread(
+                self._find_rematch_id_sync,
+                finished_id,
+            )
+            if existing_id is None:
+                raise
+            return await self._load_existing_rematch(
+                owner,
+                finished,
+                existing_id,
+            )
+        self.runtime.notify(rematch.room_id)
+        return rematch
+
+    async def _load_existing_rematch(
+        self,
+        owner_user_id: str,
+        source: RoomSnapshot,
+        game_id: str,
+    ) -> RoomSnapshot:
+        try:
+            existing = await self.coordinator.load_snapshot(game_id)
+        except RoomNotFound as error:
+            raise SoloGameStateError(
+                "the existing rematch is unavailable"
+            ) from error
+        expected_bot_count = sum(
+            seat.owner_user_id is None for seat in source.players
+        )
+        actual_bot_count = sum(
+            seat.owner_user_id is None for seat in existing.players
+        )
+        if (
+            existing.room_id == source.room_id
+            or existing.mode is not RoomMode.SOLO_BOT
+            or existing.seat_for_user(owner_user_id) is None
+            or actual_bot_count != expected_bot_count
+            or existing.bot_difficulty != source.bot_difficulty
+            or existing.theme_key != source.theme_key
+            or existing.turn_seconds != source.turn_seconds
+        ):
+            raise RoomSnapshotCorruptError(
+                "existing solo rematch settings disagree with its source"
+            )
+        if existing.status is RoomStatus.ACTIVE:
+            self.runtime.notify(existing.room_id)
+        return existing
+
     async def list_paused(self, user_id: str) -> tuple[PausedSoloGame, ...]:
         """List authoritative paused solo snapshots owned by ``user_id``."""
 
@@ -164,6 +288,8 @@ class SoloGameService:
         owner_user_id: str,
         snapshot: RoomSnapshot,
         created_at: datetime,
+        *,
+        rematch_of_game_id: str | None = None,
     ) -> None:
         document = serialize_room_snapshot(snapshot)
         with self.database.transaction() as session:
@@ -172,6 +298,7 @@ class SoloGameService:
                     id=snapshot.room_id,
                     room_id=None,
                     created_by_user_id=owner_user_id,
+                    rematch_of_game_id=rematch_of_game_id,
                     mode=GameMode.SOLO.value,
                     status=StoredGameStatus.ACTIVE.value,
                     theme_key=snapshot.theme_key,
@@ -196,6 +323,17 @@ class SoloGameService:
                 )
             )
             session.flush()
+
+    def _find_rematch_id_sync(
+        self,
+        finished_game_id: str,
+    ) -> str | None:
+        with self.database.read_session() as session:
+            return session.scalar(
+                select(Game.id).where(
+                    Game.rematch_of_game_id == finished_game_id
+                )
+            )
 
     def _list_paused_sync(
         self, owner_user_id: str
@@ -317,4 +455,5 @@ __all__ = [
     "SoloGameError",
     "SoloGameNotFound",
     "SoloGameService",
+    "SoloGameStateError",
 ]

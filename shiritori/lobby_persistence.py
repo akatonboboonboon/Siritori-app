@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from threading import Lock, RLock
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -46,6 +47,7 @@ from .models import (
 from .room_persistence import (
     RoomSnapshotCorruptError,
     deserialize_room_snapshot,
+    ensure_finished_match_participations,
     serialize_room_snapshot,
 )
 from .rooms import (
@@ -181,6 +183,46 @@ class SQLAlchemyLobbyRepository:
             )
             return tuple(_snapshot(session, room) for room in rooms)
 
+    def list_public_rooms(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[LobbyRoomSnapshot, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        with self.database.read_session() as session:
+            rooms = tuple(
+                session.scalars(
+                    select(Room)
+                    .where(
+                        Room.is_public.is_(True),
+                        or_(
+                            Room.status
+                            == StoredRoomStatus.WAITING.value,
+                            and_(
+                                Room.status
+                                == StoredRoomStatus.ACTIVE.value,
+                                Room.allow_spectators.is_(True),
+                                select(Game.id)
+                                .where(
+                                    Game.room_id == Room.id,
+                                    Game.id == Room.current_game_id,
+                                    Game.mode
+                                    == GameMode.MULTIPLAYER.value,
+                                    Game.status
+                                    == StoredGameStatus.ACTIVE.value,
+                                )
+                                .exists(),
+                            ),
+                        ),
+                        Room.deleted_at.is_(None),
+                    )
+                    .order_by(Room.created_at.asc(), Room.id.asc())
+                    .limit(limit)
+                )
+            )
+            return tuple(_snapshot(session, room) for room in rooms)
+
     def find_active_game_id(
         self,
         *,
@@ -222,17 +264,16 @@ class SQLAlchemyLobbyRepository:
             ):
                 return None
 
-            games = tuple(
-                session.scalars(
-                    select(Game)
-                    .where(Game.room_id == observed_room.id)
-                    .order_by(Game.id)
-                    .with_for_update()
-                )
-            )
-            if len(games) != 1:
+            current_game_id = observed_room.current_game_id
+            if current_game_id is None:
                 return None
-            game = games[0]
+            game = session.scalar(
+                select(Game)
+                .where(Game.id == current_game_id)
+                .with_for_update()
+            )
+            if game is None:
+                return None
             room = session.scalar(
                 select(Room)
                 .where(Room.id == observed_room.id)
@@ -244,6 +285,7 @@ class SQLAlchemyLobbyRepository:
                 or room.room_code != code
                 or room.deleted_at is not None
                 or room.status != StoredRoomStatus.ACTIVE.value
+                or room.current_game_id != game.id
             ):
                 return None
             memberships = _active_memberships(session, room.id, lock=True)
@@ -268,6 +310,72 @@ class SQLAlchemyLobbyRepository:
             if not _active_game_matches(room, memberships, game, active):
                 return None
             return game.id
+
+    def find_open_room_by_game_id(
+        self,
+        *,
+        historical_game_id: str,
+        user_id: str,
+    ) -> LobbyRoomSnapshot | None:
+        """Resolve a finished round's current open room without mutating it.
+
+        Authorization is checked in the same read transaction as the historical
+        game and room. Missing, closed, malformed, and unauthorized state all
+        fail closed as ``None``.
+        """
+
+        game_id = _identifier(
+            historical_game_id,
+            "historical_game_id",
+            36,
+        )
+        member_id = _identifier(user_id, "user_id", 36)
+        with self.database.read_session() as session:
+            game = session.get(Game, game_id)
+            if (
+                game is None
+                or game.room_id is None
+                or game.mode != GameMode.MULTIPLAYER.value
+                or game.status != StoredGameStatus.FINISHED.value
+            ):
+                return None
+            room = session.get(Room, game.room_id)
+            if (
+                room is None
+                or room.deleted_at is not None
+                or room.status
+                not in (
+                    StoredRoomStatus.WAITING.value,
+                    StoredRoomStatus.ACTIVE.value,
+                )
+                or (
+                    room.status == StoredRoomStatus.WAITING.value
+                    and room.current_game_id is not None
+                )
+                or (
+                    room.status == StoredRoomStatus.ACTIVE.value
+                    and room.current_game_id is None
+                )
+            ):
+                return None
+            member = session.get(
+                RoomMembership,
+                {"room_id": room.id, "user_id": member_id},
+            )
+            if (
+                member is None
+                or member.left_at is not None
+                or member.role
+                not in (RoomRole.PLAYER.value, RoomRole.SPECTATOR.value)
+            ):
+                return None
+            try:
+                snapshot = _snapshot(session, room)
+            except (TypeError, ValueError):
+                return None
+            if snapshot.member_for(member_id) is None:
+                return None
+            return snapshot
 
     def join_waiting(
         self,
@@ -342,6 +450,129 @@ class SQLAlchemyLobbyRepository:
             room.revision += 1
             room.updated_at = now
             session.flush()
+            return _snapshot(session, room)
+
+    def join_active_spectator(
+        self,
+        *,
+        room_id: str,
+        user_id: str,
+    ) -> LobbyRoomSnapshot:
+        """Add one public spectator to lobby membership and game state.
+
+        The Game row is locked before the Room row, matching coordinator CAS
+        and deletion order. Updating membership, lobby revision, and the
+        authoritative snapshot in one transaction prevents either subsystem
+        from observing a partially joined spectator.
+        """
+
+        room_identifier = _identifier(room_id, "room_id", 36)
+        member_id = _identifier(user_id, "user_id", 36)
+
+        with self._guard(), self.database.transaction() as session:
+            observed_room = session.scalar(
+                select(Room).where(
+                    Room.id == room_identifier,
+                    Room.deleted_at.is_(None),
+                )
+            )
+            if (
+                observed_room is None
+                or observed_room.status != StoredRoomStatus.ACTIVE.value
+                or observed_room.current_game_id is None
+            ):
+                raise LobbyStateError("active game is unavailable")
+            game = session.scalar(
+                select(Game)
+                .where(Game.id == observed_room.current_game_id)
+                .with_for_update()
+            )
+            if game is None:
+                raise LobbyStateError("active game is unavailable")
+            room = session.scalar(
+                select(Room)
+                .where(Room.id == room_identifier)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if room is None or room.deleted_at is not None:
+                raise LobbyRoomNotFound("room not found")
+            if (
+                room.status != StoredRoomStatus.ACTIVE.value
+                or room.current_game_id != game.id
+            ):
+                raise LobbyStateError("room is not active")
+
+            memberships = _active_memberships(session, room.id, lock=True)
+            existing = next(
+                (
+                    membership
+                    for membership in memberships
+                    if membership.user_id == member_id
+                ),
+                None,
+            )
+            try:
+                active = deserialize_room_snapshot(game.state_json or {})
+            except RoomSnapshotCorruptError as error:
+                raise LobbyStateError("active game is unavailable") from error
+            if not _active_game_matches(room, memberships, game, active):
+                raise LobbyStateError("active game is unavailable")
+            if existing is not None:
+                if existing.role == RoomRole.SPECTATOR.value:
+                    return _snapshot(session, room)
+                raise LobbyMemberError("member already has a different role")
+            if not room.allow_spectators:
+                raise SpectatorsDisabledError("spectators are disabled")
+
+            stored = session.get(
+                RoomMembership,
+                {"room_id": room.id, "user_id": member_id},
+            )
+            now = utc_now()
+            if stored is None:
+                stored = RoomMembership(room_id=room.id, user_id=member_id)
+                session.add(stored)
+            else:
+                stored.joined_at = now
+            stored.role = RoomRole.SPECTATOR.value
+            stored.seat_index = None
+            stored.presence = PresenceState.CONNECTED.value
+            stored.connected_count = 1
+            stored.is_bot_substituting = False
+            stored.ready = False
+            stored.last_seen_at = now
+            stored.presence_expires_at = None
+            stored.left_at = None
+
+            room.revision += 1
+            room.updated_at = now
+            session.flush()
+            updated_lobby = _snapshot(session, room)
+            updated_active = replace(
+                active,
+                spectators=tuple(
+                    member.user_id for member in updated_lobby.spectators
+                ),
+                state_version=active.state_version + 1,
+            )
+            game.state_json = serialize_room_snapshot(updated_active)
+            game.state_version = updated_active.state_version
+            game.updated_at = now
+            session.flush()
+
+            updated_memberships = _active_memberships(
+                session,
+                room.id,
+                lock=True,
+            )
+            if not _active_game_matches(
+                room,
+                updated_memberships,
+                game,
+                updated_active,
+            ):
+                raise LobbyStateError("active spectator join was inconsistent")
             return _snapshot(session, room)
 
     def set_ready(
@@ -453,6 +684,10 @@ class SQLAlchemyLobbyRepository:
                     finished_at=None,
                 )
                 session.add(game)
+                # ``rooms.current_game_id`` points at this row, so insert the
+                # Game before updating the Room (required with immediate FKs).
+                session.flush()
+                room.current_game_id = game_identifier
                 room.status = StoredRoomStatus.ACTIVE.value
                 room.revision += 1
                 room.updated_at = utc_now()
@@ -467,6 +702,132 @@ class SQLAlchemyLobbyRepository:
             if self._game_exists(game_identifier):
                 raise LobbyStateError("game ID already exists") from error
             raise
+
+    def return_finished_to_waiting(
+        self,
+        *,
+        requesting_user_id: str,
+        finished_game_id: str,
+    ) -> LobbyRoomSnapshot:
+        """Reopen the latest finished PvP round for the same members."""
+
+        member_id = _identifier(
+            requesting_user_id,
+            "requesting_user_id",
+            36,
+        )
+        game_identifier = _identifier(
+            finished_game_id,
+            "finished_game_id",
+            36,
+        )
+
+        with self._guard(), self.database.transaction() as session:
+            # Match coordinator lock order: Game, then lobby Room.
+            game = session.scalar(
+                select(Game)
+                .where(Game.id == game_identifier)
+                .with_for_update()
+            )
+            if (
+                game is None
+                or game.room_id is None
+                or game.mode != GameMode.MULTIPLAYER.value
+                or game.status != StoredGameStatus.FINISHED.value
+            ):
+                raise LobbyStateError("finished game is unavailable")
+            room = session.scalar(
+                select(Room)
+                .where(Room.id == game.room_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if room is None or room.deleted_at is not None:
+                raise LobbyRoomNotFound("room not found")
+
+            memberships = _active_memberships(
+                session,
+                room.id,
+                lock=True,
+            )
+            requesting_member = next(
+                (
+                    membership
+                    for membership in memberships
+                    if membership.user_id == member_id
+                ),
+                None,
+            )
+            if requesting_member is None:
+                raise LobbyAuthorizationError(
+                    "only a room member can return to waiting"
+                )
+            try:
+                finished = deserialize_room_snapshot(
+                    game.state_json or {}
+                )
+            except RoomSnapshotCorruptError as error:
+                raise LobbyStateError(
+                    "finished game is unavailable"
+                ) from error
+            if room.status == StoredRoomStatus.WAITING.value:
+                latest_game_id = session.scalar(
+                    select(Game.id)
+                    .where(Game.room_id == room.id)
+                    .order_by(Game.created_at.desc(), Game.id.desc())
+                    .limit(1)
+                )
+                if (
+                    room.current_game_id is not None
+                    or latest_game_id != game.id
+                ):
+                    raise LobbyStateError(
+                        "finished game is not the latest room round"
+                    )
+                # Membership can legitimately change after the automatic
+                # ACTIVE -> WAITING transition. Validate immutable historical
+                # projections here, not the old round's member layout.
+                if not _finished_game_projection_matches(
+                    room, game, finished
+                ):
+                    raise LobbyStateError("finished game is unavailable")
+                ensure_finished_match_participations(
+                    session,
+                    finished,
+                    finished_at=game.finished_at,
+                )
+                return _snapshot(session, room)
+            if (
+                room.status != StoredRoomStatus.ACTIVE.value
+                or room.current_game_id != game.id
+            ):
+                raise LobbyStateError(
+                    "finished game is not the current room round"
+                )
+            if not _finished_game_matches(
+                room,
+                memberships,
+                game,
+                finished,
+            ):
+                raise LobbyStateError("finished game is unavailable")
+
+            ensure_finished_match_participations(
+                session,
+                finished,
+                finished_at=game.finished_at,
+            )
+            now = utc_now()
+            for membership in memberships:
+                membership.ready = False
+                membership.is_bot_substituting = False
+                membership.last_seen_at = now
+            room.current_game_id = None
+            room.status = StoredRoomStatus.WAITING.value
+            room.revision += 1
+            room.updated_at = now
+            session.flush()
+            return _snapshot(session, room)
 
     def leave_waiting(
         self,
@@ -681,6 +1042,7 @@ def _active_game_matches(
     last_turn = active.history[-1] if active.history else None
     return (
         game.room_id == room.id
+        and room.current_game_id == game.id
         and game.mode == GameMode.MULTIPLAYER.value
         and game.status == StoredGameStatus.ACTIVE.value
         and game.id == active.room_id
@@ -715,6 +1077,113 @@ def _active_game_matches(
         and game.finished_at is None
         and active.spectators
         == tuple(spectator.user_id for spectator in spectators)
+    )
+
+
+def _finished_game_matches(
+    room: Room,
+    memberships: tuple[RoomMembership, ...],
+    game: Game,
+    finished: ActiveRoomSnapshot,
+) -> bool:
+    player_rows = tuple(
+        membership
+        for membership in memberships
+        if membership.role == RoomRole.PLAYER.value
+    )
+    if (
+        any(
+            membership.role
+            not in (RoomRole.PLAYER.value, RoomRole.SPECTATOR.value)
+            for membership in memberships
+        )
+        or any(
+            type(membership.seat_index) is not int
+            for membership in player_rows
+        )
+    ):
+        return False
+    players = tuple(
+        sorted(
+            player_rows,
+            key=lambda membership: int(membership.seat_index),
+        )
+    )
+    if tuple(player.seat_index for player in players) != tuple(
+        range(len(players))
+    ):
+        return False
+    spectators = tuple(
+        sorted(
+            (
+                membership
+                for membership in memberships
+                if membership.role == RoomRole.SPECTATOR.value
+            ),
+            key=lambda membership: membership.user_id,
+        )
+    )
+    expected_bot_count = _expected_bot_count_from_room(
+        room,
+        len(players),
+    )
+    return (
+        _finished_game_projection_matches(room, game, finished)
+        and expected_bot_count == game.bot_count
+        and _active_player_layout_matches(
+            tuple(player.user_id for player in players),
+            finished,
+            expected_bot_count,
+            require_human_control=False,
+        )
+        and finished.spectators
+        == tuple(spectator.user_id for spectator in spectators)
+    )
+
+
+def _finished_game_projection_matches(
+    room: Room,
+    game: Game,
+    finished: ActiveRoomSnapshot,
+) -> bool:
+    """Validate history without depending on the mutable waiting membership."""
+
+    settings = game.settings_json or {}
+    historical_bot_count = sum(
+        seat.owner_user_id is None for seat in finished.players
+    )
+    last_turn = finished.history[-1] if finished.history else None
+    return (
+        game.room_id == room.id
+        and game.mode == GameMode.MULTIPLAYER.value
+        and game.status == StoredGameStatus.FINISHED.value
+        and game.id == finished.room_id
+        and finished.mode is RoomMode.PVP
+        and finished.status is ActiveRoomStatus.FINISHED
+        and game.state_version == finished.state_version
+        and game.theme_key == finished.theme_key == room.theme_key
+        and game.turn_time_seconds
+        == finished.turn_seconds
+        == room.turn_seconds
+        and game.bot_difficulty == finished.bot_difficulty
+        and game.bot_count == historical_bot_count
+        and game.current_turn_index == finished.current_turn
+        and game.current_word_surface
+        == (last_turn.surface if last_turn is not None else None)
+        and game.current_word_reading
+        == (last_turn.reading if last_turn is not None else None)
+        and game.expected_kana == finished.expected_kana
+        and settings.get("room_code") == room.room_code
+        and settings.get("max_players") == room.max_players
+        and settings.get("allow_spectators") is room.allow_spectators
+        and settings.get("is_public", False) is room.is_public
+        and settings.get(
+            "fill_empty_seats_with_bots",
+            False,
+        )
+        is room.fill_empty_seats_with_bots
+        and game.deadline_at is None
+        and game.finished_at is not None
     )
 
 

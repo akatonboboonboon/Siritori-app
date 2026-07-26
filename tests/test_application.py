@@ -53,6 +53,23 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.services.runtime.active_room_ids, frozenset())
 
+    async def test_start_drains_all_expired_score_attack_batches(self) -> None:
+        class StubScoreAttack:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def finalize_expired_active_runs(self, *, limit: int = 100):
+                self.calls += 1
+                return tuple(range(limit)) if self.calls == 1 else ()
+
+        stub = StubScoreAttack()
+        self.services.score_attack = stub  # type: ignore[assignment]
+
+        await self.services.start()
+
+        self.assertEqual(stub.calls, 2)
+        self.assertTrue(self.services._started)
+
     async def test_runtime_bot_index_ignores_legacy_persisted_theme(
         self,
     ) -> None:

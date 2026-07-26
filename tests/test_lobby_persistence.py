@@ -22,6 +22,7 @@ from shiritori.lobby import (
     LobbyRevisionConflict,
     LobbyRoomNotFound,
     LobbyService,
+    LobbyStateError,
     SpectatorsDisabledError,
     room_name_key,
 )
@@ -29,6 +30,7 @@ from shiritori.lobby_persistence import SQLAlchemyLobbyRepository
 from shiritori.models import (
     Game,
     GameMode,
+    MatchParticipation,
     Room,
     RoomCommandReceipt,
     RoomMembership,
@@ -50,6 +52,9 @@ from shiritori.rooms import (
 
 GAME_ID = "00000000-0000-0000-0000-000000000101"
 STALE_GAME_ID = "00000000-0000-0000-0000-000000000102"
+PRIVATE_GAME_ID = "00000000-0000-0000-0000-000000000104"
+BLOCKED_GAME_ID = "00000000-0000-0000-0000-000000000105"
+REMATCH_GAME_ID = "00000000-0000-0000-0000-000000000106"
 
 
 class LobbyPersistenceTests(unittest.TestCase):
@@ -168,6 +173,427 @@ class LobbyPersistenceTests(unittest.TestCase):
         finally:
             restarted_database.dispose()
 
+    def test_finished_round_reopens_and_rematches_without_mutating_history(
+        self,
+    ) -> None:
+        lobby = self.create_room(max_players=3)
+        self.service.join_as_player(self.guest.id, lobby.room_code)
+        self.service.join_as_spectator(self.watcher.id, lobby.room_code)
+        self.service.set_ready(self.owner.id, lobby.room_code, ready=True)
+        self.service.set_ready(self.guest.id, lobby.room_code, ready=True)
+        first = self.service.start(self.owner.id, lobby.room_code)
+
+        async def finish_and_disconnect_all():
+            coordinator = RoomCoordinator(
+                SQLAlchemyRoomRepository(self.database)
+            )
+            await coordinator.connect_client(
+                first.game_id,
+                self.owner.id,
+                "owner-old-tab",
+            )
+            await coordinator.connect_client(
+                first.game_id,
+                self.guest.id,
+                "guest-old-tab",
+            )
+            outcome = await coordinator.surrender(
+                first.game_id,
+                self.owner.id,
+                expected_version=0,
+                operation_id="finish-before-sql-rematch",
+            )
+            pending = await coordinator.disconnect_client(
+                first.game_id,
+                "owner-old-tab",
+            )
+            await coordinator.disconnect_client(
+                first.game_id,
+                "guest-old-tab",
+            )
+            if pending is not None:
+                try:
+                    await pending
+                except asyncio.CancelledError:
+                    pass
+            return outcome.snapshot
+
+        finished = asyncio.run(finish_and_disconnect_all())
+        self.assertIsNotNone(finished)
+
+        # The finish transaction already made the lobby durable and waiting.
+        waiting = self.service.get_room(lobby.room_code)
+        self.assertEqual(waiting.status, StoredRoomStatus.WAITING)
+        self.assertEqual(waiting.room_code, lobby.room_code)
+        self.assertTrue(all(not player.ready for player in waiting.players))
+        self.assertEqual(
+            self.service.return_to_waiting(
+                self.watcher.id,
+                first.game_id,
+            ),
+            waiting,
+        )
+        self.assertEqual(
+            self.service.return_to_waiting(
+                self.owner.id,
+                first.game_id,
+            ),
+            waiting,
+        )
+
+        with self.database.read_session() as session:
+            old_game = session.get(Game, first.game_id)
+            old_state = dict(old_game.state_json)
+            old_finished_at = old_game.finished_at
+            rows = tuple(
+                session.scalars(
+                    select(MatchParticipation).where(
+                        MatchParticipation.game_id == first.game_id
+                    )
+                )
+            )
+            delete_receipts = tuple(
+                session.scalars(
+                    select(RoomCommandReceipt).where(
+                        RoomCommandReceipt.room_id == first.game_id,
+                        RoomCommandReceipt.command_kind == "delete",
+                    )
+                )
+            )
+            stored_lobby = session.get(Room, lobby.id)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(delete_receipts), 1)
+            self.assertFalse(delete_receipts[0].deleted)
+            self.assertEqual(
+                old_game.status,
+                StoredGameStatus.FINISHED.value,
+            )
+            self.assertIsNone(stored_lobby.current_game_id)
+            self.assertIsNone(stored_lobby.deleted_at)
+
+        # Exact retries remain read-only after legal waiting membership changes.
+        joined = self.service.join_as_player(
+            self.third.id,
+            lobby.room_code,
+        )
+        self.assertEqual(
+            self.service.return_to_waiting(
+                self.third.id,
+                first.game_id,
+            ),
+            joined,
+        )
+        after_spectator_leave = self.service.leave(
+            self.watcher.id,
+            lobby.room_code,
+        ).room
+        self.assertEqual(
+            self.service.return_to_waiting(
+                self.owner.id,
+                first.game_id,
+            ),
+            after_spectator_leave,
+        )
+
+        # Starting again creates a new Game and retains the finished history.
+        rematch_service = LobbyService(
+            self.repository,
+            game_id_factory=lambda: REMATCH_GAME_ID,
+            seat_picker=lambda _: 0,
+        )
+        for user_id in (self.owner.id, self.guest.id, self.third.id):
+            rematch_service.set_ready(user_id, lobby.room_code, ready=True)
+        second = rematch_service.start(self.owner.id, lobby.room_code)
+
+        self.assertEqual(second.game_id, REMATCH_GAME_ID)
+        self.assertEqual(second.active_room.history, ())
+        self.assertIsNone(second.active_room.expected_kana)
+        self.assertEqual(
+            tuple(seat.owner_user_id for seat in second.active_room.players),
+            (self.owner.id, self.guest.id, self.third.id),
+        )
+        self.assertEqual(
+            rematch_service.active_game_id(
+                self.third.id,
+                lobby.room_code,
+            ),
+            REMATCH_GAME_ID,
+        )
+        with self.database.read_session() as session:
+            old_game = session.get(Game, first.game_id)
+            stored_lobby = session.get(Room, lobby.id)
+            self.assertEqual(old_game.state_json, old_state)
+            self.assertEqual(old_game.finished_at, old_finished_at)
+            self.assertEqual(
+                stored_lobby.current_game_id,
+                REMATCH_GAME_ID,
+            )
+            self.assertEqual(
+                len(tuple(session.scalars(select(Game)))),
+                2,
+            )
+            self.assertEqual(
+                len(tuple(session.scalars(select(MatchParticipation)))),
+                2,
+            )
+        self.assertEqual(
+            rematch_service.open_room_for_game(
+                self.third.id,
+                first.game_id,
+            ),
+            second.lobby,
+        )
+        with self.assertRaises(LobbyRoomNotFound):
+            rematch_service.open_room_for_game(
+                "00000000-0000-0000-0000-000000000999",
+                first.game_id,
+            )
+        with self.assertRaises(LobbyStateError):
+            rematch_service.return_to_waiting(
+                self.owner.id,
+                first.game_id,
+            )
+
+    def test_active_public_spectator_join_updates_lobby_and_game_atomically(
+        self,
+    ) -> None:
+        lobby = self.create_room(is_public=True)
+        self.service.join_as_player(self.guest.id, lobby.room_code)
+        self.service.set_ready(self.owner.id, lobby.room_code, ready=True)
+        self.service.set_ready(self.guest.id, lobby.room_code, ready=True)
+        started = self.service.start(self.owner.id, lobby.room_code)
+
+        joined = self.service.join_as_spectator(
+            self.third.id,
+            lobby.room_code,
+        )
+
+        self.assertEqual(
+            tuple(member.user_id for member in joined.spectators),
+            (self.third.id,),
+        )
+        self.assertEqual(joined.revision, started.lobby.revision + 1)
+        self.assertEqual(
+            self.service.active_game_id(self.third.id, lobby.room_code),
+            started.game_id,
+        )
+        active_repository = SQLAlchemyRoomRepository(self.database)
+        active = asyncio.run(active_repository.load(started.game_id))
+        self.assertEqual(active.spectators, (self.third.id,))
+        self.assertEqual(active.state_version, 1)
+        with self.database.read_session() as session:
+            game = session.get(Game, started.game_id)
+            membership = session.get(
+                RoomMembership,
+                {"room_id": lobby.id, "user_id": self.third.id},
+            )
+            self.assertEqual(game.state_version, 1)
+            self.assertEqual(
+                membership.role,
+                RoomRole.SPECTATOR.value,
+            )
+            self.assertIsNone(membership.left_at)
+
+        same = self.service.join_as_spectator(
+            self.third.id,
+            lobby.room_code,
+        )
+        self.assertEqual(same.revision, joined.revision)
+        active = asyncio.run(active_repository.load(started.game_id))
+        self.assertEqual(active.state_version, 1)
+        self.assertEqual(active.spectators, (self.third.id,))
+
+    def test_concurrent_active_spectator_joins_preserve_both_members(
+        self,
+    ) -> None:
+        lobby = self.create_room(is_public=True)
+        self.service.join_as_player(self.guest.id, lobby.room_code)
+        self.service.set_ready(self.owner.id, lobby.room_code, ready=True)
+        self.service.set_ready(self.guest.id, lobby.room_code, ready=True)
+        started = self.service.start(self.owner.id, lobby.room_code)
+        second_database = Database(self.database_url)
+        second_service = LobbyService(
+            SQLAlchemyLobbyRepository(second_database)
+        )
+        services = (self.service, second_service)
+
+        def join(index_and_user: tuple[int, str]) -> str:
+            index, user_id = index_and_user
+            services[index].join_as_spectator(user_id, lobby.room_code)
+            return user_id
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                joined_ids = tuple(
+                    executor.map(
+                        join,
+                        (
+                            (0, self.third.id),
+                            (1, self.watcher.id),
+                        ),
+                    )
+                )
+        finally:
+            second_database.dispose()
+
+        self.assertEqual(
+            set(joined_ids),
+            {self.third.id, self.watcher.id},
+        )
+        current = self.service.get_room(lobby.room_code)
+        self.assertEqual(
+            tuple(member.user_id for member in current.spectators),
+            tuple(sorted((self.third.id, self.watcher.id))),
+        )
+        self.assertEqual(current.revision, started.lobby.revision + 2)
+        active = asyncio.run(
+            SQLAlchemyRoomRepository(self.database).load(started.game_id)
+        )
+        self.assertEqual(
+            active.spectators,
+            tuple(sorted((self.third.id, self.watcher.id))),
+        )
+        self.assertEqual(active.state_version, 2)
+        for user_id in (self.third.id, self.watcher.id):
+            self.assertEqual(
+                self.service.active_game_id(user_id, lobby.room_code),
+                started.game_id,
+            )
+
+    def test_active_join_rejects_player_and_disabled_rooms(
+        self,
+    ) -> None:
+        public = self.create_room(
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+        self.service.set_ready(self.owner.id, public.room_code, ready=True)
+        self.service.start(self.owner.id, public.room_code)
+        with self.assertRaises(LobbyStateError):
+            self.service.join_as_player(self.third.id, public.room_code)
+
+        private_service = LobbyService(
+            self.repository,
+            code_factory=lambda: "PRIV22",
+            game_id_factory=lambda: PRIVATE_GAME_ID,
+            seat_picker=lambda _: 0,
+        )
+        private = private_service.create_pvp_room(
+            self.guest.id,
+            name="Private active",
+            is_public=False,
+            fill_empty_seats_with_bots=True,
+        )
+        private_service.set_ready(
+            self.guest.id,
+            private.room_code,
+            ready=True,
+        )
+        private_service.start(self.guest.id, private.room_code)
+        private_joined = private_service.join_as_spectator(
+            self.watcher.id,
+            private.room_code,
+        )
+        self.assertEqual(
+            tuple(
+                member.user_id
+                for member in private_joined.spectators
+            ),
+            (self.watcher.id,),
+        )
+        self.assertNotIn(
+            private.id,
+            {room.id for room in self.repository.list_public_rooms()},
+        )
+        self.assertEqual(
+            private_service.active_game_id(
+                self.watcher.id,
+                private.room_code,
+            ),
+            PRIVATE_GAME_ID,
+        )
+        private_same = self.repository.join_active_spectator(
+            room_id=private.id,
+            user_id=self.watcher.id,
+        )
+        self.assertEqual(private_same.revision, private_joined.revision)
+
+        blocked_service = LobbyService(
+            self.repository,
+            code_factory=lambda: "BLOCK22",
+            game_id_factory=lambda: BLOCKED_GAME_ID,
+            seat_picker=lambda _: 0,
+        )
+        blocked = blocked_service.create_pvp_room(
+            self.third.id,
+            name="Blocked active",
+            is_public=True,
+            allow_spectators=False,
+            fill_empty_seats_with_bots=True,
+        )
+        blocked_service.set_ready(
+            self.third.id,
+            blocked.room_code,
+            ready=True,
+        )
+        blocked_service.start(self.third.id, blocked.room_code)
+        with self.assertRaises(SpectatorsDisabledError):
+            blocked_service.join_as_spectator(
+                self.watcher.id,
+                blocked.room_code,
+            )
+        with self.assertRaises(SpectatorsDisabledError):
+            self.repository.join_active_spectator(
+                room_id=blocked.id,
+                user_id=self.watcher.id,
+            )
+
+    def test_finished_game_reopens_and_late_spectator_joins_next_round(
+        self,
+    ) -> None:
+        lobby = self.create_room(is_public=True)
+        self.service.join_as_player(self.guest.id, lobby.room_code)
+        self.service.set_ready(self.owner.id, lobby.room_code, ready=True)
+        self.service.set_ready(self.guest.id, lobby.room_code, ready=True)
+        started = self.service.start(self.owner.id, lobby.room_code)
+        coordinator = RoomCoordinator(
+            SQLAlchemyRoomRepository(self.database)
+        )
+        asyncio.run(
+            coordinator.surrender(
+                started.game_id,
+                self.owner.id,
+                expected_version=0,
+                operation_id="owner-finish-before-late-watch",
+            )
+        )
+
+        joined = self.service.join_as_spectator(
+            self.third.id,
+            lobby.room_code,
+        )
+        self.assertEqual(joined.status, StoredRoomStatus.WAITING)
+        self.assertEqual(
+            tuple(member.user_id for member in joined.spectators),
+            (self.third.id,),
+        )
+        self.assertIn(
+            lobby.id,
+            {room.id for room in self.repository.list_public_rooms()},
+        )
+        finished = asyncio.run(
+            SQLAlchemyRoomRepository(self.database).load(started.game_id)
+        )
+        self.assertIsNotNone(finished)
+        self.assertNotIn(self.third.id, finished.spectators)
+        with self.database.read_session() as session:
+            membership = session.get(
+                RoomMembership,
+                {"room_id": lobby.id, "user_id": self.third.id},
+            )
+            self.assertIsNotNone(membership)
+            self.assertEqual(membership.role, RoomRole.SPECTATOR.value)
+
     def test_active_spectator_leave_closes_membership_atomically(self) -> None:
         lobby, started = self._start_lookup_room()
         coordinator = RoomCoordinator(
@@ -265,7 +691,7 @@ class LobbyPersistenceTests(unittest.TestCase):
         with self.assertRaises(LobbyRoomNotFound):
             self.service.active_game_id(self.owner.id, lobby.room_code)
 
-    def test_active_game_lookup_fails_closed_for_multiple_games(self) -> None:
+    def test_active_game_lookup_uses_current_pointer_with_game_history(self) -> None:
         lobby, _ = self._start_lookup_room()
         with self.database.transaction() as session:
             session.add(
@@ -287,8 +713,10 @@ class LobbyPersistenceTests(unittest.TestCase):
                 )
             )
 
-        with self.assertRaises(LobbyRoomNotFound):
-            self.service.active_game_id(self.owner.id, lobby.room_code)
+        self.assertEqual(
+            self.service.active_game_id(self.owner.id, lobby.room_code),
+            GAME_ID,
+        )
 
     def test_active_game_lookup_fails_closed_for_corrupt_snapshot(self) -> None:
         lobby, _ = self._start_lookup_room()
@@ -425,11 +853,13 @@ class LobbyPersistenceTests(unittest.TestCase):
             *,
             is_public: bool,
             fill: bool = False,
+            allow_spectators: bool = True,
+            game_id: str = STALE_GAME_ID,
         ):
             service = LobbyService(
                 self.repository,
                 code_factory=lambda: code,
-                game_id_factory=lambda: STALE_GAME_ID,
+                game_id_factory=lambda: game_id,
                 seat_picker=lambda _: 0,
             )
             room = service.create_pvp_room(
@@ -437,6 +867,7 @@ class LobbyPersistenceTests(unittest.TestCase):
                 name=name,
                 is_public=is_public,
                 fill_empty_seats_with_bots=fill,
+                allow_spectators=allow_spectators,
             )
             return service, room
 
@@ -453,6 +884,35 @@ class LobbyPersistenceTests(unittest.TestCase):
         )
         active_service.set_ready(self.third.id, active.room_code, ready=True)
         active_service.start(self.third.id, active.room_code)
+        blocked_service, blocked = create(
+            "LIST26",
+            self.owner.id,
+            "Active without spectators",
+            is_public=True,
+            fill=True,
+            allow_spectators=False,
+            game_id=BLOCKED_GAME_ID,
+        )
+        blocked_service.set_ready(
+            self.owner.id,
+            blocked.room_code,
+            ready=True,
+        )
+        blocked_service.start(self.owner.id, blocked.room_code)
+        private_service, private = create(
+            "LIST27",
+            self.guest.id,
+            "Private active",
+            is_public=False,
+            fill=True,
+            game_id=PRIVATE_GAME_ID,
+        )
+        private_service.set_ready(
+            self.guest.id,
+            private.room_code,
+            ready=True,
+        )
+        private_service.start(self.guest.id, private.room_code)
         deleted_service, deleted = create(
             "LIST24", self.watcher.id, "Deleted", is_public=True
         )
@@ -468,6 +928,13 @@ class LobbyPersistenceTests(unittest.TestCase):
         self.assertEqual(
             self.repository.list_public_waiting(limit=1),
             (first,),
+        )
+        self.assertEqual(
+            tuple(
+                room.id
+                for room in self.repository.list_public_rooms()
+            ),
+            (first.id, active.id, last.id),
         )
 
     def test_bot_fill_projection_is_durable_and_lookup_consistent(self) -> None:
@@ -808,6 +1275,10 @@ class LobbyPersistenceMigrationTests(unittest.TestCase):
                         column["name"]
                         for column in schema.get_columns("rooms")
                     }
+                    game_columns = {
+                        column["name"]
+                        for column in schema.get_columns("games")
+                    }
                     membership_columns = {
                         column["name"]
                         for column in schema.get_columns("room_memberships")
@@ -829,6 +1300,12 @@ class LobbyPersistenceMigrationTests(unittest.TestCase):
                         }.issubset(
                             room_columns
                         )
+                    )
+                    self.assertIn("current_game_id", room_columns)
+                    self.assertIn("rematch_of_game_id", game_columns)
+                    self.assertIn(
+                        "uq_rooms_current_game_id",
+                        {item["name"] for item in schema.get_unique_constraints("rooms")},
                     )
                     room_indexes = {
                         index["name"]: index
@@ -863,6 +1340,215 @@ class LobbyPersistenceMigrationTests(unittest.TestCase):
                     os.environ.pop("DIRECT_DATABASE_URL", None)
                 else:
                     os.environ["DIRECT_DATABASE_URL"] = previous
+
+    def test_current_game_migration_backfills_only_active_and_downgrades(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "current-round-migration.sqlite3")
+            url = f"sqlite+pysqlite:///{path.as_posix()}"
+            import os
+
+            previous = os.environ.get("DIRECT_DATABASE_URL")
+            os.environ["DIRECT_DATABASE_URL"] = url
+            try:
+                config = Config(str(root / "alembic.ini"))
+                command.upgrade(config, "0004_score_attack_runs")
+                before = Database(url)
+                try:
+                    with before.engine.begin() as connection:
+                        connection.execute(
+                            text(
+                                "INSERT INTO users "
+                                "(id, username, username_key, password_hash) "
+                                "VALUES "
+                                "('migration-owner', 'migration-owner', "
+                                "'migration-owner', 'not-a-real-hash')"
+                            )
+                        )
+                        connection.execute(
+                            text(
+                                "INSERT INTO rooms "
+                                "(id, room_code, owner_user_id, name, "
+                                "name_key, status) VALUES "
+                                "('active-room', 'ACTIVE1', "
+                                "'migration-owner', 'Active room', "
+                                "'active-room', 'active'), "
+                                "('waiting-room', 'WAIT001', "
+                                "'migration-owner', 'Waiting room', "
+                                "'waiting-room', 'waiting')"
+                            )
+                        )
+                        connection.execute(
+                            text(
+                                "INSERT INTO games "
+                                "(id, room_id, created_by_user_id, mode, "
+                                "status, created_at) VALUES "
+                                "('active-old', 'active-room', "
+                                "'migration-owner', 'multiplayer', 'finished', "
+                                "'2026-07-25 00:00:00'), "
+                                "('active-latest', 'active-room', "
+                                "'migration-owner', 'multiplayer', 'active', "
+                                "'2026-07-26 00:00:00'), "
+                                "('waiting-history', 'waiting-room', "
+                                "'migration-owner', 'multiplayer', 'finished', "
+                                "'2026-07-26 00:00:00')"
+                            )
+                        )
+                finally:
+                    before.dispose()
+
+                command.upgrade(config, "0005_room_current_game")
+                migrated = Database(url)
+                try:
+                    schema = inspect(migrated.engine)
+                    room_columns = {
+                        column["name"]
+                        for column in schema.get_columns("rooms")
+                    }
+                    game_columns = {
+                        column["name"]
+                        for column in schema.get_columns("games")
+                    }
+                    self.assertIn("current_game_id", room_columns)
+                    self.assertIn("rematch_of_game_id", game_columns)
+                    room_uniques = {
+                        constraint["name"]
+                        for constraint in schema.get_unique_constraints("rooms")
+                    }
+                    game_uniques = {
+                        constraint["name"]
+                        for constraint in schema.get_unique_constraints("games")
+                    }
+                    self.assertIn("uq_rooms_current_game_id", room_uniques)
+                    self.assertIn(
+                        "uq_games_rematch_of_game_id",
+                        game_uniques,
+                    )
+                    room_foreign_keys = {
+                        constraint["name"]: constraint
+                        for constraint in schema.get_foreign_keys("rooms")
+                    }
+                    game_foreign_keys = {
+                        constraint["name"]: constraint
+                        for constraint in schema.get_foreign_keys("games")
+                    }
+                    self.assertEqual(
+                        room_foreign_keys[
+                            "fk_rooms_current_game_id_games"
+                        ]["referred_table"],
+                        "games",
+                    )
+                    self.assertEqual(
+                        game_foreign_keys[
+                            "fk_games_rematch_of_game_id_games"
+                        ]["referred_table"],
+                        "games",
+                    )
+                    with migrated.engine.connect() as connection:
+                        pointers = {
+                            row.id: row.current_game_id
+                            for row in connection.execute(
+                                text(
+                                    "SELECT id, current_game_id FROM rooms"
+                                )
+                            )
+                        }
+                    self.assertEqual(
+                        pointers["active-room"],
+                        "active-latest",
+                    )
+                    self.assertIsNone(pointers["waiting-room"])
+                finally:
+                    migrated.dispose()
+
+                command.downgrade(config, "0004_score_attack_runs")
+                downgraded = Database(url)
+                try:
+                    schema = inspect(downgraded.engine)
+                    self.assertNotIn(
+                        "current_game_id",
+                        {
+                            column["name"]
+                            for column in schema.get_columns("rooms")
+                        },
+                    )
+                    self.assertNotIn(
+                        "rematch_of_game_id",
+                        {
+                            column["name"]
+                            for column in schema.get_columns("games")
+                        },
+                    )
+                finally:
+                    downgraded.dispose()
+            finally:
+                if previous is None:
+                    os.environ.pop("DIRECT_DATABASE_URL", None)
+                else:
+                    os.environ["DIRECT_DATABASE_URL"] = previous
+
+    def test_current_game_migration_emits_postgresql_round_trip_ddl(
+        self,
+    ) -> None:
+        """Compile upgrade/downgrade with PostgreSQL's Alembic dialect."""
+
+        from importlib import import_module
+        from io import StringIO
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        migration = import_module(
+            "migrations.versions.0005_room_current_game"
+        )
+        output = StringIO()
+        context = MigrationContext.configure(
+            url="postgresql://",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        operations = Operations(context)
+
+        class _EmptyResult:
+            @staticmethod
+            def scalars() -> tuple[()]:
+                return ()
+
+        class _OfflineOperations:
+            def __init__(self, delegate: Operations) -> None:
+                self.delegate = delegate
+
+            def __getattr__(self, name: str):
+                return getattr(self.delegate, name)
+
+            def get_bind(self):
+                return self
+
+            def execute(self, _statement):
+                return _EmptyResult()
+
+        original_op = migration.op
+        migration.op = _OfflineOperations(operations)
+        try:
+            migration.upgrade()
+            migration.downgrade()
+        finally:
+            migration.op = original_op
+
+        ddl = output.getvalue().lower()
+        self.assertIn("add column rematch_of_game_id", ddl)
+        self.assertIn("fk_games_rematch_of_game_id_games", ddl)
+        self.assertIn("uq_games_rematch_of_game_id", ddl)
+        self.assertIn("add column current_game_id", ddl)
+        self.assertIn("fk_rooms_current_game_id_games", ddl)
+        self.assertIn("uq_rooms_current_game_id", ddl)
+        self.assertIn(
+            "drop constraint uq_games_rematch_of_game_id",
+            ddl,
+        )
+        self.assertIn("drop column rematch_of_game_id", ddl)
+        self.assertIn("drop column current_game_id", ddl)
 
     def test_migration_normalizes_and_deduplicates_active_legacy_names(self) -> None:
         root = Path(__file__).resolve().parents[1]

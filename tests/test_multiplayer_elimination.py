@@ -53,7 +53,9 @@ class MultiplayerEliminationTests(unittest.IsolatedAsyncioTestCase):
     async def test_players_are_eliminated_to_spectators_until_one_remains(
         self,
     ) -> None:
-        repository = InMemoryRoomRepository([multiplayer_room()])
+        repository = InMemoryRoomRepository([
+            multiplayer_room(expected_kana="\u3042")
+        ])
         coordinator = RoomCoordinator(repository, clock=lambda: NOW)
 
         first = await coordinator.submit_user_turn(
@@ -71,15 +73,15 @@ class MultiplayerEliminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.snapshot.eliminated_seats, (0,))
         self.assertEqual(first.snapshot.active_seat_indexes, (1, 2, 3))
         self.assertEqual(first.snapshot.current_turn, 1)
-        self.assertIsNone(first.snapshot.expected_kana)
+        self.assertEqual(first.snapshot.expected_kana, "\u3042")
         self.assertEqual(first.snapshot.role_for_user("alice"), Role.SPECTATOR)
 
         second = await coordinator.submit_user_turn(
             "four-player-room",
             "bob",
-            surface="\u3044\u3093",
-            reading="\u3044\u3093",
-            canonical_key="\u3044\u3093",
+            surface="\u3042\u304b\u3093",
+            reading="\u3042\u304b\u3093",
+            canonical_key="\u3042\u304b\u3093",
             expected_version=1,
             operation_id="bob-loses",
             now=NOW + timedelta(seconds=1),
@@ -87,15 +89,16 @@ class MultiplayerEliminationTests(unittest.IsolatedAsyncioTestCase):
         assert second.snapshot is not None
         self.assertEqual(second.snapshot.status, RoomStatus.ACTIVE)
         self.assertEqual(second.snapshot.eliminated_seats, (0, 1))
+        self.assertEqual(second.snapshot.expected_kana, "\u3042")
         self.assertEqual(second.snapshot.current_turn, 2)
         self.assertEqual(second.snapshot.role_for_user("bob"), Role.SPECTATOR)
 
         final = await coordinator.submit_user_turn(
             "four-player-room",
             "carol",
-            surface="\u3046\u3093",
-            reading="\u3046\u3093",
-            canonical_key="\u3046\u3093",
+            surface="\u3042\u307e\u305e\u3093",
+            reading="\u3042\u307e\u305e\u3093",
+            canonical_key="\u3042\u307e\u305e\u3093",
             expected_version=2,
             operation_id="carol-loses",
             now=NOW + timedelta(seconds=2),

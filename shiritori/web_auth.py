@@ -34,8 +34,15 @@ from .auth import (
     canonicalize_username,
 )
 from .bots import canonical_kana
+from .game_session import SessionCode
 from .database import GameRepository
-from .lobby import LobbyError, LobbyNameConflict, LobbyService
+from .lobby import (
+    LobbyError,
+    LobbyNameConflict,
+    LobbyRoomSnapshot,
+    LobbyService,
+    LobbyStateError,
+)
 from .models import RoomRole, RoomStatus as StoredRoomStatus
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
@@ -51,8 +58,17 @@ from .rooms import (
     SeatController,
     WordSubmissionStatus,
 )
+from .score_attack import ScoreAttackSession, ScoreAttackStatus
+from .score_attack_persistence import (
+    SQLAlchemyScoreAttackService,
+    ScoreAttackActiveRunExistsError,
+    ScoreAttackPersistenceError,
+    ScoreAttackRunView,
+    StaleScoreAttackStateError,
+)
 from .settings import Settings
 from .solo import SoloGameAuthorizationError, SoloGameService
+from .statistics import StatisticsRepository
 
 
 _PLATFORM_CSS = (
@@ -72,6 +88,8 @@ class AuthWebServices:
     rooms: RoomCoordinator | None = None
     room_words: LexiconRoomService | None = None
     lobby: LobbyService | None = None
+    statistics: StatisticsRepository | None = None
+    score_attack: SQLAlchemyScoreAttackService | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +215,22 @@ def _can_surrender(snapshot: RoomSnapshot, user_id: str) -> bool:
         and seat.owner_user_id == user_id
         and seat.index not in snapshot.eliminated_seats
     )
+
+
+def _post_match_lobby_destination(
+    lobby: LobbyService,
+    user_id: str,
+    finished_game_id: str,
+) -> LobbyRoomSnapshot:
+    """Return the safe destination even if a newer round already started."""
+
+    try:
+        return lobby.return_to_waiting(user_id, finished_game_id)
+    except LobbyStateError:
+        # Finishing a PvP game already reopens its lobby atomically. A delayed
+        # browser callback may arrive after another tab has started the next
+        # round; resolve the still-authorized room without replaying mutation.
+        return lobby.open_room_for_game(user_id, finished_game_id)
 
 
 class CsrfProtector:
@@ -575,6 +609,8 @@ def register_auth_pages(
     rooms = services.rooms
     room_words = services.room_words
     lobby = services.lobby
+    statistics = services.statistics
+    score_attack = services.score_attack
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
@@ -775,6 +811,12 @@ def register_auth_pages(
                           <button class="logout-button" type="submit">ログアウト</button>
                         </form>
                         """
+                    )
+                with ui.row().classes("platform-nav"):
+                    ui.link("戦績", "/stats").classes("platform-link")
+                    ui.link("ランキング", "/rankings").classes("platform-link")
+                    ui.link("スコアアタック", "/score-attack").classes(
+                        "platform-link"
                     )
                 with ui.element("section").classes("dashboard-grid"):
                     with ui.column().classes("dashboard-card"):
@@ -1131,7 +1173,7 @@ def register_auth_pages(
                                     "lobby service is unavailable"
                                 )
                             listed_rooms = await asyncio.to_thread(
-                                lobby.list_public_waiting,
+                                lobby.list_public_rooms,
                                 limit=50,
                             )
                         except Exception:
@@ -1160,6 +1202,16 @@ def register_auth_pages(
                                             "min-w-0 gap-1"
                                         ):
                                             ui.label(
+                                                (
+                                                    "対戦中・観戦受付中"
+                                                    if listed_room.status
+                                                    is StoredRoomStatus.ACTIVE
+                                                    else "参加者募集中"
+                                                )
+                                            ).classes(
+                                                "public-room-status"
+                                            )
+                                            ui.label(
                                                 listed_room.name
                                             ).classes("aside-title")
                                             ui.label(
@@ -1176,6 +1228,725 @@ def register_auth_pages(
 
                 await refresh_public_rooms()
                 ui.timer(4.0, refresh_public_rooms)
+
+    @ui.page("/stats")
+    async def statistics_page(request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            return RedirectResponse("/login?next=/stats", status_code=303)
+        if statistics is None:
+            return RedirectResponse("/lobby", status_code=303)
+
+        user_id = principal.account.id
+        try:
+            summary, recent_matches, score_best = await asyncio.gather(
+                asyncio.to_thread(statistics.get_user_summary, user_id),
+                asyncio.to_thread(
+                    statistics.list_recent_matches,
+                    user_id,
+                    limit=20,
+                ),
+                asyncio.to_thread(
+                    statistics.get_score_attack_personal_best,
+                    user_id,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("failed to load match statistics")
+            return RedirectResponse("/lobby", status_code=303)
+
+        _page_shell()
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                with ui.row().classes("platform-nav"):
+                    ui.link("← ロビー", "/lobby").classes("platform-link")
+                    ui.link("ランキング", "/rankings").classes(
+                        "platform-link"
+                    )
+                    ui.link("スコアアタック", "/score-attack").classes(
+                        "platform-link"
+                    )
+                ui.label("あなたの戦績").classes("auth-title")
+                ui.label(
+                    "終了した対戦は、同じ操作が再送されても一度だけ記録されます。"
+                ).classes("platform-muted")
+                with ui.element("section").classes("stats-grid"):
+                    metrics = (
+                        ("対戦数", summary.games_played),
+                        ("勝ち", summary.wins),
+                        ("負け", summary.losses),
+                        ("勝率", f"{summary.win_rate * 100:.1f}%"),
+                        ("対人戦の勝ち", summary.pvp_wins),
+                        ("Bot戦の勝ち", summary.solo_wins),
+                        ("使った単語", summary.accepted_words),
+                        ("引き分け", summary.draws),
+                        (
+                            "最高スコア",
+                            score_best.score
+                            if score_best is not None else 0,
+                        ),
+                        (
+                            "最高スコアの単語数",
+                            score_best.accepted_count
+                            if score_best is not None else 0,
+                        ),
+                    )
+                    for label, value in metrics:
+                        with ui.column().classes("stat-card"):
+                            ui.label(str(value)).classes("stat-value")
+                            ui.label(label).classes("platform-muted")
+
+                with ui.column().classes("dashboard-card w-full"):
+                    ui.label("ランキング公開設定").classes("aside-title")
+                    ui.label(
+                        "オンにした場合だけ、表示名と対人戦の成績がランキングに載ります。"
+                    ).classes("platform-muted")
+                    visibility_busy = False
+                    confirmed_visibility = summary.leaderboard_visible
+
+                    async def update_visibility(event) -> None:
+                        nonlocal visibility_busy, confirmed_visibility
+                        if visibility_busy:
+                            visibility_switch.set_value(
+                                confirmed_visibility
+                            )
+                            return
+                        visibility_busy = True
+                        visibility_switch.disable()
+                        desired = bool(event.value)
+                        try:
+                            current_principal = await principal_for(request)
+                            if not _session_principal_matches_user(
+                                current_principal, user_id
+                            ):
+                                ui.navigate.to("/login?next=/stats")
+                                return
+                            confirmed_visibility = await asyncio.to_thread(
+                                statistics.set_leaderboard_visibility,
+                                user_id,
+                                desired,
+                            )
+                            visibility_switch.set_value(
+                                confirmed_visibility
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "failed to update leaderboard visibility"
+                            )
+                            visibility_switch.set_value(
+                                confirmed_visibility
+                            )
+                            ui.notify(
+                                "公開設定を保存できませんでした。再読み込みしてください。",
+                                type="negative",
+                            )
+                        else:
+                            ui.notify("公開設定を保存しました。", type="positive")
+                        finally:
+                            visibility_busy = False
+                            visibility_switch.enable()
+
+                    visibility_switch = ui.switch(
+                        "ランキングに自分の成績を表示する",
+                        value=summary.leaderboard_visible,
+                        on_change=update_visibility,
+                    )
+
+                with ui.column().classes("dashboard-card w-full"):
+                    ui.label("最近の対戦").classes("aside-title")
+                    if not recent_matches:
+                        ui.label(
+                            "まだ記録された対戦はありません。"
+                        ).classes("platform-muted")
+                    for match in recent_matches:
+                        mode = (
+                            "対人戦"
+                            if match.mode == "multiplayer"
+                            else "Bot戦"
+                        )
+                        result = {
+                            "win": "勝ち",
+                            "loss": "負け",
+                            "draw": "引き分け",
+                        }.get(match.result, match.result)
+                        placement = (
+                            f"{match.placement}位"
+                            if match.placement is not None
+                            else "順位なし"
+                        )
+                        with ui.row().classes(
+                            "recent-match-row w-full "
+                            "items-center justify-between gap-3"
+                        ):
+                            with ui.column().classes("min-w-0 gap-1"):
+                                ui.label(
+                                    f"{mode}・{result}・{placement}"
+                                ).classes("aside-title")
+                                ui.label(
+                                    f"{match.player_count}人戦・"
+                                    f"{match.move_count}語"
+                                ).classes("platform-muted")
+                            ui.label(
+                                match.finished_at.strftime("%Y-%m-%d")
+                            ).classes("platform-muted")
+
+    @ui.page("/rankings")
+    async def rankings_page(request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            return RedirectResponse(
+                "/login?next=/rankings", status_code=303
+            )
+        if statistics is None:
+            return RedirectResponse("/lobby", status_code=303)
+        try:
+            pvp_entries, score_entries = await asyncio.gather(
+                asyncio.to_thread(
+                    statistics.list_pvp_win_leaderboard,
+                    limit=50,
+                ),
+                asyncio.to_thread(
+                    statistics.list_score_attack_leaderboard,
+                    limit=50,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("failed to load leaderboard")
+            pvp_entries = ()
+            score_entries = ()
+
+        _page_shell()
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                with ui.row().classes("platform-nav"):
+                    ui.link("← ロビー", "/lobby").classes("platform-link")
+                    ui.link("自分の戦績", "/stats").classes("platform-link")
+                    ui.link("スコアアタック", "/score-attack").classes(
+                        "platform-link"
+                    )
+                ui.label("ランキング").classes("auth-title")
+                ui.label(
+                    "公開を選んだプレイヤーだけを表示します。"
+                ).classes("platform-muted")
+                with ui.column().classes("dashboard-card ranking-list w-full"):
+                    ui.label("3分スコアアタック").classes("aside-title")
+                    if not score_entries:
+                        ui.label(
+                            "公開中のスコアはまだありません。"
+                        ).classes("platform-muted")
+                    for entry in score_entries:
+                        with ui.row().classes(
+                            "ranking-row w-full items-center gap-3"
+                        ):
+                            ui.label(f"{entry.rank}位").classes(
+                                "ranking-position"
+                            )
+                            with ui.column().classes(
+                                "ranking-player min-w-0 gap-1"
+                            ):
+                                ui.label(entry.display_name).classes(
+                                    "aside-title"
+                                )
+                                ui.label(
+                                    f"{entry.accepted_count}語成功"
+                                ).classes("platform-muted")
+                            ui.label(f"{entry.score}点").classes(
+                                "stat-value"
+                            )
+                with ui.column().classes("dashboard-card ranking-list w-full"):
+                    ui.label("対人戦 勝利数").classes("aside-title")
+                    if not pvp_entries:
+                        ui.label(
+                            "公開中の戦績はまだありません。"
+                        ).classes("platform-muted")
+                    for entry in pvp_entries:
+                        with ui.row().classes(
+                            "ranking-row w-full items-center gap-3"
+                        ):
+                            ui.label(f"{entry.rank}位").classes(
+                                "ranking-position"
+                            )
+                            with ui.column().classes(
+                                "ranking-player min-w-0 gap-1"
+                            ):
+                                ui.label(entry.display_name).classes(
+                                    "aside-title"
+                                )
+                                ui.label(
+                                    f"{entry.games_played}戦・"
+                                    f"勝率 {entry.win_rate * 100:.1f}%"
+                                ).classes("platform-muted")
+                            ui.label(f"{entry.wins}勝").classes("stat-value")
+
+    @ui.page("/score-attack")
+    async def score_attack_page(request: Request):
+        principal = await principal_for(request)
+        if principal is None:
+            return RedirectResponse(
+                "/login?next=/score-attack", status_code=303
+            )
+        if score_attack is None:
+            return RedirectResponse("/lobby", status_code=303)
+
+        user_id = principal.account.id
+        try:
+            current_run = await asyncio.to_thread(
+                score_attack.resume_active,
+                user_id,
+            )
+        except Exception:
+            LOGGER.exception("failed to resume score attack")
+            current_run = None
+
+        _page_shell()
+        busy = False
+        with ui.element("main").classes("platform-shell"):
+            with ui.column().classes("platform-wrap"):
+                with ui.row().classes("platform-nav"):
+                    ui.link("← ロビー", "/lobby").classes("platform-link")
+                    ui.link("自分の戦績", "/stats").classes("platform-link")
+                    ui.link("ランキング", "/rankings").classes(
+                        "platform-link"
+                    )
+                ui.label("3分スコアアタック").classes("auth-title")
+                ui.label(
+                    "辞書にある単語を3分間でつなぎ、自己ベストを目指します。"
+                ).classes("platform-muted")
+
+                with ui.column().classes(
+                    "dashboard-card score-rules-card w-full"
+                ):
+                    ui.label("ルール").classes("aside-title")
+                    ui.label(
+                        "最初の単語は自由です。重複、「ん」で終わる単語、"
+                        "または時間切れで終了します。"
+                    ).classes("platform-muted")
+                    ui.label(
+                        "1語の得点 = 10 + 読みの長さ×2（最大30点）"
+                        " + 連鎖ボーナス（最大20点）"
+                    ).classes("platform-muted")
+
+                with ui.column().classes(
+                    "dashboard-card score-attack-card w-full"
+                ):
+                    with ui.row().classes(
+                        "score-summary w-full items-center gap-3"
+                    ):
+                        with ui.column().classes("score-metric"):
+                            score_label = ui.label("0").classes(
+                                "score-value"
+                            )
+                            ui.label("スコア").classes("platform-muted")
+                        with ui.column().classes("score-metric"):
+                            count_label = ui.label("0").classes(
+                                "stat-value"
+                            )
+                            ui.label("成功した単語").classes(
+                                "platform-muted"
+                            )
+                        deadline_label = ui.label(
+                            "開始前"
+                        ).classes("deadline-label deadline--normal")
+
+                    expected_label = ui.label(
+                        "開始ボタンを押すと3分の計測が始まります。"
+                    ).classes("aside-title")
+                    feedback_label = ui.label("").classes(
+                        "platform-muted"
+                    ).props("role='status' aria-live='polite'")
+
+                    start_button = ui.button(
+                        "3分スコアアタックを開始",
+                        icon="timer",
+                    ).props("unelevated no-caps").classes(
+                        "score-start-button"
+                    )
+
+                    with ui.column().classes(
+                        "score-active-panel w-full gap-3"
+                    ) as active_panel:
+                        word_input = ui.input(
+                            label="単語",
+                            placeholder="漢字・ひらがな・カタカナ",
+                        ).props(
+                            "outlined maxlength=30 autocomplete=off"
+                        ).classes("w-full")
+                        submit_button = ui.button(
+                            "送信",
+                            icon="send",
+                        ).props("unelevated no-caps").classes("w-full")
+                        reading_box = ui.column().classes(
+                            "score-reading-box w-full gap-2"
+                        )
+
+                    with ui.column().classes(
+                        "score-finished-panel w-full gap-2"
+                    ) as finished_panel:
+                        finish_label = ui.label("").classes("aside-title")
+                        ui.label(
+                            "結果は保存済みです。ランキング公開は戦績画面で選べます。"
+                        ).classes("platform-muted")
+
+                    ui.separator()
+                    ui.label("単語履歴").classes("aside-title")
+                    history_box = ui.column().classes(
+                        "game-history score-history w-full gap-2"
+                    )
+
+                def restored_attack(
+                    run: ScoreAttackRunView | None,
+                ) -> ScoreAttackSession | None:
+                    if run is None:
+                        return None
+                    try:
+                        return ScoreAttackSession.from_snapshot(run.snapshot)
+                    except ValueError:
+                        LOGGER.exception(
+                            "score attack snapshot failed UI validation"
+                        )
+                        return None
+
+                def update_deadline(
+                    run: ScoreAttackRunView | None,
+                ) -> bool:
+                    if (
+                        run is None
+                        or run.status
+                        != ScoreAttackStatus.ACTIVE.value
+                    ):
+                        return False
+                    deadline = _deadline_presentation(run.deadline_at)
+                    deadline_label.set_text(deadline.text)
+                    deadline_label.classes(
+                        add=f"deadline--{deadline.level}",
+                        remove=(
+                            "deadline--normal deadline--warning "
+                            "deadline--danger"
+                        ),
+                    )
+                    return deadline.expired
+
+                def render_history(
+                    attack: ScoreAttackSession | None,
+                ) -> None:
+                    history_box.clear()
+                    with history_box:
+                        if attack is None or not attack.history:
+                            ui.label(
+                                "まだ単語はありません。"
+                            ).classes("platform-muted")
+                            return
+                        for entry in reversed(attack.history):
+                            with ui.row().classes(
+                                "game-history-row w-full "
+                                "items-center justify-between gap-3"
+                            ):
+                                with ui.column().classes("min-w-0 gap-1"):
+                                    ui.label(entry.surface).classes(
+                                        "aside-title"
+                                    )
+                                    ui.label(entry.reading).classes(
+                                        "platform-muted"
+                                    )
+                                result_text = (
+                                    "終了語"
+                                    if entry.result.value == "ends_with_n"
+                                    else f"{entry.turn_number}語目"
+                                )
+                                ui.label(result_text).classes(
+                                    "platform-muted"
+                                )
+
+                async def choose_reading(reading: str) -> None:
+                    nonlocal busy, current_run
+                    if (
+                        busy
+                        or current_run is None
+                        or current_run.status
+                        != ScoreAttackStatus.ACTIVE.value
+                    ):
+                        return
+                    busy = True
+                    submit_button.disable()
+                    try:
+                        if not await score_page_session_valid():
+                            return
+                        outcome = await asyncio.to_thread(
+                            score_attack.resolve_reading,
+                            user_id=user_id,
+                            run_id=current_run.id,
+                            reading=reading,
+                            expected_version=current_run.state_version,
+                        )
+                        render_run(
+                            outcome.run,
+                            outcome.result.message
+                            if outcome.result is not None
+                            else None,
+                        )
+                    except StaleScoreAttackStateError:
+                        await refresh_after_conflict()
+                    except ScoreAttackPersistenceError:
+                        LOGGER.exception(
+                            "score attack reading choice failed"
+                        )
+                        feedback_label.set_text(
+                            "読みを確定できませんでした。再読み込みしてください。"
+                        )
+                    finally:
+                        busy = False
+                        if (
+                            current_run is not None
+                            and current_run.status
+                            == ScoreAttackStatus.ACTIVE.value
+                        ):
+                            submit_button.enable()
+
+                def render_reading_choices(
+                    attack: ScoreAttackSession | None,
+                ) -> None:
+                    reading_box.clear()
+                    if attack is None or attack.pending_reading is None:
+                        return
+                    with reading_box:
+                        ui.label("読みを選んでください").classes(
+                            "aside-title"
+                        )
+                        for reading in attack.pending_reading.readings:
+                            ui.button(
+                                reading,
+                                on_click=lambda selected=reading: (
+                                    choose_reading(selected)
+                                ),
+                            ).props("outline no-caps").classes("w-full")
+
+                def render_run(
+                    run: ScoreAttackRunView | None,
+                    message: str | None = None,
+                ) -> None:
+                    nonlocal current_run
+                    current_run = run
+                    attack = restored_attack(run)
+                    score_label.set_text(str(run.score if run else 0))
+                    count_label.set_text(
+                        str(run.accepted_count if run else 0)
+                    )
+                    render_history(attack)
+                    render_reading_choices(attack)
+                    is_active = (
+                        run is not None
+                        and run.status == ScoreAttackStatus.ACTIVE.value
+                        and attack is not None
+                    )
+                    active_panel.set_visibility(is_active)
+                    finished_panel.set_visibility(
+                        run is not None and not is_active
+                    )
+                    start_button.set_visibility(not is_active)
+
+                    if run is None:
+                        start_button.set_text("3分スコアアタックを開始")
+                        deadline_label.set_text("開始前")
+                        expected_label.set_text(
+                            "開始ボタンを押すと3分の計測が始まります。"
+                        )
+                        feedback_label.set_text(message or "")
+                        return
+                    if is_active and attack is not None:
+                        start_button.set_text("3分スコアアタックを開始")
+                        update_deadline(run)
+                        expected_label.set_text(
+                            "最初は好きな単語から"
+                            if attack.expected_kana is None
+                            else f"「{attack.expected_kana}」から始めてください"
+                        )
+                        feedback_label.set_text(
+                            message or "時計はサーバー側で進んでいます。"
+                        )
+                        word_input.enable()
+                        submit_button.enable()
+                        return
+
+                    deadline_label.set_text("終了")
+                    deadline_label.classes(
+                        add="deadline--normal",
+                        remove="deadline--warning deadline--danger",
+                    )
+                    reason = {
+                        "timeout": "3分が経過しました。",
+                        "ends_with_n": "「ん」で終わる単語を入力しました。",
+                        "duplicate": "同じ読みの単語を使いました。",
+                    }.get(run.finish_reason, "終了しました。")
+                    finish_label.set_text(
+                        f"{reason} 最終スコアは {run.score} 点です。"
+                    )
+                    feedback_label.set_text(message or reason)
+                    start_button.set_text("もう一度挑戦")
+
+                async def score_page_session_valid() -> bool:
+                    current_principal = await principal_for(request)
+                    if _session_principal_matches_user(
+                        current_principal, user_id
+                    ):
+                        return True
+                    score_timer.deactivate()
+                    ui.navigate.to("/login?next=/score-attack")
+                    return False
+
+                async def refresh_after_conflict() -> None:
+                    nonlocal current_run
+                    if current_run is None:
+                        return
+                    try:
+                        latest = await asyncio.to_thread(
+                            score_attack.get,
+                            user_id,
+                            current_run.id,
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to refresh stale score attack"
+                        )
+                        ui.navigate.to("/score-attack")
+                        return
+                    render_run(
+                        latest,
+                        "別の画面で行われた操作を反映しました。",
+                    )
+
+                async def start_run() -> None:
+                    nonlocal busy, current_run
+                    if busy:
+                        return
+                    busy = True
+                    start_button.disable()
+                    try:
+                        if not await score_page_session_valid():
+                            return
+                        try:
+                            started = await asyncio.to_thread(
+                                score_attack.start,
+                                user_id,
+                            )
+                        except ScoreAttackActiveRunExistsError:
+                            started = await asyncio.to_thread(
+                                score_attack.resume_active,
+                                user_id,
+                            )
+                            if started is None:
+                                raise
+                        render_run(
+                            started,
+                            "開始しました。最初の単語は自由です。",
+                        )
+                        word_input.set_value("")
+                        word_input.run_method("focus")
+                    except ScoreAttackPersistenceError:
+                        LOGGER.exception("failed to start score attack")
+                        feedback_label.set_text(
+                            "開始できませんでした。再読み込みしてください。"
+                        )
+                    finally:
+                        busy = False
+                        start_button.enable()
+
+                async def submit_word() -> None:
+                    nonlocal busy, current_run
+                    if (
+                        busy
+                        or current_run is None
+                        or current_run.status
+                        != ScoreAttackStatus.ACTIVE.value
+                    ):
+                        return
+                    busy = True
+                    submit_button.disable()
+                    try:
+                        if not await score_page_session_valid():
+                            return
+                        outcome = await asyncio.to_thread(
+                            score_attack.submit,
+                            user_id=user_id,
+                            run_id=current_run.id,
+                            surface=str(word_input.value or ""),
+                            expected_version=current_run.state_version,
+                        )
+                        result = outcome.result
+                        render_run(
+                            outcome.run,
+                            result.message if result is not None else None,
+                        )
+                        if (
+                            result is not None
+                            and result.code
+                            not in {
+                                SessionCode.LEXICON_REJECTED,
+                                SessionCode.NOT_CHAINED,
+                                SessionCode.INVALID_LEXICON_RESULT,
+                            }
+                        ):
+                            word_input.set_value("")
+                        if (
+                            outcome.run.status
+                            == ScoreAttackStatus.ACTIVE.value
+                        ):
+                            word_input.run_method("focus")
+                    except StaleScoreAttackStateError:
+                        await refresh_after_conflict()
+                    except ScoreAttackPersistenceError:
+                        LOGGER.exception("score attack submission failed")
+                        feedback_label.set_text(
+                            "送信できませんでした。再読み込みしてください。"
+                        )
+                    finally:
+                        busy = False
+                        if (
+                            current_run is not None
+                            and current_run.status
+                            == ScoreAttackStatus.ACTIVE.value
+                        ):
+                            submit_button.enable()
+
+                async def tick_score_attack() -> None:
+                    nonlocal busy, current_run
+                    if (
+                        busy
+                        or current_run is None
+                        or current_run.status
+                        != ScoreAttackStatus.ACTIVE.value
+                    ):
+                        return
+                    if not await score_page_session_valid():
+                        return
+                    if not update_deadline(current_run):
+                        return
+                    busy = True
+                    submit_button.disable()
+                    try:
+                        outcome = await asyncio.to_thread(
+                            score_attack.expire,
+                            user_id=user_id,
+                            run_id=current_run.id,
+                            expected_version=current_run.state_version,
+                        )
+                        render_run(
+                            outcome.run,
+                            outcome.result.message
+                            if outcome.result is not None
+                            else None,
+                        )
+                    except StaleScoreAttackStateError:
+                        await refresh_after_conflict()
+                    except ScoreAttackPersistenceError:
+                        LOGGER.exception("score attack timeout failed")
+                    finally:
+                        busy = False
+
+                start_button.on("click", start_run)
+                submit_button.on("click", submit_word)
+                word_input.on("keydown.enter", submit_word)
+                render_run(current_run)
+                score_timer = ui.timer(0.5, tick_score_attack)
 
     @ui.page("/join/{room_code}")
     async def room_invite_page(room_code: str, request: Request):
@@ -1212,7 +1983,8 @@ def register_auth_pages(
             )
         if (
             initial_room is not None
-            and initial_room.status is not StoredRoomStatus.WAITING
+            and initial_room.status is StoredRoomStatus.ACTIVE
+            and not initial_room.allow_spectators
         ):
             initial_room = None
 
@@ -1318,6 +2090,8 @@ def register_auth_pages(
                             if (
                                 len(initial_room.players)
                                 < initial_room.max_players
+                                and initial_room.status
+                                is StoredRoomStatus.WAITING
                             ):
                                 player_join_button.enable()
                             if initial_room.allow_spectators:
@@ -1338,10 +2112,16 @@ def register_auth_pages(
                         ),
                     ).props("outline no-caps").classes("w-full")
                     if (
-                        len(initial_room.players)
+                        initial_room.status is StoredRoomStatus.ACTIVE
+                        or len(initial_room.players)
                         >= initial_room.max_players
                     ):
                         player_join_button.disable()
+                        if (
+                            initial_room.status
+                            is StoredRoomStatus.ACTIVE
+                        ):
+                            player_join_button.set_text("試合中（観戦のみ）")
                     if not initial_room.allow_spectators:
                         spectator_join_button.disable()
                         spectator_join_button.set_text(
@@ -1669,6 +2449,8 @@ def register_auth_pages(
         attaching = False
         submitting = False
         surrendering = False
+        post_match_transitioning = False
+        post_match_task: asyncio.Task[None] | None = None
         polling = False
         session_invalidated = False
 
@@ -1828,6 +2610,28 @@ def register_auth_pages(
                 surrender_button.enable()
             else:
                 surrender_button.disable()
+            finished = snapshot.status is RoomStatus.FINISHED
+            is_solo = snapshot.mode is RoomMode.SOLO_BOT
+            post_match_panel.set_visibility(finished)
+            solo_rematch_button.set_visibility(finished and is_solo)
+            waiting_room_button.set_visibility(finished and not is_solo)
+            if finished and is_solo:
+                post_match_label.set_text(
+                    "Bot数・難易度・制限時間を変えずに、"
+                    "新しい対局へ挑戦できます。"
+                )
+            elif finished:
+                post_match_label.set_text(
+                    "この部屋は終了後も残ります。"
+                    "まもなく全員を待機画面へ戻します。"
+                )
+            if post_match_transitioning:
+                solo_rematch_button.disable()
+                waiting_room_button.disable()
+            else:
+                solo_rematch_button.enable()
+                waiting_room_button.enable()
+
 
             if snapshot.status is RoomStatus.FINISHED:
                 reasons = {
@@ -1926,6 +2730,14 @@ def register_auth_pages(
                     )
                 )
 
+        def schedule_return_to_waiting_room() -> None:
+            nonlocal post_match_task
+            if post_match_task is not None and not post_match_task.done():
+                return
+            post_match_task = asyncio.create_task(
+                return_to_waiting_room(delay_seconds=1.5)
+            )
+
         async def on_room_event(event: RoomEvent) -> None:
             if (
                 session_invalidated
@@ -1937,6 +2749,11 @@ def register_auth_pages(
             try:
                 with client:
                     render(event.snapshot)
+                    if (
+                        event.snapshot.status is RoomStatus.FINISHED
+                        and event.snapshot.mode is RoomMode.PVP
+                    ):
+                        schedule_return_to_waiting_room()
             except Exception:
                 LOGGER.exception("failed to render room event")
 
@@ -2026,6 +2843,11 @@ def register_auth_pages(
                     submit_button.disable()
                     return
                 render(snapshot)
+                if (
+                    snapshot.status is RoomStatus.FINISHED
+                    and snapshot.mode is RoomMode.PVP
+                ):
+                    schedule_return_to_waiting_room()
             except RoomError:
                 feedback_label.set_text(
                     "対局が終了しました。"
@@ -2228,6 +3050,94 @@ def register_auth_pages(
                 if current_snapshot is not None:
                     render(current_snapshot)
 
+        async def rematch_solo(_event: object | None = None) -> None:
+            nonlocal post_match_transitioning
+            snapshot = current_snapshot
+            if (
+                post_match_transitioning
+                or snapshot is None
+                or snapshot.status is not RoomStatus.FINISHED
+                or snapshot.mode is not RoomMode.SOLO_BOT
+            ):
+                return
+            post_match_transitioning = True
+            solo_rematch_button.disable()
+            post_match_label.set_text("同じ設定で新しい対局を準備しています。")
+            try:
+                if not await play_session_is_valid():
+                    return
+                rematch = await solo.rematch(user_id, game_id)
+            except (SoloGameAuthorizationError, RoomError):
+                LOGGER.exception("failed to create solo rematch")
+                post_match_label.set_text(
+                    "再戦を準備できませんでした。もう一度お試しください。"
+                )
+            except Exception:
+                LOGGER.exception("unexpected solo rematch failure")
+                post_match_label.set_text(
+                    "再戦を準備できませんでした。もう一度お試しください。"
+                )
+            else:
+                poll_timer.deactivate()
+                ui.navigate.to(f"/play/{rematch.room_id}")
+                return
+            finally:
+                post_match_transitioning = False
+                if not session_invalidated and not client.is_deleted:
+                    solo_rematch_button.enable()
+
+        async def return_to_waiting_room(
+            _event: object | None = None,
+            *,
+            delay_seconds: float = 0.0,
+        ) -> None:
+            nonlocal post_match_transitioning
+            snapshot = current_snapshot
+            if (
+                post_match_transitioning
+                or snapshot is None
+                or snapshot.status is not RoomStatus.FINISHED
+                or snapshot.mode is not RoomMode.PVP
+                or lobby is None
+            ):
+                return
+            post_match_transitioning = True
+            waiting_room_button.disable()
+            post_match_label.set_text(
+                "対局結果を保存しました。待機画面へ戻ります。"
+            )
+            try:
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+                if client.is_deleted or not await play_session_is_valid():
+                    return
+                waiting_room = await asyncio.to_thread(
+                    _post_match_lobby_destination,
+                    lobby,
+                    user_id,
+                    game_id,
+                )
+            except LobbyError:
+                LOGGER.exception("failed to return finished match to lobby")
+                post_match_label.set_text(
+                    "待機画面へ自動で戻れませんでした。"
+                    "ボタンからもう一度お試しください。"
+                )
+            except Exception:
+                LOGGER.exception("unexpected post-match lobby failure")
+                post_match_label.set_text(
+                    "待機画面へ自動で戻れませんでした。"
+                    "ボタンからもう一度お試しください。"
+                )
+            else:
+                poll_timer.deactivate()
+                ui.navigate.to(f"/room/{waiting_room.room_code}")
+                return
+            finally:
+                post_match_transitioning = False
+                if not session_invalidated and not client.is_deleted:
+                    waiting_room_button.enable()
+
         with ui.element("main").classes("platform-shell"):
             with ui.column().classes("platform-wrap"):
                 with ui.row().classes(
@@ -2285,6 +3195,25 @@ def register_auth_pages(
                         ).classes("platform-muted").props(
                             "role='status' aria-live='polite'"
                         )
+                        with ui.column().classes(
+                            "post-match-actions w-full gap-2"
+                        ) as post_match_panel:
+                            post_match_label = ui.label("").classes(
+                                "platform-muted"
+                            ).props(
+                                "role='status' aria-live='polite'"
+                            )
+                            solo_rematch_button = ui.button(
+                                "同じ設定でもう一度挑戦",
+                                icon="replay",
+                                on_click=rematch_solo,
+                            ).props("unelevated no-caps").classes("w-full")
+                            waiting_room_button = ui.button(
+                                "待機部屋へ戻る",
+                                icon="groups",
+                                on_click=return_to_waiting_room,
+                            ).props("unelevated no-caps").classes("w-full")
+                        post_match_panel.set_visibility(False)
                         login_link = ui.link(
                             "ログインし直す",
                             f"/login?next=/play/{game_id}",

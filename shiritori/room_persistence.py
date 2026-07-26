@@ -21,6 +21,8 @@ from .database import Database
 from .models import (
     Game,
     GameMode,
+    MatchParticipation,
+    MatchResult,
     PresenceState,
     Room,
     RoomCommandReceipt,
@@ -378,6 +380,8 @@ class SQLAlchemyRoomRepository:
             ))
             room_ids: list[str] = []
             for game in games:
+                if not _pvp_game_is_current(session, game):
+                    continue
                 state = game.state_json or {}
                 # Active Games belonging to another subsystem have no marker
                 # and are outside this repository. Once a marker is present,
@@ -405,6 +409,7 @@ class SQLAlchemyRoomRepository:
                     Game.status == StoredGameStatus.FINISHED.value,
                     Game.mode == GameMode.MULTIPLAYER.value,
                     Room.status == StoredRoomStatus.ACTIVE.value,
+                    Game.id == Room.current_game_id,
                     Room.deleted_at.is_(None),
                 )
             ))
@@ -413,6 +418,8 @@ class SQLAlchemyRoomRepository:
                 (*active_games, *finished_pvp_games),
                 key=lambda candidate: candidate.id,
             ):
+                if not _pvp_game_is_current(session, game):
+                    continue
                 state = game.state_json or {}
                 # Games belonging to another subsystem have no coordinator
                 # marker and remain outside this repository.
@@ -526,6 +533,12 @@ class SQLAlchemyRoomRepository:
                     RepositoryStatus.VERSION_CONFLICT,
                     current_snapshot=current,
                 )
+            if not _pvp_game_is_current(session, game, lock=True):
+                return RepositoryResult(
+                    RepositoryStatus.VERSION_CONFLICT,
+                    current_snapshot=current,
+                )
+            changed_at = utc_now()
             changed = session.execute(
                 update(Game)
                 .where(
@@ -533,7 +546,13 @@ class SQLAlchemyRoomRepository:
                     Game.state_version == expected_version,
                     Game.status != StoredGameStatus.ABANDONED.value,
                 )
-                .values(**_projection_values(next_snapshot, document))
+                .values(
+                    **_projection_values(
+                        next_snapshot,
+                        document,
+                        changed_at=changed_at,
+                    )
+                )
                 .execution_options(synchronize_session=False)
             )
             if changed.rowcount != 1:
@@ -545,12 +564,27 @@ class SQLAlchemyRoomRepository:
                     fingerprint=fingerprint,
                     expected_version=expected_version,
                 )
+            finished_now = (
+                current.status is not RoomStatus.FINISHED
+                and next_snapshot.status is RoomStatus.FINISHED
+            )
+            if finished_now:
+                ensure_finished_match_participations(
+                    session, next_snapshot, finished_at=changed_at
+                )
             _reconcile_departed_spectators(
                 session,
                 game,
                 current,
                 next_snapshot,
             )
+            if finished_now and next_snapshot.mode is RoomMode.PVP:
+                _return_finished_pvp_lobby_to_waiting(
+                    session,
+                    game,
+                    next_snapshot,
+                    changed_at=changed_at,
+                )
             stored = RoomCommandReceipt(
                 room_id=room_id,
                 operation_id=operation_id,
@@ -644,6 +678,44 @@ class SQLAlchemyRoomRepository:
                     RepositoryStatus.VERSION_CONFLICT,
                     current_snapshot=current,
                 )
+            if not _pvp_game_is_current(session, game, lock=True):
+                # The last browser disconnect may arrive after this exact
+                # finished round has already returned its lobby to waiting (or
+                # started the next round). Persist a successful no-op receipt:
+                # the old Game and its immutable match rows must remain intact.
+                if (
+                    current.mode is RoomMode.PVP
+                    and current.status is RoomStatus.FINISHED
+                    and game.status == StoredGameStatus.FINISHED.value
+                ):
+                    document = serialize_room_snapshot(current)
+                    session.add(RoomCommandReceipt(
+                        room_id=room_id,
+                        operation_id=operation_id,
+                        command_kind="delete",
+                        command_fingerprint=fingerprint,
+                        expected_version=expected_version,
+                        result_snapshot_json=document,
+                        deleted=False,
+                    ))
+                    session.flush()
+                    receipt = CommandReceipt(
+                        operation_id=operation_id,
+                        snapshot=current,
+                        command_kind="delete",
+                        fingerprint=fingerprint,
+                        expected_version=expected_version,
+                        deleted=False,
+                    )
+                    return RepositoryResult(
+                        RepositoryStatus.APPLIED,
+                        receipt=receipt,
+                        current_snapshot=current,
+                    )
+                return RepositoryResult(
+                    RepositoryStatus.VERSION_CONFLICT,
+                    current_snapshot=current,
+                )
             now = utc_now()
             deleted_state = {
                 _SCHEMA_KEY: SNAPSHOT_SCHEMA_VERSION,
@@ -664,7 +736,7 @@ class SQLAlchemyRoomRepository:
                     status=StoredGameStatus.ABANDONED.value,
                     deadline_at=None,
                     updated_at=now,
-                    finished_at=now,
+                    finished_at=game.finished_at or now,
                 )
                 .execution_options(synchronize_session=False)
             )
@@ -683,6 +755,7 @@ class SQLAlchemyRoomRepository:
                     .where(Room.id == game.room_id)
                     .values(
                         status=StoredRoomStatus.CLOSED.value,
+                        current_game_id=None,
                         deleted_at=now,
                         updated_at=now,
                     )
@@ -806,8 +879,12 @@ class _NullLock:
         return None
 
 def _projection_values(
-    snapshot: RoomSnapshot, document: dict[str, Any]
+    snapshot: RoomSnapshot,
+    document: dict[str, Any],
+    *,
+    changed_at: datetime | None = None,
 ) -> dict[str, Any]:
+    stored_at = changed_at or utc_now()
     last_turn = snapshot.history[-1] if snapshot.history else None
     paused = snapshot.paused_remaining_seconds
     return {
@@ -833,9 +910,213 @@ def _projection_values(
         # The projection is integer by schema; exact fractional state remains JSON.
         "paused_remaining_seconds": math.ceil(paused) if paused is not None else None,
         "winner_user_id": _winner(snapshot),
-        "updated_at": utc_now(),
-        "finished_at": utc_now() if snapshot.status is RoomStatus.FINISHED else None,
+        "updated_at": stored_at,
+        "finished_at": (
+            stored_at if snapshot.status is RoomStatus.FINISHED else None
+        ),
     }
+
+
+def ensure_finished_match_participations(
+    session: Any,
+    snapshot: RoomSnapshot,
+    *,
+    finished_at: datetime | None,
+) -> None:
+    """Ensure immutable human result rows exist exactly once.
+
+    A coordinator finish and a lobby rematch request can race or retry.  Both
+    paths call this helper in their transaction, so exact existing rows are
+    accepted, missing rows are repaired, and conflicting/extra rows fail
+    closed instead of silently rewriting history.
+    """
+
+    if snapshot.status is not RoomStatus.FINISHED:
+        raise RoomSnapshotCorruptError(
+            "match participation requires a finished snapshot"
+        )
+    if snapshot.end_reason is not None and len(snapshot.end_reason) > 64:
+        raise RoomSnapshotCorruptError("match end reason is too long")
+    if finished_at is None:
+        raise RoomSnapshotCorruptError(
+            "match participation requires a finish time"
+        )
+
+    expected = _finished_match_participations(
+        snapshot,
+        finished_at=_stored_utc(finished_at),
+    )
+    if len({row.user_id for row in expected}) != len(expected):
+        raise RoomSnapshotCorruptError(
+            "a finished match contains duplicate human users"
+        )
+    stored = tuple(
+        session.scalars(
+            select(MatchParticipation)
+            .where(MatchParticipation.game_id == snapshot.room_id)
+            .order_by(MatchParticipation.user_id)
+            .with_for_update()
+        )
+    )
+    expected_by_user = {row.user_id: row for row in expected}
+    stored_by_user = {row.user_id: row for row in stored}
+    if set(stored_by_user) - set(expected_by_user):
+        raise RoomSnapshotCorruptError(
+            "stored match participation contains unexpected users"
+        )
+    for user_id, row in stored_by_user.items():
+        if not _same_match_participation(
+            row,
+            expected_by_user[user_id],
+        ):
+            raise RoomSnapshotCorruptError(
+                "stored match participation disagrees with finished game"
+            )
+    for user_id, row in expected_by_user.items():
+        if user_id not in stored_by_user:
+            session.add(row)
+    session.flush()
+
+
+def _finished_match_participations(
+    snapshot: RoomSnapshot,
+    *,
+    finished_at: datetime,
+) -> tuple[MatchParticipation, ...]:
+    """Build the canonical human result rows for one finished snapshot."""
+
+    player_count = len(snapshot.players)
+    survivors = tuple(
+        seat.index
+        for seat in snapshot.players
+        if seat.index not in snapshot.eliminated_seats
+    )
+    winner_seat = survivors[0] if len(survivors) == 1 else None
+    placements = {
+        seat_index: player_count - eliminated_order
+        for eliminated_order, seat_index in enumerate(
+            snapshot.eliminated_seats
+        )
+    }
+    if winner_seat is not None:
+        placements[winner_seat] = 1
+
+    word_counts: dict[str, int] = {}
+    for turn in snapshot.history:
+        if turn.actor_user_id is not None and not turn.by_bot:
+            word_counts[turn.actor_user_id] = (
+                word_counts.get(turn.actor_user_id, 0) + 1
+            )
+
+    mode = (
+        GameMode.MULTIPLAYER.value
+        if snapshot.mode is RoomMode.PVP
+        else GameMode.SOLO.value
+    )
+    rows: list[MatchParticipation] = []
+    for seat in snapshot.players:
+        user_id = seat.owner_user_id
+        if user_id is None:
+            continue
+        if winner_seat is None:
+            result = MatchResult.DRAW.value
+        elif seat.index == winner_seat:
+            result = MatchResult.WIN.value
+        else:
+            result = MatchResult.LOSS.value
+        rows.append(
+            MatchParticipation(
+                game_id=snapshot.room_id,
+                user_id=user_id,
+                mode=mode,
+                seat_index=seat.index,
+                result=result,
+                placement=placements.get(seat.index),
+                player_count=player_count,
+                word_count=word_counts.get(user_id, 0),
+                end_reason=snapshot.end_reason,
+                finished_at=finished_at,
+            )
+        )
+    return tuple(rows)
+
+
+def _same_match_participation(
+    stored: MatchParticipation,
+    expected: MatchParticipation,
+) -> bool:
+    return (
+        stored.game_id == expected.game_id
+        and stored.user_id == expected.user_id
+        and stored.mode == expected.mode
+        and stored.seat_index == expected.seat_index
+        and stored.result == expected.result
+        and stored.placement == expected.placement
+        and stored.player_count == expected.player_count
+        and stored.word_count == expected.word_count
+        and stored.end_reason == expected.end_reason
+        and _stored_utc(stored.finished_at)
+        == _stored_utc(expected.finished_at)
+    )
+
+
+def _return_finished_pvp_lobby_to_waiting(
+    session: Any,
+    game: Game,
+    snapshot: RoomSnapshot,
+    *,
+    changed_at: datetime,
+) -> None:
+    """Atomically retain a finished round and reopen its lobby.
+
+    The Game is already locked by the coordinator CAS.  Locking Room and then
+    memberships here preserves the global lock order and prevents a Render
+    restart or final browser disconnect from deleting a just-finished lobby
+    before the UI can request a rematch.
+    """
+
+    if game.room_id is None:
+        raise RoomSnapshotCorruptError(
+            "a finished PvP game requires a lobby room"
+        )
+    room = session.scalar(
+        select(Room)
+        .where(Room.id == game.room_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        room is None
+        or room.deleted_at is not None
+        or room.status != StoredRoomStatus.ACTIVE.value
+        or room.current_game_id != game.id
+    ):
+        raise RoomSnapshotCorruptError(
+            "finished PvP game is not the lobby's current round"
+        )
+    memberships = tuple(
+        session.scalars(
+            select(RoomMembership)
+            .where(
+                RoomMembership.room_id == room.id,
+                RoomMembership.left_at.is_(None),
+            )
+            .order_by(RoomMembership.user_id)
+            .with_for_update()
+        )
+    )
+    if not memberships:
+        raise RoomSnapshotCorruptError(
+            "finished PvP lobby has no active memberships"
+        )
+    for membership in memberships:
+        membership.ready = False
+        membership.is_bot_substituting = False
+        membership.last_seen_at = changed_at
+    room.current_game_id = None
+    room.status = StoredRoomStatus.WAITING.value
+    room.revision += 1
+    room.updated_at = changed_at
 
 
 def _reconcile_departed_spectators(
@@ -977,9 +1258,9 @@ def _receipt(stored: RoomCommandReceipt) -> CommandReceipt:
         raise RoomSnapshotCorruptError(
             "invalid receipt command_fingerprint"
         ) from error
-    if stored.deleted != (stored.command_kind == "delete"):
+    if stored.deleted and stored.command_kind != "delete":
         raise RoomSnapshotCorruptError(
-            "command receipt kind disagrees with deleted flag"
+            "only a delete command receipt may be marked deleted"
         )
     if stored.deleted:
         if stored.result_snapshot_json is not None:
@@ -1050,6 +1331,38 @@ def _repository_document(value: object) -> bool:
 
 def _deleted_document(value: Mapping[str, Any]) -> bool:
     return value.get("deleted") is True
+
+
+def _pvp_game_is_current(
+    session: Any,
+    game: Game,
+    *,
+    lock: bool = False,
+) -> bool:
+    """Return whether a PvP Game is the lobby's current active round."""
+
+    if game.mode != GameMode.MULTIPLAYER.value:
+        return True
+    if game.room_id is None:
+        return False
+    statement = select(Room).where(Room.id == game.room_id)
+    if lock:
+        statement = statement.with_for_update()
+    room = session.scalar(statement)
+    return (
+        room is not None
+        and room.deleted_at is None
+        and room.status == StoredRoomStatus.ACTIVE.value
+        and room.current_game_id == game.id
+    )
+
+
+def _stored_utc(value: datetime) -> datetime:
+    """Normalize database datetimes (SQLite may return them as naive UTC)."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _game_deleted(game: Game) -> bool:
@@ -1161,6 +1474,7 @@ __all__ = [
     "RoomSnapshotCorruptError",
     "SNAPSHOT_SCHEMA_VERSION",
     "SQLAlchemyRoomRepository",
+    "ensure_finished_match_participations",
     "deserialize_room_snapshot",
     "serialize_room_snapshot",
 ]
