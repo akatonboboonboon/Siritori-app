@@ -33,7 +33,7 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 | 2026-07-24 | OpenAI Codex | ロビー・オンライン対局 | 部屋作成、準備、観戦、オンライン対局画面、単語同期、複数タブpresence、切断と再起動後の猶予、Bot引継ぎ・本人復帰を実装した | 画面まで統合済み | 応募者本人が公開URLと実機で観戦・切断・復帰を確認する | [#8](https://github.com/akatonboboonboon/Siritori-app/pull/8) |
 | 2026-07-24 | OpenAI Codex | ソロBot戦・テーマ | ソロ戦の保存・一時停止・再開、Normal／Hard Bot、サーバー側テーマ制約、Bot数・難易度・テーマ・時間の設定画面を実装した | 画面まで統合済み | 応募者本人がEasy Botとタイマー警告の表現を実装・確認する | [#7](https://github.com/akatonboboonboon/Siritori-app/pull/7) |
 | 2026-07-24 | OpenAI Codex | テーマ単語データ | 応募者本人が林檎／蜜柑／西瓜を入力し、Codexが公開されている日本語WordNet 1.1から9テーマの候補を抽出した。Wikipedia pageviewsは候補の順位付けだけに使い、Sudachi検査、CSV、ローダー、アプリへの登録、自動テストを実装した。データは開発時に抽出済みで、アプリ実行時の外部通信は行わない | AI実装完了・本人目視レビュー待ち | 応募者本人が収録語を目視レビューし、誤分類を修正する | 最終Draft PRへ追記予定 |
-| 2026-07-26 | OpenAI Codex | Bot語彙・3難易度 | 応募者本人から開発継続の指示を受け、公式日本語WordNetから一般名詞を抽出し、Sudachi完全一致検査済み27,781語のオフラインCSV、Easy Bot、Hard Botの大語彙向け探索キャッシュ、再生成スクリプトと自動テストを実装した | AI実装完了・本人レビュー待ち | 応募者本人が3難易度を遊び、強さ・不自然な収録語・表示を確認する | #15予定 |
+| 2026-07-26 | OpenAI Codex | Bot語彙・3難易度 | 応募者本人から開発継続の指示を受け、公式日本語WordNetから一般名詞を抽出し、Sudachi完全一致検査済み27,781語のオフラインCSV、Easy Bot、Hard Botの大語彙向け探索キャッシュ、再生成スクリプトと自動テストを実装した | AI実装完了・本人レビュー待ち | 応募者本人が3難易度を遊び、強さ・不自然な収録語・表示を確認する | [#15](https://github.com/akatonboboonboon/Siritori-app/pull/15) |
 | 2026-07-24 | OpenAI Codex | Render準備・検証 | `render.yaml`、起動時Alembic、health/readiness、公開手順を整備した。公式仕様は確認したが、本番デプロイとDashboard表示は確認していない | 準備完了・本番未確認 | Windows sandboxのACLエラーで実ブラウザ確認ができなかったため、応募者本人がDashboardと公開URLを確認する。秘密情報はCodexへ渡さず記録しない | 最終Draft PRへ追記予定 |
 
 ### 完了した確認
