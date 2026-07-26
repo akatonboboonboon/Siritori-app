@@ -6,6 +6,7 @@ from shiritori.bots import (
     BotContext,
     BotStrategy,
     EasyBot,
+    HARD_CANDIDATE_LIMIT,
     HardBot,
     NormalBot,
     WordIndex,
@@ -156,6 +157,31 @@ class HardBotTests(unittest.TestCase):
 
         self.assertEqual(index.reply_count(forced_win, frozenset()), 0)
         self.assertEqual(index.reply_count(mobile, frozenset()), 1)
+
+        selected = HardBot(seed=9).choose(BotContext("あ"), index)
+
+        self.assertEqual(selected, forced_win)
+
+    def test_forced_win_outside_natural_beam_is_still_selected(self) -> None:
+        common = [
+            word(
+                f"common-{position}",
+                "あ" + ("い" * position) + "か",
+                rank=position,
+            )
+            for position in range(HARD_CANDIDATE_LIMIT)
+        ]
+        forced_win = word("forced", "あさ", rank=999)
+        reply = word("reply", "かき", rank=1)
+        index = WordIndex([*common, forced_win, reply])
+
+        self.assertNotIn(
+            forced_win,
+            index.legal_options("あ", avoid_n=True)[
+                :HARD_CANDIDATE_LIMIT
+            ],
+        )
+        self.assertEqual(index.reply_count(forced_win, frozenset()), 0)
 
         selected = HardBot(seed=9).choose(BotContext("あ"), index)
 

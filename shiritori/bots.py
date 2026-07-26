@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from types import MappingProxyType
-from typing import Iterable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Final, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 
 _SMALL_TO_LARGE_KANA = {
@@ -304,6 +304,9 @@ class NormalBot(_SeededStrategy):
         )
 
 
+HARD_CANDIDATE_LIMIT: Final = 8
+
+
 class HardBot(_SeededStrategy):
     """Look two turns ahead and avoid replies that can immediately trap the bot."""
 
@@ -331,6 +334,35 @@ class HardBot(_SeededStrategy):
         available_safe_counts = words.available_safe_counts(
             context.used_canonical_keys
         )
+        forced_wins = tuple(
+            option
+            for option in candidates
+            if max(
+                available_safe_counts.get(
+                    canonical_kana(option.last_kana), 0
+                )
+                - words.safe_count_for_key(
+                    option.last_kana,
+                    option.canonical_key,
+                ),
+                0,
+            )
+            == 0
+        )
+        if forced_wins:
+            return min(
+                forced_wins,
+                key=lambda option: (
+                    option.rank,
+                    self._tie_break(option, context),
+                ),
+            )
+
+        # Commonness is a safety rail, not merely the last tactical tie-break.
+        # Search every option for an immediate win above, then limit the more
+        # expensive two-ply comparison to the most natural offline-ranked
+        # choices. This avoids obscure tactical suffixes dominating play.
+        candidates = tuple(candidates[:HARD_CANDIDATE_LIMIT])
         continuation_cache: dict[
             tuple[
                 str,
