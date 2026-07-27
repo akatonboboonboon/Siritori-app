@@ -213,6 +213,8 @@ NiceGUIの `storage_secret` はCookie署名に必要なため、安定した秘�
 200文字を上限にNFKC／NFC正規化と文字種検証を行います。本人のユーザー行をロックして
 審査待ちを20件までに直列化し、DBの`(user_id, surface, reading)`一意制約を
 同時送信時の最終防衛線にします。完全に同じ申請の再送は既存行を返します。
+保存前に通常対局と同じ`ApprovedLexiconValidator`で表記を照合し、Sudachi収録語または
+承認済み語としてすでに使用できる場合は、読みの候補数にかかわらず申請を拒否します。
 
 各行は`pending`、`approved`、`rejected`の審査状態と作成・更新・審査時刻を持ちます。
 保護画面`/word-suggestions`へ返すのは本人の単語、読み、補足、状態、時刻だけで、申請IDやユーザーID、

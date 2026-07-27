@@ -58,6 +58,10 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
             self.services.word_suggestions.database,
             self.services.database,
         )
+        self.assertIs(
+            self.services.word_suggestions.validator,
+            self.services.approved_validator,
+        )
 
     async def test_ranked_modes_keep_a_fixed_official_lexicon(self) -> None:
         self.assertIsNone(self.services.score_attack.validator)

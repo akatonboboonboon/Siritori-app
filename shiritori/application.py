@@ -89,9 +89,12 @@ class ApplicationServices:
         auth = AuthService(database)
         games = GameRepository(database)
         statistics = StatisticsRepository(database)
-        word_suggestions = WordSuggestionService(database)
         approved_words = ApprovedWordCatalog(database)
         approved_validator = ApprovedLexiconValidator(approved_words)
+        word_suggestions = WordSuggestionService(
+            database,
+            validator=approved_validator,
+        )
         word_review = WordReviewService(
             database,
             settings.admin_username_keys,
