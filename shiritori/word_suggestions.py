@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Protocol
 import unicodedata
 
 from sqlalchemy import func, select
@@ -16,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Database
+from .lexicon import LexiconResult, get_default_validator
 from .models import User, WordSuggestion, new_id, utc_now
 
 
@@ -59,6 +61,11 @@ class WordSuggestionPendingLimitError(WordSuggestionError):
             "審査が終わってからもう一度お試しください。"
         )
         self.limit = limit
+
+
+class _SuggestionLexiconValidator(Protocol):
+    def validate(self, raw_surface: str | None) -> LexiconResult:
+        """Return whether one normalized surface is already playable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +314,7 @@ class WordSuggestionService:
         max_pending_per_user: int = DEFAULT_MAX_PENDING_PER_USER,
         clock=utc_now,
         repository: WordSuggestionRepository | None = None,
+        validator: _SuggestionLexiconValidator | None = None,
     ) -> None:
         if (
             type(max_pending_per_user) is not int
@@ -319,6 +327,9 @@ class WordSuggestionService:
         self.repository = repository or WordSuggestionRepository(database)
         if self.repository.database is not database:
             raise ValueError("repository must use the same database")
+        self.validator = validator or get_default_validator()
+        if not callable(getattr(self.validator, "validate", None)):
+            raise TypeError("validator must provide validate")
 
     def submit(
         self,
@@ -333,6 +344,12 @@ class WordSuggestionService:
         clean_surface = normalize_suggestion_surface(surface)
         clean_reading = normalize_suggestion_reading(reading)
         clean_note = normalize_suggestion_note(note)
+        if self.validator.validate(clean_surface).is_dictionary_word:
+            raise WordSuggestionValidationError(
+                "surface",
+                "この単語はすでにしりとりで使用できるため、"
+                "申請する必要はありません。",
+            )
         try:
             with self.database.transaction() as session:
                 user = self.repository.lock_user(session, owner_id)

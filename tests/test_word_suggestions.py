@@ -20,7 +20,12 @@ from sqlalchemy import func, inspect, select
 
 from shiritori.auth import AuthService
 from shiritori.database import Database
+from shiritori.lexicon import LexiconCode, LexiconResult, normalize_surface
 from shiritori.models import User, WordSuggestion
+from shiritori.word_review import (
+    ApprovedLexiconValidator,
+    ApprovedWordCatalog,
+)
 from shiritori.word_suggestions import (
     WordSuggestionPendingLimitError,
     WordSuggestionService,
@@ -42,6 +47,27 @@ class MutableClock:
 
     def advance(self, seconds: int = 1) -> None:
         self.current += timedelta(seconds=seconds)
+
+
+class StubSuggestionValidator:
+    def __init__(
+        self,
+        results: dict[str, LexiconResult] | None = None,
+    ) -> None:
+        self.results = results or {}
+        self.calls: list[str] = []
+
+    def validate(self, raw_surface: str | None) -> LexiconResult:
+        surface = normalize_surface(raw_surface)
+        self.calls.append(surface)
+        return self.results.get(
+            surface,
+            LexiconResult(
+                code=LexiconCode.NOT_IN_DICTIONARY,
+                surface=surface,
+                message="未収録です。",
+            ),
+        )
 
 
 class WordSuggestionServiceTests(unittest.TestCase):
@@ -71,9 +97,11 @@ class WordSuggestionServiceTests(unittest.TestCase):
             display_name="Bob",
         )
         self.clock = MutableClock()
+        self.validator = StubSuggestionValidator()
         self.service = WordSuggestionService(
             self.database,
             clock=self.clock,
+            validator=self.validator,
         )
 
     def tearDown(self) -> None:
@@ -112,6 +140,96 @@ class WordSuggestionServiceTests(unittest.TestCase):
             self.assertIsNotNone(stored)
             self.assertEqual(stored.status, "pending")
             self.assertIsNone(stored.reviewed_at)
+
+    def test_existing_playable_surface_is_rejected_before_persistence(
+        self,
+    ) -> None:
+        validator = StubSuggestionValidator(
+            {
+                "ユーリンチー": LexiconResult(
+                    code=LexiconCode.ACCEPTED,
+                    surface="ユーリンチー",
+                    message="辞書語です。",
+                ),
+                "日本": LexiconResult(
+                    code=LexiconCode.MULTIPLE_READINGS,
+                    surface="日本",
+                    message="複数読みです。",
+                ),
+            }
+        )
+        service = WordSuggestionService(
+            self.database,
+            clock=self.clock,
+            validator=validator,
+        )
+
+        for surface, reading in (
+            ("  ﾕｰﾘﾝﾁｰ  ", "ゆーりんちー"),
+            ("日本", "にほんではない"),
+        ):
+            with self.subTest(surface=surface):
+                with self.assertRaises(
+                    WordSuggestionValidationError
+                ) as raised:
+                    service.submit(
+                        self.alice.id,
+                        surface,
+                        reading,
+                    )
+                self.assertEqual(raised.exception.field, "surface")
+                self.assertEqual(
+                    str(raised.exception),
+                    "この単語はすでにしりとりで使用できるため、"
+                    "申請する必要はありません。",
+                )
+
+        self.assertEqual(validator.calls, ["ユーリンチー", "日本"])
+        with self.database.read_session() as session:
+            stored_count = session.scalar(
+                select(func.count()).select_from(WordSuggestion)
+            )
+        self.assertEqual(stored_count, 0)
+
+    def test_default_validator_rejects_a_real_sudachi_word(self) -> None:
+        service = WordSuggestionService(
+            self.database,
+            clock=self.clock,
+        )
+
+        with self.assertRaises(WordSuggestionValidationError) as raised:
+            service.submit(self.alice.id, "りんご", "りんご")
+
+        self.assertEqual(raised.exception.field, "surface")
+        self.assertIn("すでにしりとりで使用できる", str(raised.exception))
+
+    def test_approved_word_is_rejected_by_the_shared_validator(self) -> None:
+        catalog = ApprovedWordCatalog(self.database)
+        catalog.add(
+            word_id="approved-request-word",
+            surface="審査済語",
+            reading="しんさずみご",
+        )
+        validator = ApprovedLexiconValidator(
+            catalog,
+            self.validator,  # type: ignore[arg-type]
+        )
+        service = WordSuggestionService(
+            self.database,
+            clock=self.clock,
+            validator=validator,
+        )
+
+        with self.assertRaises(WordSuggestionValidationError) as raised:
+            service.submit(
+                self.alice.id,
+                "審査済語",
+                "しんさずみご",
+            )
+
+        self.assertEqual(raised.exception.field, "surface")
+        self.assertIn("申請する必要はありません", str(raised.exception))
+        self.assertEqual(self.validator.calls, ["審査済語"])
 
     def test_exact_normalized_duplicate_is_idempotent(self) -> None:
         first = self.service.submit(
@@ -180,6 +298,7 @@ class WordSuggestionServiceTests(unittest.TestCase):
             self.database,
             max_pending_per_user=2,
             clock=self.clock,
+            validator=self.validator,
         )
         first = service.submit(self.alice.id, "佃煮", "つくだに")
         self.clock.advance()
