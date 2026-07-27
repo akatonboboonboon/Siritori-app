@@ -1088,6 +1088,93 @@ class LobbyPersistenceTests(unittest.TestCase):
             )
             self.assertTrue(membership.ready)
 
+    def test_waiting_setting_update_is_durable_and_resets_readiness(
+        self,
+    ) -> None:
+        room = self.create_room(max_players=4)
+        self.service.join_as_player(self.guest.id, room.room_code)
+        self.service.set_ready(self.owner.id, room.room_code, ready=True)
+        ready = self.service.set_ready(
+            self.guest.id,
+            room.room_code,
+            ready=True,
+        )
+
+        updated = self.service.update_settings(
+            self.owner.id,
+            room.room_code,
+            expected_revision=ready.revision,
+            max_players=3,
+            allow_spectators=False,
+            turn_seconds=None,
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+
+        self.assertEqual(updated.revision, ready.revision + 1)
+        self.assertTrue(all(not player.ready for player in updated.players))
+        with self.database.read_session() as session:
+            stored = session.get(Room, room.id)
+            memberships = tuple(
+                session.scalars(
+                    select(RoomMembership).where(
+                        RoomMembership.room_id == room.id,
+                        RoomMembership.left_at.is_(None),
+                    )
+                )
+            )
+            self.assertEqual(stored.max_players, 3)
+            self.assertFalse(stored.allow_spectators)
+            self.assertIsNone(stored.turn_seconds)
+            self.assertTrue(stored.is_public)
+            self.assertTrue(stored.fill_empty_seats_with_bots)
+            self.assertEqual(stored.revision, ready.revision + 1)
+            self.assertTrue(all(not member.ready for member in memberships))
+
+        restarted_database = Database(self.database_url)
+        restarted_service = LobbyService(
+            SQLAlchemyLobbyRepository(restarted_database)
+        )
+        try:
+            self.assertEqual(
+                restarted_service.get_room(room.room_code),
+                updated,
+            )
+        finally:
+            restarted_database.dispose()
+
+    def test_sql_ready_rejects_stale_displayed_gameplay_settings(
+        self,
+    ) -> None:
+        room = self.create_room(max_players=4)
+        joined = self.service.join_as_player(self.guest.id, room.room_code)
+        displayed_settings = (
+            joined.max_players,
+            joined.turn_seconds,
+            joined.fill_empty_seats_with_bots,
+        )
+        updated = self.service.update_settings(
+            self.owner.id,
+            room.room_code,
+            expected_revision=joined.revision,
+            max_players=3,
+            allow_spectators=True,
+            turn_seconds=None,
+            is_public=False,
+            fill_empty_seats_with_bots=True,
+        )
+
+        with self.assertRaises(LobbyRevisionConflict) as caught:
+            self.repository.set_ready(
+                room_id=room.id,
+                user_id=self.guest.id,
+                ready=True,
+                expected_gameplay_settings=displayed_settings,
+            )
+        self.assertEqual(caught.exception.current_room, updated)
+        current = self.service.get_room(room.room_code)
+        self.assertTrue(all(not player.ready for player in current.players))
+
     def test_start_atomically_creates_room_repository_compatible_game(self) -> None:
         lobby = self.create_room(theme_key="country", turn_seconds=3)
         self.service.join_as_player(self.guest.id, lobby.room_code)

@@ -27,11 +27,13 @@ from .lobby import (
     LobbyStartResult,
     LobbyStateError,
     SpectatorsDisabledError,
+    WaitingGameplaySettings,
     normalize_invite_code,
     normalize_room_name,
     room_name_key,
     validate_theme_key,
     validate_turn_seconds,
+    validate_waiting_gameplay_settings,
 )
 from .models import (
     Game,
@@ -581,14 +583,24 @@ class SQLAlchemyLobbyRepository:
         room_id: str,
         user_id: str,
         ready: bool,
+        expected_gameplay_settings: WaitingGameplaySettings | None = None,
     ) -> LobbyRoomSnapshot:
         room_identifier = _identifier(room_id, "room_id", 36)
         member_id = _identifier(user_id, "user_id", 36)
         if type(ready) is not bool:
             raise ValueError("ready must be boolean")
+        expected_settings = validate_waiting_gameplay_settings(
+            expected_gameplay_settings
+        )
 
         with self._guard(), self.database.transaction() as session:
             room = _waiting_room(session, room_identifier)
+            if expected_settings is not None and expected_settings != (
+                room.max_players,
+                room.turn_seconds,
+                room.fill_empty_seats_with_bots,
+            ):
+                raise LobbyRevisionConflict(_snapshot(session, room))
             membership = session.get(
                 RoomMembership,
                 {"room_id": room.id, "user_id": member_id},
@@ -602,6 +614,89 @@ class SQLAlchemyLobbyRepository:
 
             membership.ready = ready
             membership.last_seen_at = utc_now()
+            room.revision += 1
+            room.updated_at = utc_now()
+            session.flush()
+            return _snapshot(session, room)
+
+    def update_waiting_settings(
+        self,
+        *,
+        room_id: str,
+        requesting_owner_user_id: str,
+        expected_revision: int,
+        max_players: int,
+        allow_spectators: bool,
+        turn_seconds: int | None,
+        is_public: bool,
+        fill_empty_seats_with_bots: bool,
+    ) -> LobbyRoomSnapshot:
+        room_identifier = _identifier(room_id, "room_id", 36)
+        owner_id = _identifier(
+            requesting_owner_user_id,
+            "requesting_owner_user_id",
+            36,
+        )
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected_revision must be non-negative")
+        if type(max_players) is not int or not 2 <= max_players <= 8:
+            raise ValueError("max_players must be from 2 to 8")
+        if type(allow_spectators) is not bool:
+            raise ValueError("allow_spectators must be boolean")
+        if type(is_public) is not bool:
+            raise ValueError("is_public must be boolean")
+        if type(fill_empty_seats_with_bots) is not bool:
+            raise ValueError("fill_empty_seats_with_bots must be boolean")
+        seconds = validate_turn_seconds(turn_seconds)
+
+        with self._guard(), self.database.transaction() as session:
+            room = _waiting_room(session, room_identifier)
+            memberships = _active_memberships(session, room.id, lock=True)
+            current = _snapshot(session, room)
+            if room.owner_user_id != owner_id:
+                raise LobbyAuthorizationError(
+                    "only the room owner can change settings"
+                )
+            if room.revision != expected_revision:
+                raise LobbyRevisionConflict(current)
+            player_count = sum(
+                membership.role == RoomRole.PLAYER.value
+                for membership in memberships
+            )
+            if max_players < player_count:
+                raise LobbyCapacityError(
+                    "max_players cannot be lower than the current player count"
+                )
+            unchanged = (
+                room.max_players == max_players
+                and room.allow_spectators is allow_spectators
+                and room.turn_seconds == seconds
+                and room.is_public is is_public
+                and room.fill_empty_seats_with_bots
+                is fill_empty_seats_with_bots
+            )
+            if unchanged:
+                return current
+
+            gameplay_changed = (
+                room.max_players != max_players
+                or room.turn_seconds != seconds
+                or room.fill_empty_seats_with_bots
+                is not fill_empty_seats_with_bots
+            )
+            if gameplay_changed:
+                for membership in memberships:
+                    if (
+                        membership.role == RoomRole.PLAYER.value
+                        and membership.ready
+                    ):
+                        membership.ready = False
+
+            room.max_players = max_players
+            room.allow_spectators = allow_spectators
+            room.turn_seconds = seconds
+            room.is_public = is_public
+            room.fill_empty_seats_with_bots = fill_empty_seats_with_bots
             room.revision += 1
             room.updated_at = utc_now()
             session.flush()

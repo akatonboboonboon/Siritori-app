@@ -7,6 +7,7 @@ cookie value.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -215,6 +216,35 @@ class AuthService:
                     "そのユーザー名は使用できません。"
                 ) from error
             raise
+
+    def display_names_for_user_ids(
+        self,
+        user_ids: Iterable[str],
+    ) -> dict[str, str]:
+        """Return display names for a small trusted set of account IDs."""
+
+        identifiers = tuple(dict.fromkeys(user_ids))
+        if len(identifiers) > 64:
+            raise ValueError("at most 64 user IDs can be resolved at once")
+        if any(
+            not isinstance(user_id, str)
+            or not user_id
+            or len(user_id) > 36
+            for user_id in identifiers
+        ):
+            raise ValueError("user IDs must be non-empty strings up to 36 chars")
+        if not identifiers:
+            return {}
+        with self.database.read_session() as session:
+            rows = session.execute(
+                select(User.id, User.username, User.display_name).where(
+                    User.id.in_(identifiers)
+                )
+            )
+            return {
+                row.id: row.display_name or row.username
+                for row in rows
+            }
 
     def login(
         self,

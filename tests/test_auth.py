@@ -67,6 +67,43 @@ class AuthServiceTests(unittest.TestCase):
         with self.assertRaises(InvalidCredentialsError):
             self.auth.login(expanding_username, "safe-password-123")
 
+    def test_display_names_resolve_bounded_unique_account_ids(self) -> None:
+        alice = self.auth.register(
+            "alice_names",
+            "alice-display-password",
+            display_name="ありす",
+        )
+        bob = self.auth.register(
+            "bob_names",
+            "bob-display-password",
+            display_name="ボブ",
+        )
+        with self.database.transaction() as session:
+            stored_bob = session.get(User, bob.id)
+            assert stored_bob is not None
+            stored_bob.display_name = None
+
+        self.assertEqual(
+            self.auth.display_names_for_user_ids(
+                (alice.id, bob.id, alice.id, "0" * 36)
+            ),
+            {
+                alice.id: "ありす",
+                bob.id: "bob_names",
+            },
+        )
+        self.assertEqual(self.auth.display_names_for_user_ids(()), {})
+
+        invalid_sets: tuple[object, ...] = (
+            ("",),
+            (None,),
+            ("x" * 37,),
+            tuple(f"{index:036d}" for index in range(65)),
+        )
+        for invalid in invalid_sets:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.auth.display_names_for_user_ids(invalid)  # type: ignore[arg-type]
+
     def test_unknown_user_and_wrong_password_have_same_public_failure(self) -> None:
         self.auth.register("alice", "alice-password-123")
 

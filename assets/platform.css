@@ -324,6 +324,17 @@ body {
   background: #fff;
 }
 
+.game-turn-card {
+  transition: border-color 160ms ease, background-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.game-turn-card--mine {
+  border-color: #dc2626;
+  background: #fff7f7;
+  box-shadow: 0 0 0 3px rgb(220 38 38 / 18%);
+}
+
 .aside-title {
   color: #302d43;
   font-size: 1rem;
@@ -787,6 +798,10 @@ body {
   animation: none !important;
 }
 
+.motion-reduced .game-turn-card {
+  transition: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .game-history-row--new,
   .reaction-bubble--enter,
@@ -794,6 +809,10 @@ body {
   .game-effect--elimination,
   .game-effect--finish {
     animation: none !important;
+  }
+
+  .game-turn-card {
+    transition: none;
   }
 }
 
