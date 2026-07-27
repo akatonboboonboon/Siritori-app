@@ -39,6 +39,9 @@ from shiritori.web_auth import (
     _can_surrender,
     _deadline_presentation,
     _feedback_for_version,
+    _history_scroll_script,
+    _history_was_appended,
+    _latest_word_text,
     _match_result_presentation,
     _parse_room_timer_value,
     _post_match_lobby_destination,
@@ -136,6 +139,76 @@ class CsrfProtectorTests(unittest.TestCase):
 
 
 class GameUiHelperTests(unittest.TestCase):
+    def test_latest_word_text_uses_last_record_and_keeps_reading(self) -> None:
+        now = datetime(2026, 7, 27, 0, 0, tzinfo=timezone.utc)
+        apple = TurnRecord(
+            surface="林檎",
+            reading="りんご",
+            canonical_key="りんご",
+            seat_index=0,
+            actor_user_id="alice",
+            by_bot=False,
+            submitted_at=now,
+        )
+        rice = TurnRecord(
+            surface="ごはん",
+            reading="ごはん",
+            canonical_key="ごはん",
+            seat_index=1,
+            actor_user_id="bob",
+            by_bot=False,
+            submitted_at=now,
+        )
+
+        self.assertEqual(
+            _latest_word_text(()),
+            "まだありません（好きな単語から）",
+        )
+        self.assertEqual(_latest_word_text((apple,)), "林檎（よみ：りんご）")
+        self.assertEqual(_latest_word_text((apple, rice)), "ごはん")
+
+    def test_history_append_detection_ignores_initial_and_replaced_data(
+        self,
+    ) -> None:
+        self.assertFalse(_history_was_appended(None, ("りんご",)))
+        self.assertFalse(_history_was_appended(("りんご",), ("りんご",)))
+        self.assertTrue(
+            _history_was_appended(
+                ("りんご",),
+                ("りんご", "ごりら"),
+            )
+        )
+        self.assertFalse(
+            _history_was_appended(
+                ("りんご",),
+                ("らっぱ", "ぱんだ"),
+            )
+        )
+        self.assertFalse(
+            _history_was_appended(
+                ("りんご", "ごりら"),
+                ("りんご",),
+            )
+        )
+
+    def test_history_scroll_script_is_scoped_and_reduced_motion_safe(
+        self,
+    ) -> None:
+        script = _history_scroll_script(reduced_motion=False)
+        reduced_script = _history_scroll_script(reduced_motion=True)
+
+        self.assertIn("siritori-game-history", script)
+        self.assertIn("requestAnimationFrame", script)
+        self.assertIn("history.scrollHeight", script)
+        self.assertIn("behavior:reduced?'auto':'smooth'", script)
+        self.assertIn("prefers-reduced-motion: reduce", script)
+        self.assertIn("const reduced=true||", reduced_script)
+        self.assertNotIn("window.scroll", script)
+        self.assertNotIn("http://", script)
+        self.assertNotIn("https://", script)
+        with self.assertRaises(ValueError):
+            _history_scroll_script(reduced_motion=1)  # type: ignore[arg-type]
+
     def test_deadline_presentation_uses_ceil_and_warning_thresholds(self) -> None:
         now = datetime(2026, 7, 26, 0, 0, tzinfo=timezone.utc)
 
@@ -911,6 +984,43 @@ class GameResultUiHelperTests(unittest.TestCase):
         self.assertIn(".game-turn-card--mine", css)
         self.assertIn("border-color: #dc2626;", css)
         self.assertIn(".motion-reduced .game-turn-card", css)
+
+    def test_latest_word_and_history_autoscroll_are_wired(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "shiritori" / "web_auth.py").read_text(
+            encoding="utf-8"
+        )
+        css = (root / "assets" / "platform.css").read_text(
+            encoding="utf-8"
+        )
+        play_source = source[source.index('@ui.page("/play/{game_id}")'):]
+
+        self.assertIn('f"前の人の単語：{_latest_word_text(', play_source)
+        self.assertIn('"game-latest-word w-full"', play_source)
+        self.assertIn("id='siritori-game-history'", play_source)
+        self.assertIn(
+            "for index, record in enumerate(\n"
+            "                        snapshot.history, start=1",
+            play_source,
+        )
+        self.assertNotIn("reversed(snapshot.history)", play_source)
+        self.assertIn(
+            "history_should_scroll = _history_was_appended(",
+            play_source,
+        )
+        self.assertLess(
+            play_source.index("history_should_scroll ="),
+            play_source.index("rendered_history = history_signature"),
+        )
+        self.assertLess(
+            play_source.index("rendered_history = history_signature"),
+            play_source.index("_history_scroll_script("),
+        )
+        self.assertEqual(play_source.count("_history_scroll_script("), 1)
+        self.assertIn(".game-latest-word", css)
+        self.assertIn("overscroll-behavior: contain;", css)
+        self.assertIn("scroll-behavior: smooth;", css)
+        self.assertIn(".motion-reduced .game-history", css)
 
     def test_game_effect_css_respects_reduced_motion(self) -> None:
         root = Path(__file__).resolve().parents[1]
