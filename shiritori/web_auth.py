@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -67,6 +67,7 @@ from .rooms import (
     RoomStatus,
     RoomVersionConflict,
     SeatController,
+    TurnRecord,
     WordSubmissionStatus,
 )
 from .score_attack import ScoreAttackSession, ScoreAttackStatus
@@ -464,6 +465,50 @@ def _sound_cue_script(cue: str) -> str:
         "oscillator.connect(gain);gain.connect(context.destination);"
         "oscillator.start(start);oscillator.stop(start+duration+0.02);"
         "}return true;}catch(_error){return false;}})()"
+    )
+
+
+def _latest_word_text(history: Sequence[TurnRecord]) -> str:
+    """Return the latest recorded word without exposing actor identifiers."""
+
+    if not history:
+        return "まだありません（好きな単語から）"
+    latest = history[-1]
+    if latest.surface == latest.reading:
+        return latest.surface
+    return f"{latest.surface}（よみ：{latest.reading}）"
+
+
+def _history_was_appended(
+    previous: tuple[object, ...] | None,
+    current: tuple[object, ...],
+) -> bool:
+    """Return whether current strictly extends an already-rendered history."""
+
+    return (
+        previous is not None
+        and len(current) > len(previous)
+        and current[:len(previous)] == previous
+    )
+
+
+def _history_scroll_script(*, reduced_motion: bool) -> str:
+    """Return a fail-closed script which scrolls only the history region."""
+
+    if type(reduced_motion) is not bool:
+        raise ValueError("reduced_motion must be a bool")
+    reduced = "true" if reduced_motion else "false"
+    return (
+        "(()=>{try{"
+        "const history=document.getElementById('siritori-game-history');"
+        "if(!history){return false;}"
+        f"const reduced={reduced}||"
+        "window.matchMedia('(prefers-reduced-motion: reduce)').matches;"
+        "const scroll=()=>{try{history.scrollTo({"
+        "top:history.scrollHeight,behavior:reduced?'auto':'smooth'"
+        "});}catch(_scrollError){history.scrollTop=history.scrollHeight;}};"
+        "requestAnimationFrame(()=>requestAnimationFrame(scroll));"
+        "return true;}catch(_error){return false;}})()"
     )
 
 
@@ -3959,6 +4004,9 @@ def register_auth_pages(
                 if snapshot.expected_kana is not None
                 else "自由"
             )
+            latest_word_label.set_text(
+                f"前の人の単語：{_latest_word_text(snapshot.history)}"
+            )
             turn_owner = _turn_seat_label(
                 snapshot, user_id, seat_display_names
             )
@@ -3977,8 +4025,11 @@ def register_auth_pages(
             )
 
             history_signature = tuple(snapshot.history)
+            history_should_scroll = _history_was_appended(
+                rendered_history,
+                history_signature,
+            )
             if history_signature != rendered_history:
-                rendered_history = history_signature
                 history_box.clear()
                 with history_box:
                     if not snapshot.history:
@@ -4013,6 +4064,13 @@ def register_auth_pages(
                             ui.label(
                                 f"{actor}・よみ: {record.reading}"
                             ).classes("platform-muted")
+                rendered_history = history_signature
+                if history_should_scroll and not client.is_deleted:
+                    client.run_javascript(
+                        _history_scroll_script(
+                            reduced_motion=reduced_motion,
+                        )
+                    )
 
             allowed = (
                 can_submit(snapshot)
@@ -4724,6 +4782,14 @@ def register_auth_pages(
                             "aside-title"
                         )
                         turn_label = ui.label("").classes("aside-title")
+                        latest_word_label = ui.label(
+                            "前の人の単語：まだありません"
+                        ).classes(
+                            "game-latest-word w-full"
+                        ).props(
+                            "role='status' aria-live='polite' "
+                            "aria-atomic='true'"
+                        )
                         with ui.row().classes(
                             "w-full items-center gap-3"
                         ):
@@ -4894,6 +4960,10 @@ def register_auth_pages(
                         ui.label("ことばの履歴").classes("aside-title")
                         history_box = ui.column().classes(
                             "game-history w-full gap-2"
+                        ).props(
+                            "id='siritori-game-history' "
+                            "role='region' aria-label='ことばの履歴' "
+                            "tabindex='0'"
                         )
 
                 with ui.dialog() as reading_dialog, ui.card():

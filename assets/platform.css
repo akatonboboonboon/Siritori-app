@@ -374,7 +374,19 @@ body {
   max-height: min(52vh, 440px);
   padding-right: 4px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
   scrollbar-width: thin;
+}
+
+.game-latest-word {
+  padding: 10px 12px;
+  border-left: 4px solid #5b4bdb;
+  border-radius: 10px;
+  background: #f5f3ff;
+  color: #302d43;
+  font-weight: 800;
+  overflow-wrap: anywhere;
 }
 
 .game-history-row {
@@ -802,6 +814,10 @@ body {
   transition: none;
 }
 
+.motion-reduced .game-history {
+  scroll-behavior: auto;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .game-history-row--new,
   .reaction-bubble--enter,
@@ -813,6 +829,10 @@ body {
 
   .game-turn-card {
     transition: none;
+  }
+
+  .game-history {
+    scroll-behavior: auto;
   }
 }
 
