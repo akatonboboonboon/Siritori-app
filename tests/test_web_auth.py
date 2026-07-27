@@ -40,6 +40,7 @@ from shiritori.web_auth import (
     _deadline_presentation,
     _feedback_for_version,
     _match_result_presentation,
+    _parse_room_timer_value,
     _post_match_lobby_destination,
     _reaction_sender_label,
     _result_share_script,
@@ -48,6 +49,7 @@ from shiritori.web_auth import (
     _room_invite_url,
     _room_listing_summary,
     _room_timer_text,
+    _room_timer_value,
     _safe_next,
     _same_origin,
     _session_principal_matches_user,
@@ -57,6 +59,7 @@ from shiritori.web_auth import (
     _solo_difficulty_options,
     _tutorial_return_path,
     _tutorial_url,
+    _turn_seat_label,
     _word_suggestion_status_label,
 )
 
@@ -260,6 +263,93 @@ class GameUiHelperTests(unittest.TestCase):
         self.assertNotIn("secret-alice-id", summary)
         self.assertNotIn("secret-bob-id", summary)
         self.assertEqual(_room_timer_text(None), "無制限")
+
+    def test_room_timer_values_round_trip_and_reject_invalid_inputs(self) -> None:
+        for seconds, select_value in (
+            (None, "unlimited"),
+            (3, "3"),
+            (30, "30"),
+            (180, "180"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(_room_timer_value(seconds), select_value)
+                self.assertEqual(
+                    _parse_room_timer_value(select_value),
+                    seconds,
+                )
+
+        for invalid_seconds in (True, 2, 181, "30"):
+            with self.subTest(invalid_seconds=invalid_seconds):
+                with self.assertRaises(ValueError):
+                    _room_timer_value(invalid_seconds)  # type: ignore[arg-type]
+        for invalid_value in (None, True, 3, "2", "181", "three"):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaises(ValueError):
+                    _parse_room_timer_value(invalid_value)
+
+    def test_turn_label_uses_display_names_without_exposing_user_ids(self) -> None:
+        alice_id = "private-alice-id"
+        bob_id = "private-bob-id"
+        active = create_room_snapshot(
+            "turn-labels",
+            (alice_id, bob_id),
+            mode=RoomMode.PVP,
+            seat_picker=lambda _count: 0,
+        )
+        names = {
+            alice_id: "ありす",
+            bob_id: "ボブ",
+        }
+
+        own_human = _turn_seat_label(active, alice_id, names)
+        bob_turn = replace(active, current_turn=1)
+        other_human = _turn_seat_label(bob_turn, alice_id, names)
+        fallback = _turn_seat_label(bob_turn, alice_id, {})
+        own_bot = replace(
+            active,
+            players=(
+                replace(active.players[0], controller=SeatController.BOT),
+                active.players[1],
+            ),
+        )
+        other_bot = replace(
+            bob_turn,
+            players=(
+                bob_turn.players[0],
+                replace(
+                    bob_turn.players[1],
+                    controller=SeatController.BOT,
+                ),
+            ),
+        )
+        solo = create_room_snapshot(
+            "permanent-bot-label",
+            (alice_id,),
+            mode=RoomMode.SOLO_BOT,
+            permanent_bot_count=1,
+            seat_picker=lambda _count: 1,
+        )
+
+        labels = (
+            own_human,
+            other_human,
+            fallback,
+            _turn_seat_label(own_bot, alice_id, names),
+            _turn_seat_label(other_bot, alice_id, names),
+            _turn_seat_label(solo, alice_id, names),
+        )
+        self.assertEqual(
+            labels,
+            (
+                "あなた（ありす）",
+                "ボブ",
+                "プレイヤー2",
+                "あなた（ありす）の代行Bot",
+                "ボブの代行Bot",
+                "Bot 2",
+            ),
+        )
+        self.assertFalse(any("private-" in label for label in labels))
 
     def test_invite_url_is_absolute_and_same_origin(self) -> None:
         request = request_with_headers(
@@ -614,6 +704,83 @@ class GameResultUiHelperTests(unittest.TestCase):
             _SnapshotEffect("finish", "finish"),
         )
 
+    def test_snapshot_effect_uses_your_turn_only_on_human_turn_transition(
+        self,
+    ) -> None:
+        now = datetime(2026, 7, 26, 1, 30, tzinfo=timezone.utc)
+        initial = create_room_snapshot(
+            "your-turn-effect",
+            ("alice", "bob"),
+            mode=RoomMode.PVP,
+            now=now,
+            seat_picker=lambda _count: 1,
+        )
+        record = TurnRecord(
+            surface="りんご",
+            reading="りんご",
+            canonical_key="りんご",
+            seat_index=1,
+            actor_user_id="bob",
+            by_bot=False,
+            submitted_at=now,
+        )
+        alice_turn = replace(
+            initial,
+            state_version=1,
+            current_turn=0,
+            history=(record,),
+            expected_kana="ご",
+        )
+        alice_stays = replace(
+            alice_turn,
+            state_version=2,
+            history=(
+                *alice_turn.history,
+                replace(
+                    record,
+                    surface="ごりら",
+                    reading="ごりら",
+                    canonical_key="ごりら",
+                    seat_index=0,
+                    actor_user_id="alice",
+                ),
+            ),
+        )
+        alice_bot_turn = replace(
+            alice_turn,
+            players=(
+                replace(
+                    alice_turn.players[0],
+                    controller=SeatController.BOT,
+                ),
+                alice_turn.players[1],
+            ),
+        )
+
+        self.assertEqual(
+            _snapshot_effect(initial, alice_turn, "alice"),
+            _SnapshotEffect("accepted", "your_turn"),
+        )
+        self.assertEqual(
+            _snapshot_effect(alice_turn, alice_stays, "alice"),
+            _SnapshotEffect("accepted", "accepted"),
+        )
+        self.assertEqual(
+            _snapshot_effect(initial, alice_bot_turn, "alice"),
+            _SnapshotEffect("accepted", "accepted"),
+        )
+        self.assertEqual(
+            _snapshot_effect(initial, alice_turn, "bob"),
+            _SnapshotEffect("accepted", "accepted"),
+        )
+        self.assertIsNone(
+            _snapshot_effect(
+                initial,
+                replace(initial, state_version=1, current_turn=0),
+                "alice",
+            )
+        )
+
     def test_reaction_sender_labels_never_expose_user_ids(self) -> None:
         now = datetime(2026, 7, 26, 2, 0, tzinfo=timezone.utc)
         active = create_room_snapshot(
@@ -674,14 +841,76 @@ class GameResultUiHelperTests(unittest.TestCase):
 
     def test_sound_cues_are_generated_and_fail_closed(self) -> None:
         script = _sound_cue_script("accepted")
+        your_turn_script = _sound_cue_script("your_turn")
 
         self.assertIn("AudioContext", script)
         self.assertIn("createOscillator", script)
         self.assertIn("catch(_error)", script)
         self.assertNotIn("http://", script)
         self.assertNotIn("https://", script)
+        self.assertIn("1977", your_turn_script)
+        self.assertNotEqual(script, your_turn_script)
         with self.assertRaises(ValueError):
             _sound_cue_script("not-a-cue")
+
+    def test_waiting_room_settings_and_turn_highlight_are_wired(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "shiritori" / "web_auth.py").read_text(
+            encoding="utf-8"
+        )
+        css = (root / "assets" / "platform.css").read_text(
+            encoding="utf-8"
+        )
+        waiting_source = source[
+            source.index('@ui.page("/room/{room_code}")'):
+            source.index('@ui.page("/play/{game_id}")')
+        ]
+        play_source = source[source.index('@ui.page("/play/{game_id}")'):]
+
+        self.assertIn('"部屋設定を変更"', waiting_source)
+        self.assertIn('"設定を保存"', waiting_source)
+        self.assertIn("lobby.update_settings,", waiting_source)
+        self.assertIn(
+            "expected_revision=settings_edit_revision",
+            waiting_source,
+        )
+        self.assertIn(
+            "settings_button.set_visibility(is_owner)",
+            waiting_source,
+        )
+        self.assertIn("except LobbyRevisionConflict as error:", waiting_source)
+        self.assertIn("except LobbyCapacityError:", waiting_source)
+        self.assertIn(
+            "現在の対戦参加者より少ない人数には変更できません。",
+            waiting_source,
+        )
+        self.assertIn(
+            "全員の準備状態が解除されます。",
+            waiting_source,
+        )
+        self.assertIn(
+            'ui.card().classes(\n            "confirm-dialog room-settings-dialog"',
+            waiting_source,
+        )
+
+        self.assertIn('"dashboard-card game-turn-card"', play_source)
+        self.assertIn(
+            'turn_card.classes(add="game-turn-card--mine")',
+            play_source,
+        )
+        self.assertIn(
+            'turn_card.classes(remove="game-turn-card--mine")',
+            play_source,
+        )
+        self.assertIn(
+            "_has_user_human_turn(snapshot, user_id)",
+            play_source,
+        )
+        self.assertIn("await refresh_seat_display_names(snapshot)", play_source)
+        self.assertIn("_turn_seat_label(", play_source)
+        self.assertIn(".game-turn-card--mine", css)
+        self.assertIn("border-color: #dc2626;", css)
+        self.assertIn(".motion-reduced .game-turn-card", css)
 
     def test_game_effect_css_respects_reduced_motion(self) -> None:
         root = Path(__file__).resolve().parents[1]

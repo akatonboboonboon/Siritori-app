@@ -2,9 +2,10 @@
 
 The web layer supplies an authenticated user ID, but this module deliberately
 does not know how authentication works.  Persistence implementations must make
-``join_waiting``, ``join_active_spectator``, ``activate_waiting``, and
-``leave_waiting`` atomic: the service performs the same checks for useful
-errors, while the repository repeats them while holding its database lock.
+``join_waiting``, ``join_active_spectator``, ``update_waiting_settings``,
+``activate_waiting``, and ``leave_waiting`` atomic: the service performs the
+same checks for useful errors, while the repository repeats them while holding
+its database lock.
 """
 
 from __future__ import annotations
@@ -151,6 +152,27 @@ def validate_turn_seconds(turn_seconds: int | None) -> int | None:
     if type(turn_seconds) is not int or not 3 <= turn_seconds <= 180:
         raise ValueError("turn_seconds must be None or an integer from 3 to 180")
     return turn_seconds
+
+
+WaitingGameplaySettings = tuple[int, int | None, bool]
+
+
+def validate_waiting_gameplay_settings(
+    settings: WaitingGameplaySettings | None,
+) -> WaitingGameplaySettings | None:
+    """Validate the gameplay settings a waiting client last displayed."""
+
+    if settings is None:
+        return None
+    if type(settings) is not tuple or len(settings) != 3:
+        raise ValueError("expected_gameplay_settings must be a three-item tuple")
+    max_players, turn_seconds, bot_fill = settings
+    if type(max_players) is not int or not 2 <= max_players <= 8:
+        raise ValueError("expected max_players must be from 2 to 8")
+    seconds = validate_turn_seconds(turn_seconds)
+    if type(bot_fill) is not bool:
+        raise ValueError("expected bot fill must be boolean")
+    return (max_players, seconds, bot_fill)
 
 
 def validate_theme_key(theme_key: str) -> str:
@@ -371,8 +393,23 @@ class LobbyRepository(Protocol):
         room_id: str,
         user_id: str,
         ready: bool,
+        expected_gameplay_settings: WaitingGameplaySettings | None = None,
     ) -> LobbyRoomSnapshot:
         """Atomically change readiness for an existing player."""
+
+    def update_waiting_settings(
+        self,
+        *,
+        room_id: str,
+        requesting_owner_user_id: str,
+        expected_revision: int,
+        max_players: int,
+        allow_spectators: bool,
+        turn_seconds: int | None,
+        is_public: bool,
+        fill_empty_seats_with_bots: bool,
+    ) -> LobbyRoomSnapshot:
+        """Atomically update owner-controlled settings of a waiting room."""
 
     def activate_waiting(
         self,
@@ -629,10 +666,14 @@ class LobbyService:
         raw_room_code: str,
         *,
         ready: bool,
+        expected_gameplay_settings: WaitingGameplaySettings | None = None,
     ) -> LobbyRoomSnapshot:
         member_id = _require_user_id(user_id)
         if type(ready) is not bool:
             raise ValueError("ready must be boolean")
+        expected_settings = validate_waiting_gameplay_settings(
+            expected_gameplay_settings
+        )
         room = self.get_room(raw_room_code)
         if room.status is not StoredRoomStatus.WAITING:
             raise LobbyStateError("readiness changes are allowed only while waiting")
@@ -641,12 +682,68 @@ class LobbyService:
             raise LobbyMemberError("user is not a room member")
         if member.role is not RoomRole.PLAYER:
             raise LobbyAuthorizationError("spectators cannot become ready")
+        if expected_settings is not None and expected_settings != (
+            room.max_players,
+            room.turn_seconds,
+            room.fill_empty_seats_with_bots,
+        ):
+            raise LobbyRevisionConflict(room)
         if member.ready is ready:
             return room
         return self.repository.set_ready(
             room_id=room.id,
             user_id=member_id,
             ready=ready,
+            expected_gameplay_settings=expected_settings,
+        )
+
+    def update_settings(
+        self,
+        owner_user_id: str,
+        raw_room_code: str,
+        *,
+        expected_revision: int,
+        max_players: int,
+        allow_spectators: bool,
+        turn_seconds: int | None,
+        is_public: bool,
+        fill_empty_seats_with_bots: bool,
+    ) -> LobbyRoomSnapshot:
+        """Update settings while waiting without silently overwriting changes."""
+
+        owner = _require_user_id(owner_user_id)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected_revision must be non-negative")
+        if type(max_players) is not int or not 2 <= max_players <= 8:
+            raise ValueError("max_players must be from 2 to 8")
+        if type(allow_spectators) is not bool:
+            raise ValueError("allow_spectators must be boolean")
+        if type(is_public) is not bool:
+            raise ValueError("is_public must be boolean")
+        if type(fill_empty_seats_with_bots) is not bool:
+            raise ValueError("fill_empty_seats_with_bots must be boolean")
+        seconds = validate_turn_seconds(turn_seconds)
+
+        room = self.get_room(raw_room_code)
+        if room.status is not StoredRoomStatus.WAITING:
+            raise LobbyStateError("settings can change only while waiting")
+        if room.owner_user_id != owner:
+            raise LobbyAuthorizationError(
+                "only the room owner can change settings"
+            )
+        if max_players < len(room.players):
+            raise LobbyCapacityError(
+                "max_players cannot be lower than the current player count"
+            )
+        return self.repository.update_waiting_settings(
+            room_id=room.id,
+            requesting_owner_user_id=owner,
+            expected_revision=expected_revision,
+            max_players=max_players,
+            allow_spectators=allow_spectators,
+            turn_seconds=seconds,
+            is_public=is_public,
+            fill_empty_seats_with_bots=fill_empty_seats_with_bots,
         )
 
     def start(
@@ -1015,9 +1112,19 @@ class InMemoryLobbyRepository:
         room_id: str,
         user_id: str,
         ready: bool,
+        expected_gameplay_settings: WaitingGameplaySettings | None = None,
     ) -> LobbyRoomSnapshot:
+        expected_settings = validate_waiting_gameplay_settings(
+            expected_gameplay_settings
+        )
         with self._lock:
             room = self._waiting_room(room_id)
+            if expected_settings is not None and expected_settings != (
+                room.max_players,
+                room.turn_seconds,
+                room.fill_empty_seats_with_bots,
+            ):
+                raise LobbyRevisionConflict(room)
             member = room.member_for(user_id)
             if member is None:
                 raise LobbyMemberError("user is not a member")
@@ -1033,6 +1140,70 @@ class InMemoryLobbyRepository:
             )
             updated = replace(
                 room,
+                members=members,
+                revision=room.revision + 1,
+            )
+            self._rooms_by_id[room_id] = updated
+            return updated
+
+    def update_waiting_settings(
+        self,
+        *,
+        room_id: str,
+        requesting_owner_user_id: str,
+        expected_revision: int,
+        max_players: int,
+        allow_spectators: bool,
+        turn_seconds: int | None,
+        is_public: bool,
+        fill_empty_seats_with_bots: bool,
+    ) -> LobbyRoomSnapshot:
+        with self._lock:
+            room = self._waiting_room(room_id)
+            if room.owner_user_id != requesting_owner_user_id:
+                raise LobbyAuthorizationError(
+                    "only the room owner can change settings"
+                )
+            if room.revision != expected_revision:
+                raise LobbyRevisionConflict(room)
+            if max_players < len(room.players):
+                raise LobbyCapacityError(
+                    "max_players cannot be lower than the current player count"
+                )
+            unchanged = (
+                room.max_players == max_players
+                and room.allow_spectators is allow_spectators
+                and room.turn_seconds == turn_seconds
+                and room.is_public is is_public
+                and room.fill_empty_seats_with_bots
+                is fill_empty_seats_with_bots
+            )
+            if unchanged:
+                return room
+
+            gameplay_changed = (
+                room.max_players != max_players
+                or room.turn_seconds != turn_seconds
+                or room.fill_empty_seats_with_bots
+                is not fill_empty_seats_with_bots
+            )
+            members = (
+                tuple(
+                    replace(member, ready=False)
+                    if member.role is RoomRole.PLAYER and member.ready
+                    else member
+                    for member in room.members
+                )
+                if gameplay_changed
+                else room.members
+            )
+            updated = replace(
+                room,
+                max_players=max_players,
+                allow_spectators=allow_spectators,
+                turn_seconds=turn_seconds,
+                is_public=is_public,
+                fill_empty_seats_with_bots=fill_empty_seats_with_bots,
                 members=members,
                 revision=room.revision + 1,
             )

@@ -376,6 +376,171 @@ class LobbyServiceTests(unittest.TestCase):
         with self.assertRaises(LobbyMemberError):
             self.service.set_ready("stranger", room.room_code, ready=True)
 
+    def test_owner_updates_waiting_settings_and_resets_all_readiness(
+        self,
+    ) -> None:
+        room = self.create_room(max_players=4)
+        self.service.join_as_player("guest", room.room_code)
+        self.service.set_ready("owner", room.room_code, ready=True)
+        ready = self.service.set_ready(
+            "guest",
+            room.room_code,
+            ready=True,
+        )
+
+        updated = self.service.update_settings(
+            "owner",
+            room.room_code,
+            expected_revision=ready.revision,
+            max_players=3,
+            allow_spectators=False,
+            turn_seconds=None,
+            is_public=True,
+            fill_empty_seats_with_bots=True,
+        )
+
+        self.assertEqual(updated.revision, ready.revision + 1)
+        self.assertEqual(updated.max_players, 3)
+        self.assertFalse(updated.allow_spectators)
+        self.assertIsNone(updated.turn_seconds)
+        self.assertTrue(updated.is_public)
+        self.assertTrue(updated.fill_empty_seats_with_bots)
+        self.assertTrue(all(not player.ready for player in updated.players))
+        self.assertEqual(
+            tuple(player.user_id for player in updated.players),
+            ("owner", "guest"),
+        )
+        with self.assertRaises(LobbyNotReadyError):
+            self.service.start("owner", room.room_code)
+
+    def test_ready_rejects_gameplay_settings_not_seen_by_player(
+        self,
+    ) -> None:
+        room = self.create_room(max_players=4)
+        joined = self.service.join_as_player("guest", room.room_code)
+        displayed_settings = (
+            joined.max_players,
+            joined.turn_seconds,
+            joined.fill_empty_seats_with_bots,
+        )
+        updated = self.service.update_settings(
+            "owner",
+            room.room_code,
+            expected_revision=joined.revision,
+            max_players=3,
+            allow_spectators=joined.allow_spectators,
+            turn_seconds=None,
+            is_public=joined.is_public,
+            fill_empty_seats_with_bots=True,
+        )
+
+        with self.assertRaises(LobbyRevisionConflict) as service_conflict:
+            self.service.set_ready(
+                "guest",
+                room.room_code,
+                ready=True,
+                expected_gameplay_settings=displayed_settings,
+            )
+        self.assertEqual(service_conflict.exception.current_room, updated)
+        with self.assertRaises(LobbyRevisionConflict) as repo_conflict:
+            self.repository.set_ready(
+                room_id=room.id,
+                user_id="guest",
+                ready=True,
+                expected_gameplay_settings=displayed_settings,
+            )
+        self.assertEqual(repo_conflict.exception.current_room, updated)
+
+        confirmed = self.service.set_ready(
+            "guest",
+            room.room_code,
+            ready=True,
+            expected_gameplay_settings=(
+                updated.max_players,
+                updated.turn_seconds,
+                updated.fill_empty_seats_with_bots,
+            ),
+        )
+        confirmed_guest = confirmed.member_for("guest")
+        self.assertIsNotNone(confirmed_guest)
+        self.assertTrue(confirmed_guest.ready)
+
+    def test_unchanged_settings_are_a_read_only_success(self) -> None:
+        room = self.create_room(max_players=4)
+        ready = self.service.set_ready(
+            "owner",
+            room.room_code,
+            ready=True,
+        )
+
+        unchanged = self.service.update_settings(
+            "owner",
+            room.room_code,
+            expected_revision=ready.revision,
+            max_players=ready.max_players,
+            allow_spectators=ready.allow_spectators,
+            turn_seconds=ready.turn_seconds,
+            is_public=ready.is_public,
+            fill_empty_seats_with_bots=ready.fill_empty_seats_with_bots,
+        )
+
+        self.assertEqual(unchanged, ready)
+        self.assertTrue(unchanged.member_for("owner").ready)  # type: ignore[union-attr]
+
+    def test_waiting_settings_require_owner_and_current_revision(self) -> None:
+        room = self.create_room(max_players=4)
+        joined = self.service.join_as_player("guest", room.room_code)
+        self.service.join_as_spectator("watcher", room.room_code)
+
+        for user_id in ("guest", "watcher", "stranger"):
+            with self.subTest(user_id=user_id), self.assertRaises(
+                LobbyAuthorizationError
+            ):
+                self.service.update_settings(
+                    user_id,
+                    room.room_code,
+                    expected_revision=joined.revision,
+                    max_players=3,
+                    allow_spectators=True,
+                    turn_seconds=10,
+                    is_public=True,
+                    fill_empty_seats_with_bots=False,
+                )
+
+        current = self.service.get_room(room.room_code)
+        with self.assertRaises(LobbyRevisionConflict) as caught:
+            self.service.update_settings(
+                "owner",
+                room.room_code,
+                expected_revision=room.revision,
+                max_players=3,
+                allow_spectators=True,
+                turn_seconds=10,
+                is_public=True,
+                fill_empty_seats_with_bots=False,
+            )
+        self.assertEqual(caught.exception.current_room, current)
+        self.assertEqual(self.service.get_room(room.room_code), current)
+
+    def test_waiting_settings_cannot_shrink_below_present_players(self) -> None:
+        room = self.create_room(max_players=4)
+        self.service.join_as_player("guest-a", room.room_code)
+        current = self.service.join_as_player("guest-b", room.room_code)
+
+        with self.assertRaises(LobbyCapacityError):
+            self.service.update_settings(
+                "owner",
+                room.room_code,
+                expected_revision=current.revision,
+                max_players=2,
+                allow_spectators=False,
+                turn_seconds=None,
+                is_public=True,
+                fill_empty_seats_with_bots=True,
+            )
+
+        self.assertEqual(self.service.get_room(room.room_code), current)
+
     def test_start_requires_owner_two_players_and_every_player_ready(self) -> None:
         room = self.create_room()
         with self.assertRaises(LobbyNotReadyError):

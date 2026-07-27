@@ -37,8 +37,11 @@ from .bots import canonical_kana, final_kana
 from .game_session import SessionCode
 from .database import GameRepository
 from .lobby import (
+    LobbyAuthorizationError,
+    LobbyCapacityError,
     LobbyError,
     LobbyNameConflict,
+    LobbyRevisionConflict,
     LobbyRoomSnapshot,
     LobbyService,
     LobbyStateError,
@@ -155,6 +158,11 @@ _END_REASON_TEXT = {
 }
 _SOUND_CUE_NOTES = {
     "accepted": ((659, 0.00, 0.08), (880, 0.07, 0.10)),
+    "your_turn": (
+        (659, 0.00, 0.62),
+        (1318, 0.00, 0.42),
+        (1977, 0.00, 0.28),
+    ),
     "error": ((247, 0.00, 0.12), (196, 0.09, 0.14)),
     "elimination": ((392, 0.00, 0.10), (294, 0.09, 0.14)),
     "victory": (
@@ -164,6 +172,9 @@ _SOUND_CUE_NOTES = {
     ),
     "finish": ((440, 0.00, 0.11), (349, 0.10, 0.16)),
 }
+_DEFAULT_SOUND_PEAK = 0.035
+_YOUR_TURN_SOUND_PEAK = _DEFAULT_SOUND_PEAK * 1.5
+
 
 
 def _public_seat_label(
@@ -182,6 +193,34 @@ def _public_seat_label(
     ):
         return f"Bot {seat_index + 1}"
     return f"プレイヤー{seat_index + 1}"
+
+
+def _turn_seat_label(
+    snapshot: RoomSnapshot,
+    user_id: str,
+    display_names: Mapping[str, str],
+) -> str:
+    """Return a readable current-turn label without exposing account IDs."""
+
+    seat = snapshot.players[snapshot.current_turn]
+    owner_id = seat.owner_user_id
+    display_name = (
+        display_names.get(owner_id)
+        if owner_id is not None
+        else None
+    )
+    if seat.controller is SeatController.BOT:
+        if owner_id == user_id:
+            own_label = (
+                f"あなた（{display_name}）" if display_name else "あなた"
+            )
+            return f"{own_label}の代行Bot"
+        if display_name:
+            return f"{display_name}の代行Bot"
+        return f"Bot {seat.index + 1}"
+    if owner_id == user_id:
+        return f"あなた（{display_name}）" if display_name else "あなた"
+    return display_name or f"プレイヤー{seat.index + 1}"
 
 
 def _reaction_sender_label(
@@ -346,6 +385,16 @@ def _result_share_script() -> str:
 """.strip()
 
 
+def _has_user_human_turn(snapshot: RoomSnapshot, user_id: str) -> bool:
+    seat = snapshot.seat_for_user(user_id)
+    return (
+        snapshot.status is RoomStatus.ACTIVE
+        and seat is not None
+        and snapshot.current_turn == seat.index
+        and seat.controller is SeatController.HUMAN
+    )
+
+
 def _snapshot_effect(
     previous: RoomSnapshot | None,
     current: RoomSnapshot,
@@ -366,11 +415,19 @@ def _snapshot_effect(
         result = _match_result_presentation(current, user_id)
         sound = "victory" if result.tone == "victory" else "finish"
         return _SnapshotEffect("finish", sound)
+    effect: _SnapshotEffect | None = None
     if len(current.eliminated_seats) > len(previous.eliminated_seats):
-        return _SnapshotEffect("elimination", "elimination")
-    if len(current.history) > len(previous.history):
-        return _SnapshotEffect("accepted", "accepted")
-    return None
+        effect = _SnapshotEffect("elimination", "elimination")
+    elif len(current.history) > len(previous.history):
+        effect = _SnapshotEffect("accepted", "accepted")
+    if effect is None:
+        return None
+    if (
+        not _has_user_human_turn(previous, user_id)
+        and _has_user_human_turn(current, user_id)
+    ):
+        return _SnapshotEffect(effect.kind, "your_turn")
+    return effect
 
 
 def _sound_cue_script(cue: str) -> str:
@@ -380,6 +437,9 @@ def _sound_cue_script(cue: str) -> str:
         notes = _SOUND_CUE_NOTES[cue]
     except KeyError as error:
         raise ValueError("unknown sound cue") from error
+    peak_gain = _DEFAULT_SOUND_PEAK
+    if cue == "your_turn":
+        peak_gain = _YOUR_TURN_SOUND_PEAK / math.sqrt(len(notes))
     encoded_notes = ",".join(
         f"[{frequency},{delay:.2f},{duration:.2f}]"
         for frequency, delay, duration in notes
@@ -399,7 +459,7 @@ def _sound_cue_script(cue: str) -> str:
         "oscillator.type='sine';"
         "oscillator.frequency.setValueAtTime(frequency,start);"
         "gain.gain.setValueAtTime(0.0001,start);"
-        "gain.gain.exponentialRampToValueAtTime(0.035,start+0.01);"
+        f"gain.gain.exponentialRampToValueAtTime({peak_gain:.4f},start+0.01);"
         "gain.gain.exponentialRampToValueAtTime(0.0001,start+duration);"
         "oscillator.connect(gain);gain.connect(context.destination);"
         "oscillator.start(start);oscillator.stop(start+duration+0.02);"
@@ -486,6 +546,28 @@ def _room_timer_text(turn_seconds: int | None) -> str:
     """Return the compact Japanese timer label shared by room screens."""
 
     return "無制限" if turn_seconds is None else f"{turn_seconds}秒"
+
+
+def _room_timer_value(turn_seconds: int | None) -> str:
+    """Return the select value for one validated room timer."""
+
+    if turn_seconds is None:
+        return "unlimited"
+    if type(turn_seconds) is not int or not 3 <= turn_seconds <= 180:
+        raise ValueError("invalid room timer")
+    return str(turn_seconds)
+
+
+def _parse_room_timer_value(value: object) -> int | None:
+    """Parse the room timer values shared by create and waiting screens."""
+
+    if value == "unlimited":
+        return None
+    if isinstance(value, str) and value.isdigit():
+        seconds = int(value)
+        if 3 <= seconds <= 180:
+            return seconds
+    raise ValueError("invalid room timer")
 
 
 def _room_listing_summary(room: object) -> str:
@@ -1532,17 +1614,7 @@ def register_auth_pages(
                         room_busy = False
 
                         def room_turn_seconds() -> int | None:
-                            value = room_timer_select.value
-                            if value == "unlimited":
-                                return None
-                            if (
-                                isinstance(value, str)
-                                and value.isdigit()
-                            ):
-                                seconds = int(value)
-                                if 3 <= seconds <= 180:
-                                    return seconds
-                            raise ValueError("invalid room timer")
+                            return _parse_room_timer_value(room_timer_select.value)
 
                         async def create_room() -> None:
                             nonlocal room_busy
@@ -3057,6 +3129,8 @@ def register_auth_pages(
             request, initial_room.room_code
         )
         refreshing = False
+        settings_saving = False
+        settings_edit_revision = initial_room.revision
 
         def render_room(room) -> None:
             nonlocal current_room
@@ -3073,10 +3147,15 @@ def register_auth_pages(
                 if room.fill_empty_seats_with_bots
                 else "Bot補充なし"
             )
+            spectator_access = (
+                "新規観戦可"
+                if room.allow_spectators
+                else "新規観戦不可"
+            )
             settings_label.set_text(
                 f"{visibility}・制限時間: "
                 f"{_room_timer_text(room.turn_seconds)}・"
-                f"最大{room.max_players}人・{bot_fill}"
+                f"最大{room.max_players}人・{bot_fill}・{spectator_access}"
             )
             members_box.clear()
             with members_box:
@@ -3111,6 +3190,15 @@ def register_auth_pages(
                     else "準備OKにする"
                 )
             is_owner = room.owner_user_id == user_id
+            settings_button.set_visibility(is_owner)
+            if is_owner:
+                if settings_saving:
+                    settings_button.disable()
+                else:
+                    settings_button.enable()
+            else:
+                settings_button.disable()
+                settings_dialog.close()
             start_button.set_visibility(is_owner)
             if is_owner and room.all_players_ready:
                 start_button.enable()
@@ -3194,7 +3282,8 @@ def register_auth_pages(
         async def toggle_ready() -> None:
             if not await waiting_session_is_valid():
                 return
-            member = current_room.member_for(user_id)
+            displayed_room = current_room
+            member = displayed_room.member_for(user_id)
             if member is None or member.role is not RoomRole.PLAYER:
                 return
             ready_button.disable()
@@ -3202,8 +3291,23 @@ def register_auth_pages(
                 room = await asyncio.to_thread(
                     lobby.set_ready,
                     user_id,
-                    current_room.room_code,
+                    displayed_room.room_code,
                     ready=not member.ready,
+                    expected_gameplay_settings=(
+                        displayed_room.max_players,
+                        displayed_room.turn_seconds,
+                        displayed_room.fill_empty_seats_with_bots,
+                    ),
+                )
+            except LobbyRevisionConflict as error:
+                latest = error.current_room
+                if latest is not None:
+                    render_room(latest)
+                else:
+                    await refresh_room()
+                message_label.set_text(
+                    "対戦設定が変更されました。最新の内容を確認して、"
+                    "もう一度準備OKを押してください。"
                 )
             except LobbyError:
                 message_label.set_text(
@@ -3249,7 +3353,129 @@ def register_auth_pages(
                 poll_timer.deactivate()
                 ui.navigate.to("/lobby")
 
+        def populate_settings_editor(room: LobbyRoomSnapshot) -> None:
+            nonlocal settings_edit_revision
+            settings_edit_revision = room.revision
+            settings_players_select.set_value(room.max_players)
+            settings_timer_select.set_value(
+                _room_timer_value(room.turn_seconds)
+            )
+            settings_spectator_switch.set_value(room.allow_spectators)
+            settings_public_switch.set_value(room.is_public)
+            settings_bot_fill_switch.set_value(
+                room.fill_empty_seats_with_bots
+            )
+
+        def open_settings_editor() -> None:
+            if (
+                settings_saving
+                or current_room.owner_user_id != user_id
+                or current_room.status is not StoredRoomStatus.WAITING
+            ):
+                return
+            settings_error.set_text("")
+            populate_settings_editor(current_room)
+            settings_dialog.open()
+
+        async def save_room_settings() -> None:
+            nonlocal settings_saving
+            if settings_saving:
+                return
+            settings_saving = True
+            settings_save_button.disable()
+            settings_cancel_button.disable()
+            settings_button.disable()
+            try:
+                if not await waiting_session_is_valid():
+                    return
+                max_players = settings_players_select.value
+                if type(max_players) is not int or not 2 <= max_players <= 8:
+                    raise ValueError("invalid player count")
+                turn_seconds = _parse_room_timer_value(
+                    settings_timer_select.value
+                )
+                allow_spectators = settings_spectator_switch.value
+                is_public = settings_public_switch.value
+                fill_empty_seats_with_bots = (
+                    settings_bot_fill_switch.value
+                )
+                if any(
+                    type(value) is not bool
+                    for value in (
+                        allow_spectators,
+                        is_public,
+                        fill_empty_seats_with_bots,
+                    )
+                ):
+                    raise ValueError("invalid room switch")
+                gameplay_changed = (
+                    current_room.max_players != max_players
+                    or current_room.turn_seconds != turn_seconds
+                    or current_room.fill_empty_seats_with_bots
+                    is not fill_empty_seats_with_bots
+                )
+                room = await asyncio.to_thread(
+                    lobby.update_settings,
+                    user_id,
+                    current_room.room_code,
+                    expected_revision=settings_edit_revision,
+                    max_players=max_players,
+                    allow_spectators=allow_spectators,
+                    turn_seconds=turn_seconds,
+                    is_public=is_public,
+                    fill_empty_seats_with_bots=(
+                        fill_empty_seats_with_bots
+                    ),
+                )
+            except LobbyRevisionConflict as error:
+                latest = error.current_room
+                if latest is not None:
+                    render_room(latest)
+                    populate_settings_editor(latest)
+                else:
+                    await refresh_room()
+                settings_error.set_text(
+                    "参加者または設定が更新されました。"
+                    "最新の内容を確認して、もう一度保存してください。"
+                )
+            except LobbyCapacityError:
+                settings_error.set_text(
+                    "現在の対戦参加者より少ない人数には変更できません。"
+                )
+            except LobbyAuthorizationError:
+                settings_error.set_text(
+                    "部屋の設定を変更できるのは現在の部屋主だけです。"
+                )
+            except LobbyStateError:
+                settings_error.set_text(
+                    "部屋の設定は待機中だけ変更できます。"
+                )
+            except (LobbyError, TypeError, ValueError):
+                settings_error.set_text(
+                    "設定内容を確認して、もう一度お試しください。"
+                )
+            except Exception:
+                LOGGER.exception("failed to update waiting room settings")
+                settings_error.set_text(
+                    "設定を保存できませんでした。少し待ってお試しください。"
+                )
+            else:
+                render_room(room)
+                settings_dialog.close()
+                message_label.set_text(
+                    "設定を保存しました。対戦条件が変わったため、"
+                    "全員の準備を解除しました。"
+                    if gameplay_changed
+                    else "設定を保存しました。"
+                )
+            finally:
+                settings_saving = False
+                settings_save_button.enable()
+                settings_cancel_button.enable()
+                if current_room.owner_user_id == user_id:
+                    settings_button.enable()
         def copy_invite_url() -> None:
+
             ui.clipboard.write(invite_url)
             invite_feedback.set_text(
                 "招待URLをコピーしました。"
@@ -3300,6 +3526,12 @@ def register_auth_pages(
                         message_label = ui.label("").classes(
                             "platform-muted"
                         ).props("role='status' aria-live='polite'")
+                        settings_button = ui.button(
+                            "部屋設定を変更",
+                            icon="tune",
+                            on_click=open_settings_editor,
+                        ).props("outline no-caps").classes("w-full")
+                        settings_button.set_visibility(False)
                         ready_button = ui.button(
                             "準備OKにする",
                             on_click=toggle_ready,
@@ -3314,6 +3546,68 @@ def register_auth_pages(
                             on_click=leave_room,
                         ).props("flat no-caps").classes("w-full")
 
+        with ui.dialog() as settings_dialog, ui.card().classes(
+            "confirm-dialog room-settings-dialog"
+        ):
+            ui.label("部屋設定を変更").classes("auth-title")
+            ui.label(
+                "部屋主だけが、対戦を始める前に変更できます。"
+            ).classes("platform-muted")
+            settings_players_select = ui.select(
+                options={
+                    number: f"{number}人"
+                    for number in range(2, 9)
+                },
+                value=initial_room.max_players,
+                label="最大人数",
+            ).props("outlined options-dense").classes("w-full")
+            settings_timer_select = ui.select(
+                options={
+                    "unlimited": "無制限",
+                    "3": "3秒",
+                    "10": "10秒",
+                    "30": "30秒",
+                    "60": "1分",
+                    "180": "3分",
+                },
+                value=_room_timer_value(initial_room.turn_seconds),
+                label="1手の制限時間",
+            ).props("outlined options-dense").classes("w-full")
+            settings_spectator_switch = ui.switch(
+                "観戦を許可する",
+                value=initial_room.allow_spectators,
+            )
+            settings_public_switch = ui.switch(
+                "ロビーの公開部屋一覧に表示する",
+                value=initial_room.is_public,
+            )
+            settings_bot_fill_switch = ui.switch(
+                "不足人数をNormal Botで補う",
+                value=initial_room.fill_empty_seats_with_bots,
+            )
+            ui.label(
+                "最大人数・制限時間・Bot補充を変えると、"
+                "全員の準備状態が解除されます。"
+            ).classes("platform-muted room-setting-help")
+            ui.label(
+                "観戦をOFFにしても、すでに入室している観戦者は"
+                "退出するまで残り、新しい観戦参加だけを止めます。"
+            ).classes("platform-muted room-setting-help")
+            settings_error = ui.label("").classes(
+                "auth-error"
+            ).props("role='alert' aria-live='assertive'")
+            with ui.row().classes(
+                "w-full items-center justify-end gap-2"
+            ):
+                settings_cancel_button = ui.button(
+                    "キャンセル",
+                    on_click=settings_dialog.close,
+                ).props("flat no-caps")
+                settings_save_button = ui.button(
+                    "設定を保存",
+                    icon="save",
+                    on_click=save_room_settings,
+                ).props("unelevated no-caps")
         render_room(initial_room)
         poll_timer = ui.timer(1.5, refresh_room)
 
@@ -3344,6 +3638,8 @@ def register_auth_pages(
             sound_muted = False
             reduced_motion = False
         current_snapshot: RoomSnapshot | None = None
+        seat_display_names = {user_id: principal.account.display_name}
+        display_name_user_ids: tuple[str, ...] = ()
         pending_submission: tuple[str, int, str] | None = None
         transient_feedback: _VersionedFeedback | None = None
         rendered_history: tuple[object, ...] | None = None
@@ -3360,7 +3656,32 @@ def register_auth_pages(
         polling = False
         session_invalidated = False
 
+        async def refresh_seat_display_names(
+            snapshot: RoomSnapshot,
+        ) -> None:
+            nonlocal seat_display_names, display_name_user_ids
+            player_user_ids = tuple(
+                dict.fromkeys(
+                    seat.owner_user_id
+                    for seat in snapshot.players
+                    if seat.owner_user_id is not None
+                )
+            )
+            if player_user_ids == display_name_user_ids:
+                return
+            try:
+                resolved = await asyncio.to_thread(
+                    auth.display_names_for_user_ids,
+                    player_user_ids,
+                )
+            except Exception:
+                LOGGER.exception("failed to resolve room display names")
+                resolved = {}
+            resolved[user_id] = principal.account.display_name
+            seat_display_names = resolved
+            display_name_user_ids = player_user_ids
         def persist_game_preferences() -> None:
+
             if preference_storage is None:
                 return
             try:
@@ -3638,22 +3959,14 @@ def register_auth_pages(
                 if snapshot.expected_kana is not None
                 else "自由"
             )
-            current_seat = snapshot.players[snapshot.current_turn]
-            if current_seat.controller is SeatController.BOT:
-                bot_label = (
-                    "代行Bot"
-                    if current_seat.owner_user_id == user_id
-                    else f"Bot {current_seat.index + 1}"
-                )
-                turn_label.set_text(
-                    f"{bot_label} の番です"
-                )
-            elif current_seat.owner_user_id == user_id:
-                turn_label.set_text("あなたの番です")
+            turn_owner = _turn_seat_label(
+                snapshot, user_id, seat_display_names
+            )
+            turn_label.set_text(f"{turn_owner}の番です")
+            if _has_user_human_turn(snapshot, user_id):
+                turn_card.classes(add="game-turn-card--mine")
             else:
-                turn_label.set_text(
-                    f"プレイヤー{current_seat.index + 1}の番です"
-                )
+                turn_card.classes(remove="game-turn-card--mine")
             deadline = _deadline_presentation(snapshot.deadline_at)
             deadline_label.set_text(deadline.text)
             deadline_label.classes(
@@ -3924,6 +4237,7 @@ def register_auth_pages(
                     or event.snapshot is None
                 ):
                     return
+                await refresh_seat_display_names(event.snapshot)
                 with client:
                     render(event.snapshot)
                     if (
@@ -3998,6 +4312,7 @@ def register_auth_pages(
                     "対局へ接続できませんでした。"
                 )
             else:
+                await refresh_seat_display_names(snapshot)
                 render(snapshot)
             finally:
                 attaching = False
@@ -4020,6 +4335,7 @@ def register_auth_pages(
                     word_input.disable()
                     submit_button.disable()
                     return
+                await refresh_seat_display_names(snapshot)
                 render(snapshot)
                 if (
                     snapshot.status is RoomStatus.FINISHED
@@ -4401,7 +4717,9 @@ def register_auth_pages(
                     "role='log' aria-live='polite' aria-relevant='additions'"
                 )
                 with ui.element("section").classes("dashboard-grid"):
-                    with ui.column().classes("dashboard-card"):
+                    with ui.column().classes(
+                        "dashboard-card game-turn-card"
+                    ) as turn_card:
                         status_label = ui.label("接続中").classes(
                             "aside-title"
                         )
