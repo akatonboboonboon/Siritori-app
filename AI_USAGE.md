@@ -27,12 +27,12 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 | 2026-07-24 | OpenAI Codex | プロジェクト基盤 | `main.py`、`shiritori/`、`assets/styles.css`、Render設定、README、自動テストを実装した | 完了 | Codexが13件のルールテストと3件のNiceGUI操作シミュレーションを実行済み。応募者本人によるコードレビューと実ブラウザ確認は未実施 | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 | 2026-07-24 | OpenAI Codex | 共同開発文書 | `CONTRIBUTING.md` と本ファイルを作成し、ブランチ、Draft PR、担当宣言、秘密情報、AI記録の運用を文書化した | 完了 | 応募者本人が運用内容を読み、自分の作業方法に合うか確認する | [#1](https://github.com/akatonboboonboon/Siritori-app/pull/1) |
 | 2026-07-24 | OpenAI Codex | ルール・ロードマップ | 応募者本人が決めた単語規則、Neon採用、PC・スマートフォン対応を、画面別の合格条件と段階的PRへ整理して `docs/RULES.md` と `docs/ROADMAP.md` に記録した | 完了（本人レビュー待ち） | 応募者本人が一文字、同音語、Bot、切断時の規則と、自分が実装する担当範囲を最終確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2) |
-| 2026-07-24 | OpenAI Codex | 無料構成 | Render Free＋Neon PostgreSQL、DBを正本にするRoomHub、認証、再接続、環境変数を設計し、SQLリポジトリと起動処理へ反映した | AI担当基盤完了 | 応募者本人が無料枠の最新条件、Dashboard設定、実デプロイを確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／最終Draft PRへ追記予定 |
-| 2026-07-24 | OpenAI Codex | 実在語判定 | `shiritori/lexicon.py`、固定版Sudachi依存、辞書テスト、第三者ソフトウェア表記を作成した。完全一致の名詞、漢字読み、複数読み、一文字、絵文字、未知語を検証する | 完了・ゲーム状態と公開画面へ接続済み | 応募者本人はコード、辞書判定例、読み選択操作を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／最終Draft PRへ追記予定 |
-| 2026-07-24 | OpenAI Codex | 認証・永続化 | Argon2id、不透明セッション、CSRF／Origin検証、正規化ユーザー名＋IPの登録・ログイン制限、本文サイズ制限、Argon2同時実行制限、AlembicとNeon向けSQLリポジトリを実装した | AI担当完了・最終統合中 | 応募者本人が登録・ログイン・ログアウト、再起動後の保持、エラー文を確認する | 最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | 無料構成 | Render Free＋Neon PostgreSQL、DBを正本にするRoomHub、認証、再接続、環境変数を設計し、SQLリポジトリと起動処理へ反映した | AI基盤完了・本番接続確認済み | 応募者本人が無料枠の最新条件とDashboardの`ADMIN_USERNAMES`設定を最終確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／[#24](https://github.com/akatonboboonboon/Siritori-app/pull/24) |
+| 2026-07-24 | OpenAI Codex | 実在語判定 | `shiritori/lexicon.py`、固定版Sudachi依存、辞書テスト、第三者ソフトウェア表記を作成した。完全一致の名詞、漢字読み、複数読み、一文字、絵文字、未知語を検証する | 完了・ゲーム状態と公開画面へ接続済み | 応募者本人は公開画面で辞書判定例と読み選択操作を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／[#24](https://github.com/akatonboboonboon/Siritori-app/pull/24) |
+| 2026-07-24 | OpenAI Codex | 認証・永続化 | Argon2id、不透明セッション、CSRF／Origin検証、正規化ユーザー名＋IPの登録・ログイン制限、本文サイズ制限、Argon2同時実行制限、AlembicとNeon向けSQLリポジトリを実装した | AI実装完了・本番DB疎通確認済み | 応募者本人が登録、再ログイン、再デプロイ後の保持とエラー文を確認する | [#2](https://github.com/akatonboboonboon/Siritori-app/pull/2)／[#24](https://github.com/akatonboboonboon/Siritori-app/pull/24) |
 | 2026-07-24 | OpenAI Codex | ロビー・オンライン対局 | 部屋作成、準備、観戦、オンライン対局画面、単語同期、複数タブpresence、切断と再起動後の猶予、Bot引継ぎ・本人復帰を実装した | 画面まで統合済み | 応募者本人が公開URLと実機で観戦・切断・復帰を確認する | [#8](https://github.com/akatonboboonboon/Siritori-app/pull/8) |
-| 2026-07-24 | OpenAI Codex | ソロBot戦・テーマ | ソロ戦の保存・一時停止・再開、Normal／Hard Bot、サーバー側テーマ制約、Bot数・難易度・テーマ・時間の設定画面を実装した | 画面まで統合済み | 応募者本人がEasy Botとタイマー警告の表現を実装・確認する | [#7](https://github.com/akatonboboonboon/Siritori-app/pull/7) |
-| 2026-07-24 | OpenAI Codex | テーマ単語データ | 応募者本人が林檎／蜜柑／西瓜を入力し、Codexが公開されている日本語WordNet 1.1から9テーマの候補を抽出した。Wikipedia pageviewsは候補の順位付けだけに使い、Sudachi検査、CSV、ローダー、アプリへの登録、自動テストを実装した。データは開発時に抽出済みで、アプリ実行時の外部通信は行わない | AI実装完了・本人目視レビュー待ち | 応募者本人が収録語を目視レビューし、誤分類を修正する | 最終Draft PRへ追記予定 |
+| 2026-07-24 | OpenAI Codex | ソロBot戦・テーマ | ソロ戦の保存・一時停止・再開、Normal／Hard Bot、サーバー側テーマ制約、Bot数・難易度・テーマ・時間の設定画面を実装した。後続PRでEasy Botと警告表示を追加し、テーマ機能は本人判断で完全廃止した | AI実装完了・テーマ廃止済み | 応募者本人が3難易度とタイマー警告のプレイ感を確認する | [#7](https://github.com/akatonboboonboon/Siritori-app/pull/7)／[#16](https://github.com/akatonboboonboon/Siritori-app/pull/16)／[#21](https://github.com/akatonboboonboon/Siritori-app/pull/21) |
+| 2026-07-24 | OpenAI Codex | テーマ単語データ | 応募者本人が林檎／蜜柑／西瓜を入力し、Codexが公開されている日本語WordNet 1.1から9テーマの候補を抽出した。Wikipedia pageviewsは候補の順位付けだけに使い、Sudachi検査、CSV、ローダー、アプリへの登録、自動テストを実装した。実行時の外部通信は行わなかった | 開発履歴として保存・実行時テーマ機能は廃止 | 分類レビューは不要。応募者本人はテーマ選択や制約が公開画面に残っていないことを確認する | [#20](https://github.com/akatonboboonboon/Siritori-app/pull/20)／[#21](https://github.com/akatonboboonboon/Siritori-app/pull/21) |
 | 2026-07-26 | OpenAI Codex | 単語の複数テーマ分類・16テーマ化 | 応募者本人が食べ物テーマで油淋鶏・湯豆腐などの一般語が拒否される問題を発見し、一般語彙全体へ分類を付ける設計を提案した。Codexが一般Bot語彙と旧9テーマを1枚のmulti-label表へ統合し、多義語の全sense安全判定、旧分類不変hash、reviewed override、7テーマ追加、ユーリンチーの限定alias、再生成器と回帰テストを実装した。実行時の外部検索は採用していない | AI実装完了・本人レビュー待ち | 応募者本人が16テーマを遊び、収録語・誤分類・長いテーマ名のPC／スマートフォン表示を確認する。Codexは全298テストと固定入力からのCSV再生成一致を確認済み | [#20](https://github.com/akatonboboonboon/Siritori-app/pull/20) |
 | 2026-07-26 | OpenAI Codex | テーマ機能の完全廃止 | 応募者本人が、一般語をテーマへ漏れなく分類し続ける調整はいたちごっこになると判断し、旧保存対局を含めてテーマ選択・表示・判定を廃止する方針を決定した。Codexが新規・再開PvP／ソロの人間入力とBotを一般辞書へ統一し、`theme_key`と旧分類データはスキーマ・開発履歴だけのため残す処理と文書を整えた | AI実装完了・本人確認待ち | 応募者本人がテーマ選択・表示がないこと、旧保存対局もテーマ制約なしで再開できることを確認する | [#21](https://github.com/akatonboboonboon/Siritori-app/pull/21) |
 | 2026-07-26 | OpenAI Codex | Bot語彙・3難易度 | 応募者本人から開発継続の指示を受け、公式日本語WordNetから一般名詞を抽出し、Sudachi完全一致検査済み27,781語のオフラインCSV、Easy Bot、Hard Botの大語彙向け探索キャッシュ、再生成スクリプトと自動テストを実装した | AI実装完了・本人レビュー待ち | 応募者本人が3難易度を遊び、強さ・不自然な収録語・表示を確認する | [#15](https://github.com/akatonboboonboon/Siritori-app/pull/15) |
@@ -45,7 +45,7 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 | 2026-07-26 | OpenAI Codex | 戦績・ランキング・スコアアタック・観戦・再戦 | 応募者本人が選んだ追加機能の次段階として、Codexが終了CASと同じトランザクションで一度だけ保存する人間戦績、初期値非公開のopt-in PvP勝数／スコアアタックランキング、固定3分のスコアアタック、進行中観戦、脱落時の開始文字引継ぎを実装した。追加指示により、Bot戦の同設定再挑戦と、PvP終了時に旧Gameを保持したまま同じ部屋をWAITINGへ戻し、新規参加者を加えて別IDの次戦を開始する複数ラウンド制御も実装した。`0003_match_statistics`、`0004_score_attack_runs`、`0005_room_current_game`はRender起動時に自動適用し、新しい環境変数は追加していない | AI実装・全388件の自動テスト成功／本人手動確認待ち | 応募者本人がPC・スマートフォンと2ブラウザで戦績、公開設定、2種類のランキング、スコアアタック再開、進行中観戦、開始文字引継ぎ、Bot再戦、PvP待機復帰と追加参加を確認する | [#23](https://github.com/akatonboboonboon/Siritori-app/pull/23) |
 | 2026-07-26 | OpenAI Codex | リアクション・結果演出・単語追加リクエスト | 応募者本人が残っていた機能もすべて追加すると決定した。Codexが、プレイヤー／観戦者認可と1秒制限を持つ固定5絵文字の非永続リアクション、外部素材を使わない生成効果音、モーション軽減、公開用席名だけで作るレスポンシブなリザルト、ログインユーザーが単語・ひらがなの読み・任意補足を送って本人一覧を確認できる審査制申請を実装した。申請は`0006_word_suggestions`へ永続化するが、一般辞書・Bot語彙と分離し、送信や審査状態だけでは対局に使える語を変更しない | AI実装・全419件の自動テスト成功／本人手動確認待ち | 応募者本人が2ブラウザとPC・実スマートフォンでリアクション、効果音OFF、演出軽減、勝敗別リザルト、申請の保存・本人限定一覧・即時辞書反映されないことを確認する | [#24](https://github.com/akatonboboonboon/Siritori-app/pull/24) |
 | 2026-07-26 | OpenAI Codex | 単語審査・デイリー・結果共有・チュートリアル | 応募者本人が最終追加として審査、デイリーチャレンジ、リザルト共有、チュートリアルを選び、初期管理者名を「あかとんぼ」と決定した。Codexが、Render環境変数による管理者allowlist、申請のグループ審査と監査記録、通常対局の人間入力だけに使う承認語フォールバック、JST日替わり・1日1回・3分・途中再開・公開ランキング付きデイリー、Web Share／クリップボード共有、初回4ステップチュートリアル、`0007_final_features`を実装した。ランキング対象モードは固定Sudachi辞書を使い、管理権限はコードへ固定せず各操作でDBの有効アカウントを再確認する | AI実装・全491件の自動テスト成功／認証済みHTTP確認成功／本人実機確認待ち | 応募者本人がRenderへ`ADMIN_USERNAMES=あかとんぼ`を設定し、PC・実スマートフォンで審査、承認語、デイリー、共有、初回チュートリアルを確認する | [#24](https://github.com/akatonboboonboon/Siritori-app/pull/24) |
-| 2026-07-24 | OpenAI Codex | Render準備・検証 | `render.yaml`、起動時Alembic、health/readiness、公開手順を整備した。公式仕様は確認したが、本番デプロイとDashboard表示は確認していない | 準備完了・本番未確認 | Windows sandboxのACLエラーで実ブラウザ確認ができなかったため、応募者本人がDashboardと公開URLを確認する。秘密情報はCodexへ渡さず記録しない | 最終Draft PRへ追記予定 |
+| 2026-07-27 | OpenAI Codex | Render公開・最終検証 | `render.yaml`、起動時Alembic、health/readiness、公開手順を整備し、PR #24のmainマージと本番反映後に公開URLをHTTP確認した | 公開基盤・Neon疎通確認済み／認証済み実機確認待ち | `/healthz`と`/readyz`のHTTP 200、新しい保護ページのログインリダイレクトを確認した。Dashboardの秘密値は取得・記録していない。管理者設定とPC・実スマートフォンの目視確認は応募者本人が行う | [#24](https://github.com/akatonboboonboon/Siritori-app/pull/24)／merge `ae79459` |
 
 ### 完了した確認
 
@@ -64,29 +64,28 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 - 初回チュートリアルの永続化と、Web Share／クリップボードの安全なフォールバックをテスト
 - Edgeの独立した2ブラウザ状態で、部屋作成、参加、準備、開始、単語同期と幅375px表示を確認
 - Render用の`PORT`、`0.0.0.0`、Blueprint、WebSocket、health/readiness設定を公式資料と照合
-- 2026-07-26に公開中のRenderで `/healthz`、`/readyz`、`/`、`/login` のHTTP 200を確認
+- 2026-07-27に公開中のRenderで`/healthz`とNeon疎通を含む`/readyz`のHTTP 200を確認
+- `/tutorial`、`/daily-challenge`、`/admin/word-suggestions`が未ログイン時に安全にログイン画面へ戻ることを確認
 - リポジトリと文書へ接続文字列、パスワード、セッション秘密値を記録していない
 
-### 現時点で完了していないこと
+### 応募者本人による確認が残っていること
 
 - Easy／Normal／Hardの3難易度のプレイ感確認
-- PCと実スマートフォンでの最終操作・レイアウト確認
-- 2ブラウザでの進行中観戦、戦績、公開設定、ランキング、再戦、プレイヤー／観戦者リアクションの手動確認
-- PC・実スマートフォンでの効果音、アニメーション軽減、リザルト、単語申請と本人一覧の手動確認
-- テーマ廃止変更をマージした後のRender再デプロイと公開URLでの回帰確認
-- `0003`〜`0007`適用後の公開環境で、既存データを保った新画面、再戦、単語申請、審査、デイリーの回帰確認
-- PC・実スマートフォンでの初回チュートリアル、結果共有、管理画面の表示確認
-- 応募者本人によるコードレビュー、本人担当機能、READMEの工夫・学び・振り返り
+- PCと実スマートフォンでの最終操作、レイアウト、共有、効果音、モーション軽減の確認
+- 2ブラウザでの対戦、進行中観戦、切断時のBot引継ぎ、本人復帰、再戦、リアクションの確認
+- `ADMIN_USERNAMES=あかとんぼ`の反映と、一般ユーザー・管理者それぞれの権限確認
+- 承認語、デイリーチャレンジ、初回チュートリアル、結果共有の認証済み本番確認
+- READMEの工夫・学び・AI出力を検証した過程、実機確認結果、スクリーンショットの追記
 
-これらは実際に完了した時点で、関連PR、変更ファイル、確認結果とともに更新します。
+公開基盤と自動テストの完了は、これらの本人による目視・プレイ確認の代わりにはしません。
 
-### 2026-07-26 最終機能の引き継ぎ
+### 2026-07-27 公開後の引き継ぎ
 
-この変更を利用するために、応募者本人が追加コードやNeon Consoleの手動SQLを書く必要はありません。
-PRをマージすると、Render起動時に`0007_final_features`まで自動適用されます。
-ただし管理画面を有効にするため、登録済みアカウント「あかとんぼ」を作成したうえで、
-Renderへ`ADMIN_USERNAMES=あかとんぼ`を設定します。
-公開後は次を本人の確認記録として残します。
+PR #24はmainへマージされ、Render起動時の`0007_final_features`自動適用とNeon readinessを確認済みです。
+応募者本人が追加コードやNeon Consoleの手動SQLを書く必要はありません。
+管理画面を有効にするには、登録済みアカウント「あかとんぼ」を作成したうえで、
+Renderへ`ADMIN_USERNAMES=あかとんぼ`を設定して再デプロイします。未登録の場合は、最初は変数を空にして
+アカウントを登録してから設定します。次を本人の確認記録として残します。
 
 1. 2ブラウザでプレイヤー／観戦者のリアクション、固定絵文字、1秒クールダウンを確認する
 2. PC・実スマートフォンで効果音OFF、「演出を減らす」、端末のモーション軽減、
