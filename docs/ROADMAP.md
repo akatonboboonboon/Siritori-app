@@ -321,7 +321,7 @@ PvPは終了CASと同じトランザクションで戦績を確定し、同じ�
 - 各操作で管理者の有効なセッションと環境変数allowlistをDBから再確認する
 - 承認・却下を申請状態、担当者、日時、任意メモとともに原子的に保存する
 - 承認語を人間入力へ反映しても構造違反を通さず、Bot候補を変更しない
-- `0006_word_suggestions`と`0007_final_features`のupgrade／downgradeを検査する
+- `0006_word_suggestions`、`0007_final_features`、`0008_life_system`のupgrade／downgradeを検査する
 
 **新規画面のレスポンシブ合格条件**
 
@@ -446,7 +446,7 @@ Bot戦設定画面:
 
 **現状:** Blueprint、起動時マイグレーション、health/readinessは準備済みです。
 `0003_match_statistics`、`0004_score_attack_runs`、`0005_room_current_game`、
-`0006_word_suggestions`、`0007_final_features`も既存の起動処理で自動適用し、
+`0006_word_suggestions`、`0007_final_features`、`0008_life_system`も既存の起動処理で自動適用し、
 Neon Consoleでの手動SQLを必要としません。管理者画面には`ADMIN_USERNAMES`を使います。
 本番デプロイ後の新画面と実端末の確認はリポジトリ所有者が行います。
 
@@ -461,7 +461,7 @@ Neon Consoleでの手動SQLを必要としません。管理者画面には`ADMI
 **受け入れテスト**
 
 - 新規デプロイと再起動後にヘルスチェックが成功する
-- 起動時Alembicで`0003`〜`0007`が適用され、戦績、デイリー、審査、チュートリアルを利用できる
+- 起動時Alembicで`0003`〜`0008`が適用され、戦績、デイリー、審査、チュートリアル、ライフ設定を利用できる
 - `ADMIN_USERNAMES`の登録済みユーザーだけが管理者画面を利用できる
 - 再起動後もアカウントと保存試合が残る
 - 2つ以上のブラウザから実際に対戦・観戦できる

@@ -186,6 +186,12 @@ class Room(Base):
         String(16), nullable=False, default=RoomStatus.WAITING.value
     )
     max_players: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    lives_per_player: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
     allow_spectators: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
@@ -226,6 +232,10 @@ class Room(Base):
         ),
         CheckConstraint(
             "max_players >= 2 AND max_players <= 8", name="max_players_range"
+        ),
+        CheckConstraint(
+            "lives_per_player >= 1 AND lives_per_player <= 5",
+            name="lives_per_player_range",
         ),
         CheckConstraint(
             "turn_seconds IS NULL OR "

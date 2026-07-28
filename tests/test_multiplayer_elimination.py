@@ -186,7 +186,13 @@ class MultiplayerEliminationTests(unittest.IsolatedAsyncioTestCase):
 
         legacy = deepcopy(document)
         legacy["room_repository_schema"] = 2
-        legacy["snapshot"].pop("eliminated_seats")
+        for field in (
+            "eliminated_seats",
+            "lives_per_player",
+            "remaining_lives",
+            "life_loss_events",
+        ):
+            legacy["snapshot"].pop(field)
         restored = deserialize_room_snapshot(legacy)
         self.assertEqual(restored.eliminated_seats, ())
         self.assertEqual(restored.current_turn, snapshot.current_turn)

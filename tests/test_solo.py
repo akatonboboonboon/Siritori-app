@@ -97,11 +97,13 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.service.create(
             self.owner.id,
             bot_count=2,
+            lives_per_player=3,
             bot_difficulty="hard",
             turn_seconds=30,
             now=NOW,
         )
         self.assertEqual(len(snapshot.players), 3)
+        self.assertEqual(snapshot.remaining_lives, (3, 3, 3))
 
         connected = await self.service.connect(
             self.owner.id,
@@ -119,6 +121,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(paused), 1)
         self.assertEqual(paused[0].game_id, snapshot.room_id)
         self.assertEqual(paused[0].bot_count, 2)
+        self.assertEqual(paused[0].lives_per_player, 3)
         self.assertEqual(paused[0].paused_remaining_seconds, 30)
 
         resumed = await self.service.connect(
@@ -143,6 +146,15 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.bot_difficulty, "easy")
         self.assertEqual(len(snapshot.players), 2)
 
+    async def test_create_rejects_invalid_life_counts(self) -> None:
+        for invalid in (True, 0, 6):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    await self.service.create(
+                        self.owner.id,
+                        lives_per_player=invalid,  # type: ignore[arg-type]
+                    )
+
     async def test_legacy_theme_argument_is_ignored_and_all_is_persisted(
         self,
     ) -> None:
@@ -162,6 +174,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         source = await self.service.create(
             self.owner.id,
             bot_count=3,
+            lives_per_player=5,
             bot_difficulty="hard",
             turn_seconds=45,
             now=NOW,
@@ -245,6 +258,8 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried.history, ())
         self.assertIsNone(retried.expected_kana)
         self.assertEqual(retried.bot_difficulty, "hard")
+        self.assertEqual(retried.lives_per_player, 5)
+        self.assertEqual(retried.remaining_lives, (5, 5, 5, 5))
         self.assertEqual(retried.turn_seconds, 45)
         self.assertEqual(retried.theme_key, source.theme_key)
         self.assertEqual(

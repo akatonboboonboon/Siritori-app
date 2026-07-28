@@ -23,6 +23,7 @@ from shiritori.lobby import (
     normalize_invite_code,
     normalize_room_name,
     room_name_key,
+    validate_lives_per_player,
     validate_turn_seconds,
 )
 from shiritori.models import RoomRole, RoomStatus as StoredRoomStatus
@@ -64,6 +65,13 @@ class InviteCodeTests(unittest.TestCase):
         for invalid in (2, 181, True, 3.0):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 validate_turn_seconds(invalid)  # type: ignore[arg-type]
+
+    def test_life_count_accepts_only_inclusive_one_to_five(self) -> None:
+        self.assertEqual(validate_lives_per_player(1), 1)
+        self.assertEqual(validate_lives_per_player(5), 5)
+        for invalid in (0, 6, True, 1.0, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_lives_per_player(invalid)  # type: ignore[arg-type]
 
     def test_room_name_normalization_has_one_display_and_identity_form(self) -> None:
         self.assertEqual(
@@ -163,6 +171,9 @@ class LobbyServiceTests(unittest.TestCase):
             {"allow_spectators": 1},
             {"is_public": 1},
             {"fill_empty_seats_with_bots": 1},
+            {"lives_per_player": 0},
+            {"lives_per_player": 6},
+            {"lives_per_player": True},
             {"turn_seconds": 2},
             {"turn_seconds": True},
         )
@@ -413,6 +424,40 @@ class LobbyServiceTests(unittest.TestCase):
         with self.assertRaises(LobbyNotReadyError):
             self.service.start("owner", room.room_code)
 
+    def test_life_change_resets_readiness_and_start_uses_new_count(
+        self,
+    ) -> None:
+        room = self.create_room(lives_per_player=1)
+        self.service.join_as_player("guest", room.room_code)
+        self.service.set_ready("owner", room.room_code, ready=True)
+        ready = self.service.set_ready(
+            "guest",
+            room.room_code,
+            ready=True,
+        )
+
+        updated = self.service.update_settings(
+            "owner",
+            room.room_code,
+            expected_revision=ready.revision,
+            max_players=ready.max_players,
+            allow_spectators=ready.allow_spectators,
+            turn_seconds=ready.turn_seconds,
+            is_public=ready.is_public,
+            fill_empty_seats_with_bots=ready.fill_empty_seats_with_bots,
+            lives_per_player=5,
+        )
+
+        self.assertEqual(updated.lives_per_player, 5)
+        self.assertTrue(all(not player.ready for player in updated.players))
+        self.service.set_ready("owner", room.room_code, ready=True)
+        self.service.set_ready("guest", room.room_code, ready=True)
+
+        started = self.service.start("owner", room.room_code)
+
+        self.assertEqual(started.active_room.lives_per_player, 5)
+        self.assertEqual(started.active_room.remaining_lives, (5, 5))
+
     def test_ready_rejects_gameplay_settings_not_seen_by_player(
         self,
     ) -> None:
@@ -422,6 +467,7 @@ class LobbyServiceTests(unittest.TestCase):
             joined.max_players,
             joined.turn_seconds,
             joined.fill_empty_seats_with_bots,
+            joined.lives_per_player,
         )
         updated = self.service.update_settings(
             "owner",
@@ -459,6 +505,7 @@ class LobbyServiceTests(unittest.TestCase):
                 updated.max_players,
                 updated.turn_seconds,
                 updated.fill_empty_seats_with_bots,
+                updated.lives_per_player,
             ),
         )
         confirmed_guest = confirmed.member_for("guest")

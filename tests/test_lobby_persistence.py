@@ -967,6 +967,7 @@ class LobbyPersistenceTests(unittest.TestCase):
                     "allow_spectators": True,
                     "is_public": True,
                     "fill_empty_seats_with_bots": True,
+                    "lives_per_player": 1,
                 },
             )
 
@@ -1109,9 +1110,11 @@ class LobbyPersistenceTests(unittest.TestCase):
             turn_seconds=None,
             is_public=True,
             fill_empty_seats_with_bots=True,
+            lives_per_player=4,
         )
 
         self.assertEqual(updated.revision, ready.revision + 1)
+        self.assertEqual(updated.lives_per_player, 4)
         self.assertTrue(all(not player.ready for player in updated.players))
         with self.database.read_session() as session:
             stored = session.get(Room, room.id)
@@ -1128,6 +1131,7 @@ class LobbyPersistenceTests(unittest.TestCase):
             self.assertIsNone(stored.turn_seconds)
             self.assertTrue(stored.is_public)
             self.assertTrue(stored.fill_empty_seats_with_bots)
+            self.assertEqual(stored.lives_per_player, 4)
             self.assertEqual(stored.revision, ready.revision + 1)
             self.assertTrue(all(not member.ready for member in memberships))
 
@@ -1152,6 +1156,7 @@ class LobbyPersistenceTests(unittest.TestCase):
             joined.max_players,
             joined.turn_seconds,
             joined.fill_empty_seats_with_bots,
+            joined.lives_per_player,
         )
         updated = self.service.update_settings(
             self.owner.id,
@@ -1384,6 +1389,7 @@ class LobbyPersistenceMigrationTests(unittest.TestCase):
                             "name_key",
                             "is_public",
                             "fill_empty_seats_with_bots",
+                            "lives_per_player",
                         }.issubset(
                             room_columns
                         )

@@ -27,7 +27,7 @@ import secrets
 from typing import Final, Protocol, runtime_checkable
 from uuid import uuid4
 
-from .bots import canonical_kana, final_kana
+from .bots import canonical_kana, final_kana, first_kana
 from .lexicon import LexiconResult, get_default_validator
 from .themes import ALL_THEME_ID, ThemeCatalog
 
@@ -114,6 +114,44 @@ class TurnRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class LifeLossRecord:
+    """One authoritative failed-turn or surrender event."""
+
+    seat_index: int
+    reason: str
+    surface: str | None
+    reading: str | None
+    remaining_lives: int
+    eliminated: bool
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.seat_index) is not int or self.seat_index < 0:
+            raise ValueError("life-loss seat index must be non-negative")
+        if type(self.reason) is not str or not self.reason:
+            raise ValueError("life-loss reason is required")
+        if self.surface is not None and type(self.surface) is not str:
+            raise ValueError("life-loss surface must be a string or None")
+        if self.reading is not None and type(self.reading) is not str:
+            raise ValueError("life-loss reading must be a string or None")
+        if (self.surface is None) != (self.reading is None):
+            raise ValueError(
+                "life-loss surface and reading must both be set or both be absent"
+            )
+        if self.surface is not None and (
+            self.surface == "" or self.reading == ""
+        ):
+            raise ValueError("life-loss word fields must not be empty")
+        if type(self.remaining_lives) is not int or self.remaining_lives < 0:
+            raise ValueError("remaining_lives must be a non-negative integer")
+        if type(self.eliminated) is not bool:
+            raise ValueError("eliminated must be boolean")
+        if self.eliminated != (self.remaining_lives == 0):
+            raise ValueError("an eliminated life-loss event must have zero lives")
+        _require_utc(self.occurred_at, "occurred_at")
+
+
+@dataclass(frozen=True, slots=True)
 class RoomSnapshot:
     """Complete state required to rebuild a room after a process restart."""
 
@@ -127,6 +165,9 @@ class RoomSnapshot:
     bot_difficulty: str = "normal"
     spectators: tuple[str, ...] = ()
     eliminated_seats: tuple[int, ...] = ()
+    lives_per_player: int = 1
+    remaining_lives: tuple[int, ...] = ()
+    life_loss_events: tuple[LifeLossRecord, ...] = ()
     history: tuple[TurnRecord, ...] = ()
     expected_kana: str | None = None
     turn_seconds: int | None = None
@@ -194,6 +235,48 @@ class RoomSnapshot:
             )
         ):
             raise ValueError("eliminated seat indexes must be unique and valid")
+        if (
+            type(self.lives_per_player) is not int
+            or not 1 <= self.lives_per_player <= 5
+        ):
+            raise ValueError("lives_per_player must be from 1 to 5")
+        if not self.remaining_lives:
+            object.__setattr__(
+                self,
+                "remaining_lives",
+                tuple(
+                    0 if seat.index in self.eliminated_seats
+                    else self.lives_per_player
+                    for seat in self.players
+                ),
+            )
+        if (
+            len(self.remaining_lives) != len(self.players)
+            or any(
+                type(lives) is not int
+                or not 0 <= lives <= self.lives_per_player
+                for lives in self.remaining_lives
+            )
+        ):
+            raise ValueError(
+                "remaining_lives must contain one valid count per player"
+            )
+        zero_life_seats = {
+            index
+            for index, lives in enumerate(self.remaining_lives)
+            if lives == 0
+        }
+        if zero_life_seats != set(self.eliminated_seats):
+            raise ValueError(
+                "zero-life seats must exactly match eliminated_seats"
+            )
+        for event in self.life_loss_events:
+            if (
+                not isinstance(event, LifeLossRecord)
+                or event.seat_index >= len(self.players)
+                or event.remaining_lives > self.lives_per_player
+            ):
+                raise ValueError("life_loss_events contain an invalid event")
         active_seat_count = len(self.players) - len(self.eliminated_seats)
         if (
             self.status in {RoomStatus.ACTIVE, RoomStatus.PAUSED}
@@ -698,6 +781,7 @@ def create_room_snapshot(
     turn_seconds: int | None = None,
     theme_key: str = "all",
     bot_difficulty: str = "normal",
+    lives_per_player: int = 1,
     now: datetime | None = None,
     seat_picker: SeatPicker | None = None,
 ) -> RoomSnapshot:
@@ -716,6 +800,10 @@ def create_room_snapshot(
         raise ValueError("human player ids must be unique")
     if permanent_bot_count < 0:
         raise ValueError("permanent_bot_count must be non-negative")
+    if (
+        type(lives_per_player) is not int or not 1 <= lives_per_player <= 5
+    ):
+        raise ValueError("lives_per_player must be from 1 to 5")
     if turn_seconds is not None and not 3 <= turn_seconds <= 180:
         raise ValueError("turn_seconds must be between 3 and 180")
     if mode is RoomMode.SOLO_BOT:
@@ -755,6 +843,8 @@ def create_room_snapshot(
         status=RoomStatus.ACTIVE,
         players=seats,
         spectators=tuple(spectators),
+        lives_per_player=lives_per_player,
+        remaining_lives=(lives_per_player,) * len(seats),
         current_turn=starting_seat,
         expected_kana=None,
         turn_seconds=turn_seconds,
@@ -1266,6 +1356,15 @@ class RoomCoordinator:
 
             current_time = self._now(now)
             self._cancel_disconnect(room_id, user_id)
+            surrender_event = LifeLossRecord(
+                seat_index=seat.index,
+                reason="surrender",
+                surface=None,
+                reading=None,
+                remaining_lives=0,
+                eliminated=True,
+                occurred_at=current_time,
+            )
             if snapshot.mode is RoomMode.SOLO_BOT:
                 active = frozenset(snapshot.active_seat_indexes)
                 permanent_bots = tuple(
@@ -1295,6 +1394,15 @@ class RoomCoordinator:
                         for candidate in snapshot.players
                         if candidate.index != survivor
                     ),
+                    remaining_lives=tuple(
+                        (
+                            snapshot.remaining_lives[candidate.index]
+                            if candidate.index == survivor
+                            else 0
+                        )
+                        for candidate in snapshot.players
+                    ),
+                    life_loss_events=(*snapshot.life_loss_events, surrender_event),
                     expected_kana=None,
                     deadline_at=None,
                     paused_remaining_seconds=None,
@@ -1338,6 +1446,15 @@ class RoomCoordinator:
                     ),
                     current_turn=next_turn,
                     eliminated_seats=eliminated,
+                    remaining_lives=tuple(
+                        (
+                            0
+                            if index == seat.index
+                            else lives
+                        )
+                        for index, lives in enumerate(snapshot.remaining_lives)
+                    ),
+                    life_loss_events=(*snapshot.life_loss_events, surrender_event),
                     expected_kana=(
                         None if finished else snapshot.expected_kana
                     ),
@@ -1419,7 +1536,7 @@ class RoomCoordinator:
         operation_id: str,
         now: datetime | None = None,
     ) -> CommandOutcome:
-        """Finish a room only when its persisted UTC deadline is due."""
+        """Apply a life loss only when the persisted UTC deadline is due."""
 
         _validate_internal_operation_id(operation_id, "runtime:")
         fingerprint = _command_fingerprint(
@@ -1449,8 +1566,9 @@ class RoomCoordinator:
             ):
                 raise TurnDeadlineNotReached("turn deadline is not due")
 
-            next_snapshot = self._eliminate_current_seat(
+            next_snapshot = self._apply_current_seat_life_loss(
                 snapshot,
+                players=self._complete_pending_handbacks(snapshot.players),
                 reason="timeout",
                 now=current_time,
                 expected_kana=snapshot.expected_kana,
@@ -1475,7 +1593,7 @@ class RoomCoordinator:
         operation_id: str,
         now: datetime | None = None,
     ) -> CommandOutcome:
-        """Finish when the authoritative Bot index has no legal candidate."""
+        """Apply a life loss when the active Bot has no legal candidate."""
 
         _validate_internal_operation_id(operation_id, "runtime:")
         fingerprint = _command_fingerprint(
@@ -1512,8 +1630,9 @@ class RoomCoordinator:
                 raise RoomAuthorizationError(
                     "only the current Bot seat can have no legal move"
                 )
-            next_snapshot = self._eliminate_current_seat(
+            next_snapshot = self._apply_current_seat_life_loss(
                 snapshot,
+                players=self._complete_pending_handbacks(snapshot.players),
                 reason="no_legal_move",
                 now=current_time,
                 expected_kana=snapshot.expected_kana,
@@ -1603,7 +1722,7 @@ class RoomCoordinator:
             )
             if (
                 required_kana is not None
-                and canonical_kana(reading[0]) != required_kana
+                and first_kana(reading) != required_kana
             ):
                 raise InvalidMove(
                     f"word must begin with {required_kana!r}"
@@ -1611,14 +1730,16 @@ class RoomCoordinator:
 
             next_players = self._complete_pending_handbacks(snapshot.players)
             if canonical_key in snapshot.used_canonical_keys:
-                # Repeating a normalized reading is a losing move. It ends the
-                # player's run but is deliberately not appended to history.
-                next_snapshot = self._eliminate_current_seat(
+                # Repeating a normalized reading costs one life but is
+                # deliberately not appended to the accepted-word history.
+                next_snapshot = self._apply_current_seat_life_loss(
                     snapshot,
                     players=next_players,
                     reason="duplicate",
                     now=current_time,
                     expected_kana=required_kana,
+                    surface=surface,
+                    reading=reading,
                 )
             else:
                 last_kana = final_kana(reading)
@@ -1632,12 +1753,14 @@ class RoomCoordinator:
                     submitted_at=current_time,
                 )
                 if last_kana == "ん":
-                    next_snapshot = self._eliminate_current_seat(
+                    next_snapshot = self._apply_current_seat_life_loss(
                         snapshot,
                         players=next_players,
                         history=(*snapshot.history, record),
                         reason="ends_with_n",
                         now=current_time,
+                        surface=surface,
+                        reading=reading,
                         # In an elimination match the next survivor inherits
                         # the kana this player had to answer with. The losing
                         # word itself cannot continue because it ends in ん.
@@ -1690,7 +1813,7 @@ class RoomCoordinator:
                 return candidate
         raise ValueError("a room must retain at least one active seat")
 
-    def _eliminate_current_seat(
+    def _apply_current_seat_life_loss(
         self,
         snapshot: RoomSnapshot,
         *,
@@ -1700,20 +1823,38 @@ class RoomCoordinator:
         players: tuple[PlayerSeat, ...] | None = None,
         history: tuple[TurnRecord, ...] | None = None,
         timed_out: bool = False,
+        surface: str | None = None,
+        reading: str | None = None,
     ) -> RoomSnapshot:
         losing_seat = snapshot.current_turn
-        eliminated = (*snapshot.eliminated_seats, losing_seat)
+        remaining_lives = list(snapshot.remaining_lives)
+        remaining_lives[losing_seat] -= 1
+        eliminated_now = remaining_lives[losing_seat] == 0
+        eliminated = (
+            (*snapshot.eliminated_seats, losing_seat)
+            if eliminated_now
+            else snapshot.eliminated_seats
+        )
         next_turn = self._next_active_turn(
             snapshot,
             after=losing_seat,
             eliminated_seats=eliminated,
         )
-        remaining = len(snapshot.players) - len(eliminated)
-        finished = remaining == 1
+        active_seat_count = len(snapshot.players) - len(eliminated)
+        finished = eliminated_now and active_seat_count == 1
         deadline = (
             now + timedelta(seconds=snapshot.turn_seconds)
             if not finished and snapshot.turn_seconds is not None
             else None
+        )
+        event = LifeLossRecord(
+            seat_index=losing_seat,
+            reason=reason,
+            surface=surface,
+            reading=reading,
+            remaining_lives=remaining_lives[losing_seat],
+            eliminated=eliminated_now,
+            occurred_at=now,
         )
         return replace(
             snapshot,
@@ -1721,6 +1862,8 @@ class RoomCoordinator:
             players=snapshot.players if players is None else players,
             current_turn=next_turn,
             eliminated_seats=eliminated,
+            remaining_lives=tuple(remaining_lives),
+            life_loss_events=(*snapshot.life_loss_events, event),
             history=snapshot.history if history is None else history,
             expected_kana=None if finished else expected_kana,
             deadline_at=deadline,

@@ -90,7 +90,7 @@ Codexは明示的な許可なしにPRをマージしません。
 デプロイログを上から確認します。
 
 1. `pip install -r requirements.txt`が成功
-2. Alembicが`0007_final_features`を含む最新版までupgrade
+2. Alembicが`0008_life_system`を含む最新版までupgrade
 3. NiceGUIが`0.0.0.0:$PORT`で起動
 4. `/readyz`がHTTP 200
 
@@ -100,7 +100,8 @@ Codexは明示的な許可なしにPRをマージしません。
 `0002_room_discovery`は部屋名キー、公開設定、空席Bot補充設定と一意索引を追加します。
 `0003`〜`0005`は戦績、スコアアタック、複数ラウンドを追加し、
 `0006_word_suggestions`は一般辞書と分離した単語追加リクエスト表を追加します。
-`0007_final_features`は審査監査、承認語、デイリーチャレンジ、チュートリアル完了状態を追加します。
+`0007_final_features`は審査監査、承認語、デイリーチャレンジ、チュートリアル完了状態を追加し、
+`0008_life_system`は待機部屋のライフ数設定を追加します。
 マージ後のRender再デプロイ時に、既存の`DIRECT_DATABASE_URL`を使ってNeonへ自動適用されます。
 Neon ConsoleでのSQL・列・索引の手動作成は不要です。管理画面には`ADMIN_USERNAMES`を使います。
 リアクションと音・アニメーションはDBマイグレーションや外部アセットを必要としません。

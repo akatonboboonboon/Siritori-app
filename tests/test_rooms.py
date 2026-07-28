@@ -715,6 +715,7 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         room = replace(
             room,
             eliminated_seats=(2,),
+            remaining_lives=(1, 1, 0),
             deadline_at=NOW + timedelta(seconds=10),
         )
         repository = InMemoryRoomRepository([room])
@@ -797,12 +798,15 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             now=NOW,
             seat_picker=lambda _: 1,
         )
-        eliminated = replace(active, eliminated_seats=(0,))
+        eliminated = replace(
+            active, eliminated_seats=(0,), remaining_lives=(0, 1, 1)
+        )
         finished = replace(
             pvp_room(),
             status=RoomStatus.FINISHED,
             current_turn=1,
             eliminated_seats=(0,),
+            remaining_lives=(0, 1),
             expected_kana=None,
             deadline_at=None,
         )
@@ -1480,6 +1484,7 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             status=RoomStatus.FINISHED,
             state_version=1,
             eliminated_seats=(0,),
+            remaining_lives=(0, 1),
             expected_kana=None,
             deadline_at=None,
             losing_seat=0,
@@ -1507,6 +1512,7 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             status=RoomStatus.FINISHED,
             state_version=1,
             eliminated_seats=(0,),
+            remaining_lives=(0, 1),
             expected_kana=None,
             deadline_at=None,
             losing_seat=0,

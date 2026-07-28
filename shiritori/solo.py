@@ -62,6 +62,7 @@ class PausedSoloGame:
     theme_key: str
     bot_difficulty: str
     bot_count: int
+    lives_per_player: int
     turn_seconds: int | None
     state_version: int
     move_count: int
@@ -94,6 +95,7 @@ class SoloGameService:
         bot_count: int = 1,
         bot_difficulty: str = "normal",
         theme_key: str | None = None,
+        lives_per_player: int = 1,
         turn_seconds: int | None = None,
         now: datetime | None = None,
     ) -> RoomSnapshot:
@@ -102,6 +104,8 @@ class SoloGameService:
         owner = _identifier(user_id, "user_id")
         if type(bot_count) is not int or not 1 <= bot_count <= 7:
             raise ValueError("bot_count must be from 1 to 7")
+        if type(lives_per_player) is not int or not 1 <= lives_per_player <= 5:
+            raise ValueError("lives_per_player must be from 1 to 5")
         difficulty = str(bot_difficulty).strip().lower()
         # Resolve before writing so an unregistered user-owned EasyBot fails
         # closed instead of leaving an unplayable Game row.
@@ -117,6 +121,7 @@ class SoloGameService:
             (owner,),
             mode=RoomMode.SOLO_BOT,
             permanent_bot_count=bot_count,
+            lives_per_player=lives_per_player,
             turn_seconds=turn_seconds,
             theme_key=theme.theme_id,
             bot_difficulty=difficulty,
@@ -215,6 +220,7 @@ class SoloGameService:
             (owner,),
             mode=RoomMode.SOLO_BOT,
             permanent_bot_count=permanent_bot_count,
+            lives_per_player=finished.lives_per_player,
             turn_seconds=finished.turn_seconds,
             theme_key=theme.theme_id,
             bot_difficulty=finished.bot_difficulty,
@@ -266,6 +272,7 @@ class SoloGameService:
             or existing.mode is not RoomMode.SOLO_BOT
             or existing.seat_for_user(owner_user_id) is None
             or actual_bot_count != expected_bot_count
+            or existing.lives_per_player != source.lives_per_player
             or existing.bot_difficulty != source.bot_difficulty
             or existing.theme_key != source.theme_key
             or existing.turn_seconds != source.turn_seconds
@@ -378,6 +385,7 @@ class SoloGameService:
                             seat.owner_user_id is None
                             for seat in snapshot.players
                         ),
+                        lives_per_player=snapshot.lives_per_player,
                         turn_seconds=snapshot.turn_seconds,
                         state_version=snapshot.state_version,
                         move_count=len(snapshot.history),
