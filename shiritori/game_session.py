@@ -25,7 +25,8 @@ from shiritori.lexicon import (
 
 
 LEGACY_SNAPSHOT_VERSION = 1
-SNAPSHOT_VERSION = 2
+PREVIOUS_SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 _SMALL_TO_LARGE_KANA = {
     "ぁ": "あ",
@@ -42,9 +43,21 @@ _SMALL_TO_LARGE_KANA = {
     "ゖ": "け",
 }
 
-_DAKUON_CHAIN_EQUIVALENTS = {
+_LEGACY_DAKUON_CHAIN_EQUIVALENTS = {
     "ぢ": "じ",
     "づ": "ず",
+}
+
+_DAKUON_CHAIN_EQUIVALENTS = {
+    **_LEGACY_DAKUON_CHAIN_EQUIVALENTS,
+    "ゔ": "ぶ",
+}
+
+_VU_MORA_CHAIN_EQUIVALENTS = {
+    "ゔぁ": "ば",
+    "ゔぃ": "び",
+    "ゔぇ": "べ",
+    "ゔぉ": "ぼ",
 }
 
 _VOWEL_GROUPS = {
@@ -249,6 +262,8 @@ class SessionResult:
 def canonical_kana(kana: str) -> str:
     """Return the canonical kana used only for shiritori connections."""
 
+    if kana in _VU_MORA_CHAIN_EQUIVALENTS:
+        return _VU_MORA_CHAIN_EQUIVALENTS[kana]
     expanded = _SMALL_TO_LARGE_KANA.get(kana, kana)
     return _DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
 
@@ -259,6 +274,9 @@ def first_chain_kana(reading: str) -> str:
     normalized = _normalized_reading(reading)
     if not normalized or normalized[0] == "ー":
         raise ValueError("reading has no usable first kana")
+    for alternate, canonical in _VU_MORA_CHAIN_EQUIVALENTS.items():
+        if normalized.startswith(alternate):
+            return canonical
     return canonical_kana(normalized[0])
 
 
@@ -274,6 +292,9 @@ def ending_chain_kana(reading: str) -> str:
         raise ValueError("reading has no usable ending kana")
 
     if normalized[-1] != "ー":
+        for alternate, canonical in _VU_MORA_CHAIN_EQUIVALENTS.items():
+            if normalized.endswith(alternate):
+                return canonical
         return canonical_kana(normalized[-1])
 
     index = len(normalized) - 2
@@ -285,6 +306,42 @@ def ending_chain_kana(reading: str) -> str:
     vowel = _VOWEL_BY_KANA.get(normalized[index])
     if vowel is None:
         raise ValueError("long sound mark does not follow a vowel-bearing kana")
+    return vowel
+
+
+def _legacy_canonical_kana(kana: str) -> str:
+    """Return the connection kana used by snapshot versions 1 and 2."""
+
+    expanded = _SMALL_TO_LARGE_KANA.get(kana, kana)
+    return _LEGACY_DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
+
+
+def _legacy_first_chain_kana(reading: str) -> str:
+    normalized = _normalized_reading(reading)
+    if not normalized or normalized[0] == "ー":
+        raise ValueError("reading has no usable first kana")
+    return _legacy_canonical_kana(normalized[0])
+
+
+def _legacy_ending_chain_kana(reading: str) -> str:
+    normalized = _normalized_reading(reading)
+    if not normalized:
+        raise ValueError("reading has no usable ending kana")
+
+    if normalized[-1] != "ー":
+        return _legacy_canonical_kana(normalized[-1])
+
+    index = len(normalized) - 2
+    while index >= 0 and normalized[index] == "ー":
+        index -= 1
+    if index < 0:
+        raise ValueError("reading cannot consist only of long sound marks")
+
+    vowel = _VOWEL_BY_KANA.get(normalized[index])
+    if vowel is None:
+        raise ValueError(
+            "long sound mark does not follow a vowel-bearing kana"
+        )
     return vowel
 
 
@@ -570,7 +627,10 @@ class GameSession:
                 if "deadline_policy" in snapshot:
                     raise ValueError
                 deadline_policy = DeadlinePolicy.PER_TURN
-            elif version == SNAPSHOT_VERSION:
+            elif version in {
+                PREVIOUS_SNAPSHOT_VERSION,
+                SNAPSHOT_VERSION,
+            }:
                 deadline_policy = validate_deadline_policy(
                     snapshot["deadline_policy"]  # type: ignore[arg-type]
                 )
@@ -595,7 +655,11 @@ class GameSession:
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid game session snapshot") from error
 
-        if version not in {LEGACY_SNAPSHOT_VERSION, SNAPSHOT_VERSION}:
+        if version not in {
+            LEGACY_SNAPSHOT_VERSION,
+            PREVIOUS_SNAPSHOT_VERSION,
+            SNAPSHOT_VERSION,
+        }:
             raise ValueError(f"unsupported snapshot version: {version}")
         if not isinstance(raw_history, list):
             raise ValueError("snapshot history must be a list")
@@ -613,7 +677,11 @@ class GameSession:
             raise ValueError("history turn numbers must be consecutive")
         if len({entry.canonical_key for entry in history}) != len(history):
             raise ValueError("snapshot history contains duplicate words")
-        _validate_snapshot_history(history)
+        _validate_snapshot_history(
+            history,
+            allow_legacy_connections=version
+            in {LEGACY_SNAPSHOT_VERSION, PREVIOUS_SNAPSHOT_VERSION},
+        )
 
         pending: PendingReading | None = None
         if raw_pending is not None:
@@ -884,7 +952,11 @@ def _validate_snapshot_reading(reading: str) -> str:
     return normalized
 
 
-def _validate_snapshot_history(history: list[HistoryEntry]) -> None:
+def _validate_snapshot_history(
+    history: list[HistoryEntry],
+    *,
+    allow_legacy_connections: bool = False,
+) -> None:
     previous: HistoryEntry | None = None
     for index, entry in enumerate(history):
         normalized = _validate_snapshot_reading(entry.reading)
@@ -905,9 +977,15 @@ def _validate_snapshot_history(history: list[HistoryEntry]) -> None:
             raise ValueError("ends_with_n entry must be the final entry")
 
         if (
-            previous is not None
-            and ending_chain_kana(previous.reading)
-            != first_chain_kana(normalized)
+            previous is not None and not (
+                ending_chain_kana(previous.reading)
+                == first_chain_kana(normalized)
+                or (
+                    allow_legacy_connections
+                    and _legacy_ending_chain_kana(previous.reading)
+                    == _legacy_first_chain_kana(normalized)
+                )
+            )
         ):
             raise ValueError("adjacent history entries do not chain")
         previous = entry

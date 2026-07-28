@@ -277,7 +277,8 @@ Render Freeではpre-deploy commandを利用できないため、`python -m scri
 自動適用されます。戦績・ランキング用の`0003_match_statistics`、スコアアタック用の
 `0004_score_attack_runs`、複数ラウンド用の`0005_room_current_game`、
 単語追加リクエスト用の`0006_word_suggestions`、審査・日次挑戦・チュートリアル用の
-`0007_final_features`も自動適用します。Neon Consoleでの手作業による列・索引・
+`0007_final_features`と、待機部屋のライフ数を追加する`0008_life_system`も
+自動適用します。Neon Consoleでの手作業による列・索引・
 テーブル作成は不要です。管理画面を有効にする場合は`ADMIN_USERNAMES`を追加します。
 
 ## デプロイ環境変数

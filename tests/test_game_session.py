@@ -452,6 +452,13 @@ class SnapshotTests(unittest.TestCase):
         self.clock = ManualClock()
         self.lexicon = FakeLexicon(WORDS)
 
+    def test_new_snapshots_use_version_three(self) -> None:
+        snapshot = GameSession(
+            self.lexicon,  # type: ignore[arg-type]
+            clock=self.clock,
+        ).to_snapshot()
+        self.assertEqual(snapshot["snapshot_version"], 3)
+
     def test_round_trips_active_history_pending_and_deadline(self) -> None:
         game = GameSession(
             self.lexicon,  # type: ignore[arg-type]
@@ -578,6 +585,75 @@ class SnapshotTests(unittest.TestCase):
                 self.lexicon,  # type: ignore[arg-type]
                 clock=self.clock,
             )
+
+    def test_v1_and_v2_restore_connections_valid_under_the_old_vu_rule(
+        self,
+    ) -> None:
+        base = GameSession(
+            self.lexicon,  # type: ignore[arg-type]
+            clock=self.clock,
+        ).to_snapshot()
+        base["history"] = [
+            {
+                "surface": "語尾ヴ",
+                "reading": "ごびゔ",
+                "canonical_key": "ごびゔ",
+                "turn_number": 1,
+                "timestamp": START.isoformat(),
+                "result": "accepted",
+            },
+            {
+                "surface": "ヴァリア",
+                "reading": "ゔぁりあ",
+                "canonical_key": "ゔぁりあ",
+                "turn_number": 2,
+                "timestamp": START.isoformat(),
+                "result": "accepted",
+            },
+        ]
+
+        for version in (1, 2):
+            with self.subTest(version=version):
+                legacy = self._clone_snapshot(base)
+                legacy["snapshot_version"] = version
+                if version == 1:
+                    del legacy["deadline_policy"]
+                restored = GameSession.from_snapshot(
+                    legacy,
+                    self.lexicon,  # type: ignore[arg-type]
+                    clock=self.clock,
+                )
+                self.assertEqual(
+                    tuple(entry.reading for entry in restored.history),
+                    ("ごびゔ", "ゔぁりあ"),
+                )
+
+    def test_v3_rejects_connection_only_valid_under_the_old_vu_rule(
+        self,
+    ) -> None:
+        snapshot = GameSession(
+            self.lexicon,  # type: ignore[arg-type]
+            clock=self.clock,
+        ).to_snapshot()
+        snapshot["history"] = [
+            {
+                "surface": "語尾ヴ",
+                "reading": "ごびゔ",
+                "canonical_key": "ごびゔ",
+                "turn_number": 1,
+                "timestamp": START.isoformat(),
+                "result": "accepted",
+            },
+            {
+                "surface": "ヴァリア",
+                "reading": "ゔぁりあ",
+                "canonical_key": "ゔぁりあ",
+                "turn_number": 2,
+                "timestamp": START.isoformat(),
+                "result": "accepted",
+            },
+        ]
+        self._assert_snapshot_rejected(snapshot)
 
 
     def _assert_snapshot_rejected(

@@ -326,6 +326,7 @@ class StartupRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 status=RoomStatus.FINISHED,
                 state_version=snapshot.state_version + 1,
                 eliminated_seats=(0,),
+                remaining_lives=(0, 1),
                 expected_kana=None,
                 deadline_at=None,
                 losing_seat=0,

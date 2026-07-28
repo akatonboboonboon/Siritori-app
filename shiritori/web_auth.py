@@ -53,6 +53,7 @@ from .onboarding import (
 )
 from .room_runtime import RoomRuntimeCapabilityError
 from .rooms import (
+    LifeLossRecord,
     LexiconRoomService,
     ReactionRateLimitError,
     SUPPORTED_REACTIONS,
@@ -139,6 +140,7 @@ class _MatchResultPresentation:
     end_reason: str
     round_summary: str
     last_word: str
+    life_loss_history: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +205,23 @@ def _turn_seat_label(
 ) -> str:
     """Return a readable current-turn label without exposing account IDs."""
 
-    seat = snapshot.players[snapshot.current_turn]
+    return _seat_display_label(
+        snapshot,
+        snapshot.current_turn,
+        user_id,
+        display_names,
+    )
+
+
+def _seat_display_label(
+    snapshot: RoomSnapshot,
+    seat_index: int,
+    user_id: str,
+    display_names: Mapping[str, str],
+) -> str:
+    """Return one public seat label for turn, life, and result displays."""
+
+    seat = snapshot.players[seat_index]
     owner_id = seat.owner_user_id
     display_name = (
         display_names.get(owner_id)
@@ -222,6 +240,90 @@ def _turn_seat_label(
     if owner_id == user_id:
         return f"あなた（{display_name}）" if display_name else "あなた"
     return display_name or f"プレイヤー{seat.index + 1}"
+
+
+def _seat_life_text(
+    snapshot: RoomSnapshot,
+    seat_index: int,
+    user_id: str,
+    display_names: Mapping[str, str],
+) -> str:
+    """Describe one player's remaining lives without exposing an account ID."""
+
+    seat = snapshot.players[seat_index]
+    label = _seat_display_label(
+        snapshot,
+        seat_index,
+        user_id,
+        display_names,
+    )
+    remaining = snapshot.remaining_lives[seat_index]
+    if remaining <= 0 or seat_index in snapshot.eliminated_seats:
+        elimination = next(
+            (
+                event
+                for event in reversed(snapshot.life_loss_events)
+                if event.seat_index == seat_index and event.eliminated
+            ),
+            None,
+        )
+        if elimination is None:
+            state = "脱落・観戦中"
+        else:
+            reason = _END_REASON_TEXT.get(
+                elimination.reason,
+                "対局ルールに違反した",
+            )
+            word = _life_loss_word_text(elimination)
+            state = (
+                f"脱落（{reason}／{word}）・観戦中"
+            )
+    elif (
+        snapshot.status is RoomStatus.ACTIVE
+        and snapshot.current_turn == seat_index
+    ):
+        state = "現在の手番"
+    elif seat.controller is SeatController.BOT:
+        state = "Botが代行中"
+    else:
+        state = "待機中"
+    return (
+        f"{label}｜ライフ {remaining}/{snapshot.lives_per_player}"
+        f"｜{state}"
+    )
+
+
+def _life_loss_word_text(event: LifeLossRecord) -> str:
+    """Return the attempted word or a clear server-event fallback."""
+
+    if not event.surface:
+        return "使用単語なし"
+    if event.reading and event.reading != event.surface:
+        return f"{event.surface}（よみ：{event.reading}）"
+    return event.surface
+
+
+def _life_loss_event_text(
+    snapshot: RoomSnapshot,
+    event: LifeLossRecord,
+    user_id: str,
+    display_names: Mapping[str, str],
+) -> str:
+    """Build a public, complete explanation of one life-loss event."""
+
+    actor = _seat_display_label(
+        snapshot,
+        event.seat_index,
+        user_id,
+        display_names,
+    )
+    reason = _END_REASON_TEXT.get(event.reason, "対局ルールに違反した")
+    outcome = "脱落" if event.eliminated else "ライフ減少"
+    return (
+        f"{actor}｜{_life_loss_word_text(event)}｜{reason}｜"
+        f"残りライフ {event.remaining_lives}/{snapshot.lives_per_player}"
+        f"｜{outcome}"
+    )
 
 
 def _reaction_sender_label(
@@ -243,6 +345,7 @@ def _reaction_sender_label(
 def _match_result_presentation(
     snapshot: RoomSnapshot,
     user_id: str,
+    display_names: Mapping[str, str] | None = None,
 ) -> _MatchResultPresentation:
     """Build the finished result card entirely from public seat labels."""
 
@@ -286,6 +389,7 @@ def _match_result_presentation(
         if snapshot.history
         else "なし"
     )
+    public_names = display_names or {}
     return _MatchResultPresentation(
         title=title,
         tone=tone,
@@ -300,23 +404,37 @@ def _match_result_presentation(
         ),
         round_summary=round_summary,
         last_word=last_word,
+        life_loss_history=tuple(
+            _life_loss_event_text(
+                snapshot,
+                event,
+                user_id,
+                public_names,
+            )
+            for event in snapshot.life_loss_events
+        ),
     )
 
 
 def _result_share_text(result: _MatchResultPresentation) -> str:
     """Return a private-ID-free, URL-free plain-text result."""
 
-    return "\n".join(
-        (
-            "しりとり対局結果",
-            result.title,
-            result.outcome,
-            f"成立したことば: {result.accepted_word_count}語",
-            f"終了理由: {result.end_reason}",
-            f"対戦概要: {result.round_summary}",
-            f"最後のことば: {result.last_word}",
+    lines = [
+        "しりとり対局結果",
+        result.title,
+        result.outcome,
+        f"成立したことば: {result.accepted_word_count}語",
+        f"終了理由: {result.end_reason}",
+        f"対戦概要: {result.round_summary}",
+        f"最後のことば: {result.last_word}",
+    ]
+    if result.life_loss_history:
+        lines.append("ライフ損失履歴:")
+        lines.extend(
+            f"- {event_text}"
+            for event_text in result.life_loss_history
         )
-    )
+    return "\n".join(lines)
 
 
 def _result_share_script() -> str:
@@ -417,8 +535,12 @@ def _snapshot_effect(
         sound = "victory" if result.tone == "victory" else "finish"
         return _SnapshotEffect("finish", sound)
     effect: _SnapshotEffect | None = None
-    if len(current.eliminated_seats) > len(previous.eliminated_seats):
-        effect = _SnapshotEffect("elimination", "elimination")
+    if len(current.life_loss_events) > len(previous.life_loss_events):
+        latest_loss = current.life_loss_events[-1]
+        effect = _SnapshotEffect(
+            "elimination" if latest_loss.eliminated else "life_loss",
+            "elimination",
+        )
     elif len(current.history) > len(previous.history):
         effect = _SnapshotEffect("accepted", "accepted")
     if effect is None:
@@ -587,6 +709,21 @@ def _solo_difficulty_options() -> dict[str, str]:
     }
 
 
+def _life_count_options() -> dict[int, str]:
+    """Return every supported initial life count."""
+
+    return {
+        count: f"{count}個"
+        for count in range(1, 6)
+    }
+
+
+def _validate_lives_per_player(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 5:
+        raise ValueError("lives_per_player must be from 1 to 5")
+    return value
+
+
 def _room_timer_text(turn_seconds: int | None) -> str:
     """Return the compact Japanese timer label shared by room screens."""
 
@@ -622,6 +759,7 @@ def _room_listing_summary(room: object) -> str:
     player_count = len(players)
     max_players = int(getattr(room, "max_players"))
     timer = _room_timer_text(getattr(room, "turn_seconds"))
+    lives = _validate_lives_per_player(getattr(room, "lives_per_player"))
     bot_fill = (
         "不足分はNormal Bot"
         if bool(getattr(room, "fill_empty_seats_with_bots"))
@@ -634,7 +772,7 @@ def _room_listing_summary(room: object) -> str:
     )
     return (
         f"対戦参加 {player_count}/{max_players}人・"
-        f"{timer}・{bot_fill}・{spectator}"
+        f"{timer}・ライフ{lives}・{bot_fill}・{spectator}"
     )
 
 
@@ -1621,6 +1759,11 @@ def register_auth_pages(
                             value=2,
                             label="最大人数",
                         ).props("outlined options-dense").classes("w-full")
+                        room_lives_select = ui.select(
+                            options=_life_count_options(),
+                            value=1,
+                            label="ライフ数",
+                        ).props("outlined options-dense").classes("w-full")
                         room_timer_select = ui.select(
                             options={
                                 "unlimited": "無制限",
@@ -1687,6 +1830,9 @@ def register_auth_pages(
                                     or not 2 <= max_players <= 8
                                 ):
                                     raise ValueError("invalid player count")
+                                lives_per_player = (
+                                    _validate_lives_per_player(room_lives_select.value)
+                                )
                                 room = await asyncio.to_thread(
                                     lobby.create_pvp_room,
                                     current_principal.account.id,
@@ -1694,6 +1840,7 @@ def register_auth_pages(
                                         room_name_input.value or ""
                                     ),
                                     max_players=max_players,
+                                    lives_per_player=lives_per_player,
                                     allow_spectators=bool(
                                         spectator_switch.value
                                     ),
@@ -1819,6 +1966,11 @@ def register_auth_pages(
                             value=1,
                             label="Botの数",
                         ).props("outlined options-dense").classes("w-full")
+                        solo_lives_select = ui.select(
+                            options=_life_count_options(),
+                            value=1,
+                            label="ライフ数",
+                        ).props("outlined options-dense").classes("w-full")
                         difficulty_select = ui.select(
                             options=_solo_difficulty_options(),
                             value="normal",
@@ -1864,6 +2016,9 @@ def register_auth_pages(
                                 bot_count = bot_count_select.value
                                 difficulty = difficulty_select.value
                                 timer_value = timer_select.value
+                                lives_per_player = (
+                                    _validate_lives_per_player(solo_lives_select.value)
+                                )
                                 if (
                                     type(bot_count) is not int
                                     or not 1 <= bot_count <= 7
@@ -1890,6 +2045,7 @@ def register_auth_pages(
                                     bot_count=bot_count,
                                     bot_difficulty=difficulty,
                                     turn_seconds=turn_seconds,
+                                    lives_per_player=lives_per_player,
                                 )
                             except (
                                 TypeError,
@@ -3201,6 +3357,7 @@ def register_auth_pages(
                 f"{visibility}・制限時間: "
                 f"{_room_timer_text(room.turn_seconds)}・"
                 f"最大{room.max_players}人・{bot_fill}・{spectator_access}"
+                f"・ライフ{room.lives_per_player}"
             )
             members_box.clear()
             with members_box:
@@ -3342,6 +3499,7 @@ def register_auth_pages(
                         displayed_room.max_players,
                         displayed_room.turn_seconds,
                         displayed_room.fill_empty_seats_with_bots,
+                        displayed_room.lives_per_player,
                     ),
                 )
             except LobbyRevisionConflict as error:
@@ -3402,6 +3560,7 @@ def register_auth_pages(
             nonlocal settings_edit_revision
             settings_edit_revision = room.revision
             settings_players_select.set_value(room.max_players)
+            settings_lives_select.set_value(room.lives_per_player)
             settings_timer_select.set_value(
                 _room_timer_value(room.turn_seconds)
             )
@@ -3436,6 +3595,9 @@ def register_auth_pages(
                 max_players = settings_players_select.value
                 if type(max_players) is not int or not 2 <= max_players <= 8:
                     raise ValueError("invalid player count")
+                lives_per_player = _validate_lives_per_player(
+                    settings_lives_select.value
+                )
                 turn_seconds = _parse_room_timer_value(
                     settings_timer_select.value
                 )
@@ -3455,6 +3617,7 @@ def register_auth_pages(
                     raise ValueError("invalid room switch")
                 gameplay_changed = (
                     current_room.max_players != max_players
+                    or current_room.lives_per_player != lives_per_player
                     or current_room.turn_seconds != turn_seconds
                     or current_room.fill_empty_seats_with_bots
                     is not fill_empty_seats_with_bots
@@ -3465,6 +3628,7 @@ def register_auth_pages(
                     current_room.room_code,
                     expected_revision=settings_edit_revision,
                     max_players=max_players,
+                    lives_per_player=lives_per_player,
                     allow_spectators=allow_spectators,
                     turn_seconds=turn_seconds,
                     is_public=is_public,
@@ -3606,6 +3770,11 @@ def register_auth_pages(
                 value=initial_room.max_players,
                 label="最大人数",
             ).props("outlined options-dense").classes("w-full")
+            settings_lives_select = ui.select(
+                options=_life_count_options(),
+                value=initial_room.lives_per_player,
+                label="ライフ数",
+            ).props("outlined options-dense").classes("w-full")
             settings_timer_select = ui.select(
                 options={
                     "unlimited": "無制限",
@@ -3631,7 +3800,7 @@ def register_auth_pages(
                 value=initial_room.fill_empty_seats_with_bots,
             )
             ui.label(
-                "最大人数・制限時間・Bot補充を変えると、"
+                "最大人数・制限時間・ライフ数・Bot補充を変えると、"
                 "全員の準備状態が解除されます。"
             ).classes("platform-muted room-setting-help")
             ui.label(
@@ -3770,7 +3939,7 @@ def register_auth_pages(
                 return
             if effect.kind == "accepted":
                 animate_element(history_box, "game-effect--accepted")
-            elif effect.kind == "elimination":
+            elif effect.kind in {"life_loss", "elimination"}:
                 animate_element(feedback_label, "game-effect--elimination")
             elif effect.kind == "finish":
                 animate_element(result_panel, "game-effect--finish")
@@ -3979,12 +4148,12 @@ def register_auth_pages(
                 )
                 settings_label.set_text(
                     f"Bot {len(snapshot.players) - 1}体・"
-                    f"{difficulty}・{timer}"
+                    f"{difficulty}・{timer}・ライフ{snapshot.lives_per_player}"
                 )
             else:
                 game_title.set_text("オンライン対戦")
                 settings_label.set_text(
-                    f"{len(snapshot.players)}人対戦・{timer}"
+                    f"{len(snapshot.players)}人対戦・{timer}・ライフ{snapshot.lives_per_player}"
                 )
             status_names = {
                 RoomStatus.ACTIVE: "対局中",
@@ -4023,6 +4192,35 @@ def register_auth_pages(
                     "deadline--normal deadline--warning deadline--danger"
                 ),
             )
+            player_status_box.clear()
+            with player_status_box:
+                for seat in snapshot.players:
+                    seat_status = ui.label(
+                        _seat_life_text(
+                            snapshot,
+                            seat.index,
+                            user_id,
+                            seat_display_names,
+                        )
+                    ).classes("w-full")
+                    if (
+                        snapshot.status is RoomStatus.ACTIVE
+                        and snapshot.current_turn == seat.index
+                    ):
+                        seat_status.classes(add="aside-title")
+                    else:
+                        seat_status.classes(add="platform-muted")
+            if snapshot.life_loss_events:
+                latest_loss = snapshot.life_loss_events[-1]
+                life_event_label.set_text(
+                    "直近のライフ変動："
+                    + _life_loss_event_text(
+                        snapshot, latest_loss, user_id, seat_display_names
+                    )
+                )
+                life_event_label.set_visibility(True)
+            else:
+                life_event_label.set_visibility(False)
 
             history_signature = tuple(snapshot.history)
             history_should_scroll = _history_was_appended(
@@ -4100,7 +4298,7 @@ def register_auth_pages(
             solo_rematch_button.set_visibility(finished and is_solo)
             waiting_room_button.set_visibility(finished and not is_solo)
             if finished:
-                result = _match_result_presentation(snapshot, user_id)
+                result = _match_result_presentation(snapshot, user_id, seat_display_names)
                 result_panel.classes(
                     add=f"match-result--{result.tone}",
                     remove=(
@@ -4116,12 +4314,21 @@ def register_auth_pages(
                 result_reason.set_text(result.end_reason)
                 result_round.set_text(result.round_summary)
                 result_last_word.set_text(result.last_word)
+                result_life_loss_box.clear()
+                with result_life_loss_box:
+                    if result.life_loss_history:
+                        for entry in result.life_loss_history:
+                            ui.label(f"・{entry}").classes(
+                                "platform-muted w-full"
+                            )
+                    else:
+                        ui.label("ライフ損失なし").classes("platform-muted")
                 result_share_payload.set_text(
                     _result_share_text(result)
                 )
             if finished and is_solo:
                 post_match_label.set_text(
-                    "Bot数・難易度・制限時間を変えずに、"
+                    "Bot数・難易度・制限時間・ライフ数を変えずに、"
                     "新しい対局へ挑戦できます。"
                 )
             elif finished:
@@ -4194,13 +4401,24 @@ def register_auth_pages(
                 feedback_label.set_text(transient_message)
             elif snapshot.role_for_user(user_id) is Role.SPECTATOR:
                 own_seat = snapshot.seat_for_user(user_id)
-                if (
-                    own_seat is not None
-                    and snapshot.end_reason == "surrender"
-                    and snapshot.losing_seat == own_seat.index
-                ):
+                own_loss = (
+                    next(
+                        (
+                            event
+                            for event in reversed(snapshot.life_loss_events)
+                            if event.seat_index == own_seat.index
+                        ),
+                        None,
+                    )
+                    if own_seat is not None
+                    else None
+                )
+                if own_loss is not None and own_loss.eliminated:
                     feedback_label.set_text(
-                        "降参しました。観戦中です。"
+                        _life_loss_event_text(
+                            snapshot, own_loss, user_id, seat_display_names
+                        )
+                        + "。観戦中です。"
                     )
                 else:
                     feedback_label.set_text(
@@ -4216,19 +4434,13 @@ def register_auth_pages(
                 feedback_label.set_text(
                     "辞書にある単語を入力してください。"
                 )
-            elif snapshot.eliminated_seats:
-                latest = snapshot.eliminated_seats[-1]
-                action = (
-                    "が降参して観戦に回りました。"
-                    if (
-                        snapshot.end_reason == "surrender"
-                        and snapshot.losing_seat == latest
-                    )
-                    else "が脱落しました。"
-                )
+            elif snapshot.life_loss_events:
+                latest_loss = snapshot.life_loss_events[-1]
                 feedback_label.set_text(
-                    f"プレイヤー{latest + 1}{action}"
-                    f"残り{len(snapshot.active_seat_indexes)}人です。"
+                    _life_loss_event_text(
+                        snapshot, latest_loss, user_id, seat_display_names
+                    )
+                    + f"。対戦継続中は残り{len(snapshot.active_seat_indexes)}人です。"
                 )
             else:
                 feedback_label.set_text(
@@ -4803,6 +5015,21 @@ def register_auth_pages(
                             "role='status' aria-live='polite' "
                             "aria-atomic='true'"
                         )
+                        ui.label("プレイヤーとライフ").classes(
+                            "aside-title"
+                        )
+                        player_status_box = ui.column().classes(
+                            "w-full gap-1"
+                        ).props(
+                            "role='status' aria-live='polite' "
+                            "aria-label='プレイヤーごとの残りライフ'"
+                        )
+                        life_event_label = ui.label("").classes(
+                            "game-latest-word w-full"
+                        ).props(
+                            "role='alert' aria-live='assertive' aria-atomic='true'"
+                        )
+                        life_event_label.set_visibility(False)
                         word_input = ui.input(
                             label="次のことば",
                             placeholder="漢字・ひらがな・カタカナ",
@@ -4874,6 +5101,12 @@ def register_auth_pages(
                                     result_last_word = ui.label("").classes(
                                         "match-result-metric-value"
                                     )
+                            ui.label("ライフ損失履歴").classes(
+                                "match-result-metric-label"
+                            )
+                            result_life_loss_box = ui.column().classes(
+                                "w-full gap-1"
+                            )
                         result_panel.set_visibility(False)
                         result_share_payload = ui.label("").classes(
                             "result-share-payload"
@@ -5043,7 +5276,8 @@ def register_auth_pages(
                                 else f"{save.turn_seconds}秒"
                             )
                             ui.label(
-                                f"Bot {save.bot_count}体・{timer}・{save.move_count}手"
+                                f"Bot {save.bot_count}体・{timer}・"
+                                f"ライフ{save.lives_per_player}・{save.move_count}手"
                             ).classes("platform-muted")
                             ui.label(
                                 f"対局ID: {save.game_id}"

@@ -33,6 +33,14 @@ _SMALL_TO_LARGE_KANA = {
 _DAKUON_CHAIN_EQUIVALENTS = {
     "ぢ": "じ",
     "づ": "ず",
+    "ゔ": "ぶ",
+}
+
+_VU_MORA_CHAIN_EQUIVALENTS = {
+    "ゔぁ": "ば",
+    "ゔぃ": "び",
+    "ゔぇ": "べ",
+    "ゔぉ": "ぼ",
 }
 
 _VOWEL_BY_KANA = {
@@ -47,8 +55,21 @@ _VOWEL_BY_KANA = {
 def canonical_kana(character: str) -> str:
     """Return the canonical kana used only for shiritori connections."""
 
+    if character in _VU_MORA_CHAIN_EQUIVALENTS:
+        return _VU_MORA_CHAIN_EQUIVALENTS[character]
     expanded = _SMALL_TO_LARGE_KANA.get(character, character)
     return _DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
+
+
+def first_kana(reading: str) -> str:
+    """Return a reading's effective first kana."""
+
+    if not reading:
+        raise ValueError("reading must not be empty")
+    for alternate, canonical in _VU_MORA_CHAIN_EQUIVALENTS.items():
+        if reading.startswith(alternate):
+            return canonical
+    return canonical_kana(reading[0])
 
 
 def final_kana(reading: str) -> str:
@@ -63,6 +84,9 @@ def final_kana(reading: str) -> str:
         raise ValueError("reading must not be empty")
     final = reading[-1]
     if final != "ー":
+        for alternate, canonical in _VU_MORA_CHAIN_EQUIVALENTS.items():
+            if reading.endswith(alternate):
+                return canonical
         return canonical_kana(final)
     for character in reversed(reading[:-1]):
         if character == "ー":
@@ -95,7 +119,7 @@ class WordOption:
 
     @property
     def first_kana(self) -> str:
-        return canonical_kana(self.reading[0])
+        return first_kana(self.reading)
 
     @property
     def last_kana(self) -> str:

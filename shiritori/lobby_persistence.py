@@ -31,6 +31,7 @@ from .lobby import (
     normalize_invite_code,
     normalize_room_name,
     room_name_key,
+    validate_lives_per_player,
     validate_theme_key,
     validate_turn_seconds,
     validate_waiting_gameplay_settings,
@@ -92,6 +93,7 @@ class SQLAlchemyLobbyRepository:
         turn_seconds: int | None,
         is_public: bool = False,
         fill_empty_seats_with_bots: bool = False,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
         owner = _identifier(owner_user_id, "owner_user_id", 36)
         code = normalize_invite_code(room_code)
@@ -103,6 +105,7 @@ class SQLAlchemyLobbyRepository:
             raise ValueError("allow_spectators must be boolean")
         key = validate_theme_key(theme_key)
         seconds = validate_turn_seconds(turn_seconds)
+        lives = validate_lives_per_player(lives_per_player)
         if type(is_public) is not bool:
             raise ValueError("is_public must be boolean")
         if type(fill_empty_seats_with_bots) is not bool:
@@ -117,6 +120,7 @@ class SQLAlchemyLobbyRepository:
                     name_key=clean_name_key,
                     status=StoredRoomStatus.WAITING.value,
                     max_players=max_players,
+                    lives_per_player=lives,
                     allow_spectators=allow_spectators,
                     is_public=is_public,
                     fill_empty_seats_with_bots=fill_empty_seats_with_bots,
@@ -599,6 +603,7 @@ class SQLAlchemyLobbyRepository:
                 room.max_players,
                 room.turn_seconds,
                 room.fill_empty_seats_with_bots,
+                room.lives_per_player,
             ):
                 raise LobbyRevisionConflict(_snapshot(session, room))
             membership = session.get(
@@ -630,6 +635,7 @@ class SQLAlchemyLobbyRepository:
         turn_seconds: int | None,
         is_public: bool,
         fill_empty_seats_with_bots: bool,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
         room_identifier = _identifier(room_id, "room_id", 36)
         owner_id = _identifier(
@@ -648,6 +654,7 @@ class SQLAlchemyLobbyRepository:
         if type(fill_empty_seats_with_bots) is not bool:
             raise ValueError("fill_empty_seats_with_bots must be boolean")
         seconds = validate_turn_seconds(turn_seconds)
+        lives = validate_lives_per_player(lives_per_player)
 
         with self._guard(), self.database.transaction() as session:
             room = _waiting_room(session, room_identifier)
@@ -674,6 +681,7 @@ class SQLAlchemyLobbyRepository:
                 and room.is_public is is_public
                 and room.fill_empty_seats_with_bots
                 is fill_empty_seats_with_bots
+                and room.lives_per_player == lives
             )
             if unchanged:
                 return current
@@ -683,6 +691,7 @@ class SQLAlchemyLobbyRepository:
                 or room.turn_seconds != seconds
                 or room.fill_empty_seats_with_bots
                 is not fill_empty_seats_with_bots
+                or room.lives_per_player != lives
             )
             if gameplay_changed:
                 for membership in memberships:
@@ -697,6 +706,7 @@ class SQLAlchemyLobbyRepository:
             room.turn_seconds = seconds
             room.is_public = is_public
             room.fill_empty_seats_with_bots = fill_empty_seats_with_bots
+            room.lives_per_player = lives
             room.revision += 1
             room.updated_at = utc_now()
             session.flush()
@@ -765,6 +775,7 @@ class SQLAlchemyLobbyRepository:
                         "fill_empty_seats_with_bots": (
                             room.fill_empty_seats_with_bots
                         ),
+                        "lives_per_player": room.lives_per_player,
                     },
                     state_json=document,
                     starting_seat_index=active_room.current_turn,
@@ -1088,6 +1099,7 @@ def _snapshot(session: Session, room: Room) -> LobbyRoomSnapshot:
         members=members,
         is_public=room.is_public,
         fill_empty_seats_with_bots=room.fill_empty_seats_with_bots,
+        lives_per_player=room.lives_per_player,
     )
 
 
@@ -1158,6 +1170,9 @@ def _active_game_matches(
             False,
         )
         is room.fill_empty_seats_with_bots
+        and settings.get("lives_per_player", 1)
+        == room.lives_per_player
+        == active.lives_per_player
         and _active_player_layout_matches(
             tuple(player.user_id for player in players),
             active,
@@ -1277,6 +1292,9 @@ def _finished_game_projection_matches(
             False,
         )
         is room.fill_empty_seats_with_bots
+        and settings.get("lives_per_player", 1)
+        == room.lives_per_player
+        == finished.lives_per_player
         and game.deadline_at is None
         and game.finished_at is not None
     )
@@ -1320,6 +1338,7 @@ def _validate_active_snapshot(
         )
         or active.spectators != expected_spectators
         or active.turn_seconds != turn_seconds
+        or active.lives_per_player != lobby.lives_per_player
         or active.theme_key != lobby.theme_key
         or lobby.theme_key != theme_key
         or active.bot_difficulty != "normal"

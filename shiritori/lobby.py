@@ -154,7 +154,18 @@ def validate_turn_seconds(turn_seconds: int | None) -> int | None:
     return turn_seconds
 
 
-WaitingGameplaySettings = tuple[int, int | None, bool]
+def validate_lives_per_player(lives_per_player: int) -> int:
+    """Validate the configured starting life count for every player."""
+
+    if (
+        type(lives_per_player) is not int
+        or not 1 <= lives_per_player <= 5
+    ):
+        raise ValueError("lives_per_player must be an integer from 1 to 5")
+    return lives_per_player
+
+
+WaitingGameplaySettings = tuple[int, int | None, bool, int]
 
 
 def validate_waiting_gameplay_settings(
@@ -164,15 +175,16 @@ def validate_waiting_gameplay_settings(
 
     if settings is None:
         return None
-    if type(settings) is not tuple or len(settings) != 3:
-        raise ValueError("expected_gameplay_settings must be a three-item tuple")
-    max_players, turn_seconds, bot_fill = settings
+    if type(settings) is not tuple or len(settings) != 4:
+        raise ValueError("expected_gameplay_settings must be a four-item tuple")
+    max_players, turn_seconds, bot_fill, lives_per_player = settings
     if type(max_players) is not int or not 2 <= max_players <= 8:
         raise ValueError("expected max_players must be from 2 to 8")
     seconds = validate_turn_seconds(turn_seconds)
     if type(bot_fill) is not bool:
         raise ValueError("expected bot fill must be boolean")
-    return (max_players, seconds, bot_fill)
+    lives = validate_lives_per_player(lives_per_player)
+    return (max_players, seconds, bot_fill, lives)
 
 
 def validate_theme_key(theme_key: str) -> str:
@@ -222,6 +234,7 @@ class LobbyRoomSnapshot:
     members: tuple[LobbyMember, ...]
     is_public: bool = False
     fill_empty_seats_with_bots: bool = False
+    lives_per_player: int = 1
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -238,6 +251,7 @@ class LobbyRoomSnapshot:
             raise ValueError("max_players must be from 2 to 8")
         validate_theme_key(self.theme_key)
         validate_turn_seconds(self.turn_seconds)
+        validate_lives_per_player(self.lives_per_player)
         if type(self.is_public) is not bool:
             raise ValueError("is_public must be boolean")
         if type(self.fill_empty_seats_with_bots) is not bool:
@@ -334,6 +348,7 @@ class LobbyRepository(Protocol):
         turn_seconds: int | None,
         is_public: bool = False,
         fill_empty_seats_with_bots: bool = False,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
         """Create the room and owner membership in one transaction."""
 
@@ -408,6 +423,7 @@ class LobbyRepository(Protocol):
         turn_seconds: int | None,
         is_public: bool,
         fill_empty_seats_with_bots: bool,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
         """Atomically update owner-controlled settings of a waiting room."""
 
@@ -476,6 +492,7 @@ class LobbyService:
         turn_seconds: int | None = None,
         is_public: bool = False,
         fill_empty_seats_with_bots: bool = False,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
         """Create an unrestricted room; legacy theme arguments are ignored."""
         owner = _require_user_id(owner_user_id)
@@ -489,6 +506,7 @@ class LobbyService:
         if type(fill_empty_seats_with_bots) is not bool:
             raise ValueError("fill_empty_seats_with_bots must be boolean")
         seconds = validate_turn_seconds(turn_seconds)
+        lives = validate_lives_per_player(lives_per_player)
 
         for _ in range(self.max_code_attempts):
             code = normalize_invite_code(self.code_factory())
@@ -503,6 +521,7 @@ class LobbyService:
                     turn_seconds=seconds,
                     is_public=is_public,
                     fill_empty_seats_with_bots=fill_empty_seats_with_bots,
+                    lives_per_player=lives,
                 )
             except InviteCodeConflict:
                 continue
@@ -686,6 +705,7 @@ class LobbyService:
             room.max_players,
             room.turn_seconds,
             room.fill_empty_seats_with_bots,
+            room.lives_per_player,
         ):
             raise LobbyRevisionConflict(room)
         if member.ready is ready:
@@ -708,6 +728,7 @@ class LobbyService:
         turn_seconds: int | None,
         is_public: bool,
         fill_empty_seats_with_bots: bool,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
         """Update settings while waiting without silently overwriting changes."""
 
@@ -723,6 +744,7 @@ class LobbyService:
         if type(fill_empty_seats_with_bots) is not bool:
             raise ValueError("fill_empty_seats_with_bots must be boolean")
         seconds = validate_turn_seconds(turn_seconds)
+        lives = validate_lives_per_player(lives_per_player)
 
         room = self.get_room(raw_room_code)
         if room.status is not StoredRoomStatus.WAITING:
@@ -744,6 +766,7 @@ class LobbyService:
             turn_seconds=seconds,
             is_public=is_public,
             fill_empty_seats_with_bots=fill_empty_seats_with_bots,
+            lives_per_player=lives,
         )
 
     def start(
@@ -784,6 +807,7 @@ class LobbyService:
             turn_seconds=room.turn_seconds,
             theme_key=room.theme_key,
             bot_difficulty="normal",
+            lives_per_player=room.lives_per_player,
             **picker_arguments,
         )
         # create_room_snapshot deliberately leaves expected_kana unset, so the
@@ -869,7 +893,9 @@ class InMemoryLobbyRepository:
         turn_seconds: int | None,
         is_public: bool = False,
         fill_empty_seats_with_bots: bool = False,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
+        lives = validate_lives_per_player(lives_per_player)
         with self._lock:
             if room_code in self._room_id_by_code:
                 raise InviteCodeConflict(room_code)
@@ -904,6 +930,7 @@ class InMemoryLobbyRepository:
                 ),
                 is_public=is_public,
                 fill_empty_seats_with_bots=fill_empty_seats_with_bots,
+                lives_per_player=lives,
             )
             self._rooms_by_id[room.id] = room
             self._room_id_by_code[room.room_code] = room.id
@@ -1123,6 +1150,7 @@ class InMemoryLobbyRepository:
                 room.max_players,
                 room.turn_seconds,
                 room.fill_empty_seats_with_bots,
+                room.lives_per_player,
             ):
                 raise LobbyRevisionConflict(room)
             member = room.member_for(user_id)
@@ -1157,7 +1185,9 @@ class InMemoryLobbyRepository:
         turn_seconds: int | None,
         is_public: bool,
         fill_empty_seats_with_bots: bool,
+        lives_per_player: int = 1,
     ) -> LobbyRoomSnapshot:
+        lives = validate_lives_per_player(lives_per_player)
         with self._lock:
             room = self._waiting_room(room_id)
             if room.owner_user_id != requesting_owner_user_id:
@@ -1177,6 +1207,7 @@ class InMemoryLobbyRepository:
                 and room.is_public is is_public
                 and room.fill_empty_seats_with_bots
                 is fill_empty_seats_with_bots
+                and room.lives_per_player == lives
             )
             if unchanged:
                 return room
@@ -1186,6 +1217,7 @@ class InMemoryLobbyRepository:
                 or room.turn_seconds != turn_seconds
                 or room.fill_empty_seats_with_bots
                 is not fill_empty_seats_with_bots
+                or room.lives_per_player != lives
             )
             members = (
                 tuple(
@@ -1204,6 +1236,7 @@ class InMemoryLobbyRepository:
                 turn_seconds=turn_seconds,
                 is_public=is_public,
                 fill_empty_seats_with_bots=fill_empty_seats_with_bots,
+                lives_per_player=lives,
                 members=members,
                 revision=room.revision + 1,
             )
@@ -1242,6 +1275,7 @@ class InMemoryLobbyRepository:
                     expected_bot_count=expected_bot_count,
                 )
                 or active_room.turn_seconds != turn_seconds
+                or active_room.lives_per_player != room.lives_per_player
                 or active_room.theme_key != room.theme_key
                 or active_room.bot_difficulty != "normal"
                 or theme_key != room.theme_key
@@ -1422,6 +1456,7 @@ def _active_start_matches(
         and active.theme_key == room.theme_key
         and active.bot_difficulty == "normal"
         and active.turn_seconds == room.turn_seconds
+        and active.lives_per_player == room.lives_per_player
     )
 
 
@@ -1475,6 +1510,7 @@ __all__ = [
     "normalize_invite_code",
     "normalize_room_name",
     "room_name_key",
+    "validate_lives_per_player",
     "validate_theme_key",
     "validate_turn_seconds",
 ]

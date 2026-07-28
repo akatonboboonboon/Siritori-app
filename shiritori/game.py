@@ -29,6 +29,14 @@ _SMALL_TO_LARGE_KANA = {
 _DAKUON_CHAIN_EQUIVALENTS = {
     "ぢ": "じ",
     "づ": "ず",
+    "ゔ": "ぶ",
+}
+
+_VU_MORA_CHAIN_EQUIVALENTS = {
+    "ゔぁ": "ば",
+    "ゔぃ": "び",
+    "ゔぇ": "べ",
+    "ゔぉ": "ぼ",
 }
 
 
@@ -94,8 +102,24 @@ def is_hiragana_only(word: str) -> bool:
 def canonical_kana(character: str) -> str:
     """Return the canonical kana used only for shiritori connections."""
 
+    if character in _VU_MORA_CHAIN_EQUIVALENTS:
+        return _VU_MORA_CHAIN_EQUIVALENTS[character]
     expanded = _SMALL_TO_LARGE_KANA.get(character, character)
     return _DAKUON_CHAIN_EQUIVALENTS.get(expanded, expanded)
+
+
+def _first_chain_kana(word: str) -> str:
+    for alternate, canonical in _VU_MORA_CHAIN_EQUIVALENTS.items():
+        if word.startswith(alternate):
+            return canonical
+    return canonical_kana(word[0])
+
+
+def _ending_chain_kana(word: str) -> str:
+    for alternate, canonical in _VU_MORA_CHAIN_EQUIVALENTS.items():
+        if word.endswith(alternate):
+            return canonical
+    return canonical_kana(word[-1])
 
 
 class GameState:
@@ -109,7 +133,7 @@ class GameState:
             raise ValueError("start_word must contain at least two characters")
         if normalized_start[0] in _SMALL_TO_LARGE_KANA:
             raise ValueError("start_word cannot begin with a small kana")
-        if canonical_kana(normalized_start[-1]) == "ん":
+        if _ending_chain_kana(normalized_start) == "ん":
             raise ValueError("start_word cannot end with ん")
 
         self._start_word = normalized_start
@@ -133,7 +157,7 @@ class GameState:
     def expected_kana(self) -> str:
         """The kana that must begin the next word."""
 
-        return canonical_kana(self.current_word[-1])
+        return _ending_chain_kana(self.current_word)
 
     @property
     def turn_count(self) -> int:
@@ -201,7 +225,7 @@ class GameState:
                 game_over=False,
             )
 
-        if canonical_kana(word[0]) != self.expected_kana:
+        if _first_chain_kana(word) != self.expected_kana:
             return TurnResult(
                 code=TurnCode.NOT_CHAINED,
                 message=f"「{self.expected_kana}」から始まることばを入力してください。",
@@ -222,7 +246,7 @@ class GameState:
 
         self._history.append(word)
 
-        if canonical_kana(word[-1]) == "ん":
+        if _ending_chain_kana(word) == "ん":
             self.status = GameStatus.LOST_BY_N
             return TurnResult(
                 code=TurnCode.ENDS_WITH_N,

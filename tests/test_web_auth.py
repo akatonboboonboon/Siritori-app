@@ -17,6 +17,7 @@ from starlette.responses import RedirectResponse
 from shiritori.auth import Account, SessionPrincipal
 from shiritori.lobby import LobbyStateError
 from shiritori.rooms import (
+    LifeLossRecord,
     RoomMode,
     Role,
     RoomReaction,
@@ -41,6 +42,8 @@ from shiritori.web_auth import (
     _feedback_for_version,
     _history_scroll_script,
     _history_was_appended,
+    _life_count_options,
+    _life_loss_event_text,
     _latest_word_text,
     _match_result_presentation,
     _parse_room_timer_value,
@@ -56,6 +59,7 @@ from shiritori.web_auth import (
     _safe_next,
     _same_origin,
     _session_principal_matches_user,
+    _seat_life_text,
     _snapshot_effect,
     _sound_cue_script,
     _set_session_cookie,
@@ -63,6 +67,7 @@ from shiritori.web_auth import (
     _tutorial_return_path,
     _tutorial_url,
     _turn_seat_label,
+    _validate_lives_per_player,
     _word_suggestion_status_label,
 )
 
@@ -322,6 +327,7 @@ class GameUiHelperTests(unittest.TestCase):
                 SimpleNamespace(user_id="secret-bob-id"),
             ),
             max_players=4,
+            lives_per_player=3,
             turn_seconds=30,
             fill_empty_seats_with_bots=True,
             allow_spectators=False,
@@ -331,7 +337,7 @@ class GameUiHelperTests(unittest.TestCase):
 
         self.assertEqual(
             summary,
-            "対戦参加 2/4人・30秒・不足分はNormal Bot・観戦不可",
+            "対戦参加 2/4人・30秒・ライフ3・不足分はNormal Bot・観戦不可",
         )
         self.assertNotIn("secret-alice-id", summary)
         self.assertNotIn("secret-bob-id", summary)
@@ -359,6 +365,22 @@ class GameUiHelperTests(unittest.TestCase):
             with self.subTest(invalid_value=invalid_value):
                 with self.assertRaises(ValueError):
                     _parse_room_timer_value(invalid_value)
+
+    def test_life_count_options_cover_only_one_through_five(self) -> None:
+        self.assertEqual(
+            _life_count_options(),
+            {
+                1: "1個",
+                2: "2個",
+                3: "3個",
+                4: "4個",
+                5: "5個",
+            },
+        )
+        for invalid in (True, 0, 6, "3", None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    _validate_lives_per_player(invalid)
 
     def test_turn_label_uses_display_names_without_exposing_user_ids(self) -> None:
         alice_id = "private-alice-id"
@@ -424,6 +446,71 @@ class GameUiHelperTests(unittest.TestCase):
         )
         self.assertFalse(any("private-" in label for label in labels))
 
+    def test_life_labels_and_loss_reasons_use_display_names(self) -> None:
+        now = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
+        alice_id = "private-alice-id"
+        bob_id = "private-bob-id"
+        active = create_room_snapshot(
+            "life-labels",
+            (alice_id, bob_id),
+            mode=RoomMode.PVP,
+            lives_per_player=3,
+            now=now,
+            seat_picker=lambda _count: 0,
+        )
+        first_loss = LifeLossRecord(
+            seat_index=1,
+            reason="ends_with_n",
+            surface="ごはん",
+            reading="ごはん",
+            remaining_lives=2,
+            eliminated=False,
+            occurred_at=now,
+        )
+        after_loss = replace(
+            active,
+            remaining_lives=(3, 2),
+            life_loss_events=(first_loss,),
+        )
+        names = {alice_id: "ありす", bob_id: "ボブ"}
+        self.assertEqual(
+            _seat_life_text(after_loss, 0, alice_id, names),
+            "あなた（ありす）｜ライフ 3/3｜現在の手番",
+        )
+        self.assertEqual(
+            _life_loss_event_text(
+                after_loss, first_loss, alice_id, names
+            ),
+            "ボブ｜ごはん｜「ん」で終わった｜残りライフ 2/3｜ライフ減少",
+        )
+        final_loss = LifeLossRecord(
+            seat_index=1,
+            reason="timeout",
+            surface=None,
+            reading=None,
+            remaining_lives=0,
+            eliminated=True,
+            occurred_at=now,
+        )
+        eliminated = replace(
+            active,
+            status=RoomStatus.FINISHED,
+            eliminated_seats=(1,),
+            remaining_lives=(3, 0),
+            life_loss_events=(final_loss,),
+            losing_seat=1,
+            end_reason="timeout",
+        )
+        self.assertEqual(
+            _seat_life_text(eliminated, 1, alice_id, names),
+            "ボブ｜ライフ 0/3｜脱落（時間切れ／使用単語なし）・観戦中",
+        )
+        explanation = _life_loss_event_text(
+            eliminated, final_loss, alice_id, names
+        )
+        self.assertIn("使用単語なし｜時間切れ", explanation)
+        self.assertNotIn("private-", explanation)
+
     def test_invite_url_is_absolute_and_same_origin(self) -> None:
         request = request_with_headers(
             ("host", "siritori.example"),
@@ -457,6 +544,7 @@ class GameUiHelperTests(unittest.TestCase):
             taken_over,
             current_turn=1,
             eliminated_seats=(0,),
+            remaining_lives=(0, 1, 1),
         )
         self.assertFalse(_can_surrender(eliminated, "alice"))
 
@@ -465,6 +553,7 @@ class GameUiHelperTests(unittest.TestCase):
             status=RoomStatus.FINISHED,
             current_turn=2,
             eliminated_seats=(0, 1),
+            remaining_lives=(0, 0, 1),
             losing_seat=0,
             end_reason="surrender",
         )
@@ -537,6 +626,7 @@ class GameResultUiHelperTests(unittest.TestCase):
             state_version=3,
             current_turn=0,
             eliminated_seats=(1,),
+            remaining_lives=(1, 0),
             history=(record,),
             losing_seat=1,
             end_reason="timeout",
@@ -612,6 +702,7 @@ class GameResultUiHelperTests(unittest.TestCase):
             state_version=3,
             current_turn=0,
             eliminated_seats=(1,),
+            remaining_lives=(1, 0),
             history=(accepted, losing),
             losing_seat=1,
             end_reason="ends_with_n",
@@ -688,6 +779,7 @@ class GameResultUiHelperTests(unittest.TestCase):
             state_version=1,
             current_turn=1,
             eliminated_seats=(0,),
+            remaining_lives=(0, 1),
             losing_seat=0,
             end_reason="ends_with_n",
             deadline_at=None,
@@ -738,10 +830,21 @@ class GameResultUiHelperTests(unittest.TestCase):
             history=(record,),
             expected_kana="か",
         )
+        elimination_event = LifeLossRecord(
+            seat_index=1,
+            reason="timeout",
+            surface=None,
+            reading=None,
+            remaining_lives=0,
+            eliminated=True,
+            occurred_at=now,
+        )
         eliminated = replace(
             accepted,
             state_version=2,
             eliminated_seats=(1,),
+            remaining_lives=(1, 0, 1),
+            life_loss_events=(elimination_event,),
             losing_seat=1,
             end_reason="timeout",
         )
@@ -751,6 +854,7 @@ class GameResultUiHelperTests(unittest.TestCase):
             state_version=3,
             current_turn=0,
             eliminated_seats=(1, 2),
+            remaining_lives=(1, 0, 0),
             losing_seat=2,
             end_reason="ends_with_n",
             expected_kana=None,
@@ -887,6 +991,7 @@ class GameResultUiHelperTests(unittest.TestCase):
             status=RoomStatus.FINISHED,
             current_turn=1,
             eliminated_seats=(0,),
+            remaining_lives=(0, 1),
             losing_seat=0,
             end_reason="surrender",
         )
@@ -965,6 +1070,12 @@ class GameResultUiHelperTests(unittest.TestCase):
             'ui.card().classes(\n            "confirm-dialog room-settings-dialog"',
             waiting_source,
         )
+        self.assertIn("settings_lives_select", waiting_source)
+        self.assertIn(
+            "displayed_room.lives_per_player",
+            waiting_source,
+        )
+        self.assertIn("lives_per_player=lives_per_player", waiting_source)
 
         self.assertIn('"dashboard-card game-turn-card"', play_source)
         self.assertIn(
@@ -981,6 +1092,12 @@ class GameResultUiHelperTests(unittest.TestCase):
         )
         self.assertIn("await refresh_seat_display_names(snapshot)", play_source)
         self.assertIn("_turn_seat_label(", play_source)
+        self.assertIn("player_status_box", play_source)
+        self.assertIn("life_event_label", play_source)
+        self.assertIn("_seat_life_text(", play_source)
+        self.assertIn("_life_loss_event_text(", play_source)
+        self.assertIn("result_life_loss_box", play_source)
+        self.assertIn("ライフ損失履歴", play_source)
         self.assertIn(".game-turn-card--mine", css)
         self.assertIn("border-color: #dc2626;", css)
         self.assertIn(".motion-reduced .game-turn-card", css)

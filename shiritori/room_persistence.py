@@ -34,6 +34,7 @@ from .models import (
 )
 from .rooms import (
     CommandReceipt,
+    LifeLossRecord,
     PlayerSeat,
     RepositoryResult,
     RepositoryStatus,
@@ -46,9 +47,8 @@ from .rooms import (
 )
 
 
-SNAPSHOT_SCHEMA_VERSION = 3
-_LEGACY_SNAPSHOT_SCHEMA_VERSION = 2
-_SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({2, 3})
+SNAPSHOT_SCHEMA_VERSION = 4
+_SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 _SQLITE_LOCKS_GUARD = Lock()
 _SQLITE_LOCKS: dict[str, RLock] = {}
 _SCHEMA_KEY = "room_repository_schema"
@@ -57,14 +57,26 @@ _SNAPSHOT_KEYS = {
     "room_id", "mode", "status", "players", "current_turn",
     "state_version", "theme_key", "bot_difficulty", "spectators",
     "eliminated_seats", "history", "expected_kana",
+    "lives_per_player", "remaining_lives", "life_loss_events",
     "turn_seconds", "deadline_at", "paused_remaining_seconds",
     "timed_out_seat", "losing_seat", "end_reason",
 }
-_LEGACY_SNAPSHOT_KEYS = _SNAPSHOT_KEYS - {"eliminated_seats"}
+_SCHEMA_V3_SNAPSHOT_KEYS = _SNAPSHOT_KEYS - {
+    "lives_per_player",
+    "remaining_lives",
+    "life_loss_events",
+}
+_SCHEMA_V2_SNAPSHOT_KEYS = _SCHEMA_V3_SNAPSHOT_KEYS - {
+    "eliminated_seats"
+}
 _PLAYER_KEYS = {"index", "owner_user_id", "controller", "handback_pending"}
 _TURN_KEYS = {
     "surface", "reading", "canonical_key", "seat_index", "actor_user_id",
     "by_bot", "submitted_at",
+}
+_LIFE_LOSS_KEYS = {
+    "seat_index", "reason", "surface", "reading", "remaining_lives",
+    "eliminated", "occurred_at",
 }
 
 
@@ -107,6 +119,20 @@ def serialize_room_snapshot(snapshot: RoomSnapshot) -> dict[str, Any]:
         "bot_difficulty": snapshot.bot_difficulty,
         "spectators": list(snapshot.spectators),
         "eliminated_seats": list(snapshot.eliminated_seats),
+        "lives_per_player": snapshot.lives_per_player,
+        "remaining_lives": list(snapshot.remaining_lives),
+        "life_loss_events": [
+            {
+                "seat_index": event.seat_index,
+                "reason": event.reason,
+                "surface": event.surface,
+                "reading": event.reading,
+                "remaining_lives": event.remaining_lives,
+                "eliminated": event.eliminated,
+                "occurred_at": _datetime_to_json(event.occurred_at),
+            }
+            for event in snapshot.life_loss_events
+        ],
         "history": [
             {
                 "surface": turn.surface,
@@ -147,11 +173,14 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
     if _boolean(root["deleted"], "deleted"):
         raise RoomSnapshotCorruptError("room snapshot is marked deleted")
     payload = _mapping(root["snapshot"], "snapshot")
-    if schema_version == _LEGACY_SNAPSHOT_SCHEMA_VERSION:
-        _exact_keys(payload, _LEGACY_SNAPSHOT_KEYS, "snapshot")
+    if schema_version == 2:
+        _exact_keys(payload, _SCHEMA_V2_SNAPSHOT_KEYS, "snapshot")
         eliminated_seats: tuple[int, ...] = ()
     else:
-        _exact_keys(payload, _SNAPSHOT_KEYS, "snapshot")
+        snapshot_keys = (
+            _SCHEMA_V3_SNAPSHOT_KEYS if schema_version == 3 else _SNAPSHOT_KEYS
+        )
+        _exact_keys(payload, snapshot_keys, "snapshot")
         eliminated_seats = tuple(
             _integer(value, f"eliminated_seats[{index}]")
             for index, value in enumerate(
@@ -175,6 +204,57 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
                 value["handback_pending"], f"players[{index}].handback_pending"
             ),
         ))
+
+    if schema_version == SNAPSHOT_SCHEMA_VERSION:
+        lives_per_player = _integer(
+            payload["lives_per_player"], "lives_per_player"
+        )
+        remaining_lives = tuple(
+            _integer(value, f"remaining_lives[{index}]")
+            for index, value in enumerate(
+                _array(payload["remaining_lives"], "remaining_lives")
+            )
+        )
+        life_loss_events = []
+        for index, raw in enumerate(
+            _array(payload["life_loss_events"], "life_loss_events")
+        ):
+            value = _mapping(raw, f"life_loss_events[{index}]")
+            _exact_keys(value, _LIFE_LOSS_KEYS, f"life_loss_events[{index}]")
+            try:
+                life_loss_events.append(LifeLossRecord(
+                    seat_index=_integer(
+                        value["seat_index"], f"life_loss_events[{index}].seat_index"
+                    ),
+                    reason=_string(value["reason"], f"life_loss_events[{index}].reason"),
+                    surface=_nullable_string(
+                        value["surface"], f"life_loss_events[{index}].surface"
+                    ),
+                    reading=_nullable_string(
+                        value["reading"], f"life_loss_events[{index}].reading"
+                    ),
+                    remaining_lives=_integer(
+                        value["remaining_lives"],
+                        f"life_loss_events[{index}].remaining_lives",
+                    ),
+                    eliminated=_boolean(
+                        value["eliminated"], f"life_loss_events[{index}].eliminated"
+                    ),
+                    occurred_at=_datetime_from_json(
+                        value["occurred_at"], f"life_loss_events[{index}].occurred_at"
+                    ),
+                ))
+            except (TypeError, ValueError) as error:
+                raise RoomSnapshotCorruptError(
+                    f"stored life-loss event violates domain rules: {error}"
+                ) from error
+    else:
+        lives_per_player = 1
+        remaining_lives = tuple(
+            0 if index in eliminated_seats else 1
+            for index in range(len(players))
+        )
+        life_loss_events = []
 
     history = []
     for index, raw in enumerate(_array(payload["history"], "history")):
@@ -215,6 +295,9 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
             ),
             spectators=spectators,
             eliminated_seats=eliminated_seats,
+            lives_per_player=lives_per_player,
+            remaining_lives=remaining_lives,
+            life_loss_events=tuple(life_loss_events),
             history=tuple(history),
             expected_kana=_nullable_string(payload["expected_kana"], "expected_kana"),
             turn_seconds=_nullable_integer(payload["turn_seconds"], "turn_seconds"),

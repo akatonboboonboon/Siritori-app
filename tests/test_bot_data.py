@@ -30,7 +30,8 @@ class BotDataTests(unittest.TestCase):
             for option in options
             if not option.ends_with_n
         }
-        self.assertEqual(len(start_kana), 68)
+        # ヴ始まりはブ始まりと同じ接続bucketへ統合される。
+        self.assertEqual(len(start_kana), 67)
         self.assertTrue(safe_final_kana <= start_kana)
 
     def test_every_row_still_matches_the_pinned_sudachi_dictionary(self) -> None:
