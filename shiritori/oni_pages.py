@@ -85,7 +85,7 @@ def register_oni_pages(
                 with ui.column().classes("dashboard-card w-full gap-3"):
                     ui.label("固定ルール").classes("aside-title")
                     ui.label(
-                        "Hard Bot 1体・ライフ3・1手10秒。"
+                        "Hard Bot 1体・ライフ3・1手30秒。"
                         "読みの音数制限と、直近10語の末尾封印は"
                         "すべての手番に適用されます。"
                     ).classes("platform-muted")
