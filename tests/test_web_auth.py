@@ -41,6 +41,8 @@ from shiritori.web_auth import (
     _room_closed_message,
     _deadline_presentation,
     _feedback_for_version,
+    _finished_feedback_text,
+    _history_actor_label,
     _history_scroll_script,
     _history_was_appended,
     _life_count_options,
@@ -447,6 +449,73 @@ class GameUiHelperTests(unittest.TestCase):
         )
         self.assertFalse(any("private-" in label for label in labels))
 
+    def test_history_actors_use_display_names_and_preserve_bot_origin(
+        self,
+    ) -> None:
+        now = datetime(2026, 7, 29, 1, 0, tzinfo=timezone.utc)
+        alice_id = "private-alice-id"
+        bob_id = "private-bob-id"
+        active = create_room_snapshot(
+            "history-labels",
+            (alice_id, bob_id),
+            mode=RoomMode.PVP,
+            now=now,
+            seat_picker=lambda _count: 0,
+        )
+        names = {alice_id: "ありす", bob_id: "ボブ"}
+        own_record = TurnRecord(
+            surface="りんご",
+            reading="りんご",
+            canonical_key="りんご",
+            seat_index=0,
+            actor_user_id=alice_id,
+            by_bot=False,
+            submitted_at=now,
+        )
+        other_record = TurnRecord(
+            surface="ごりら",
+            reading="ごりら",
+            canonical_key="ごりら",
+            seat_index=1,
+            actor_user_id=bob_id,
+            by_bot=False,
+            submitted_at=now,
+        )
+        proxy_record = replace(
+            other_record,
+            actor_user_id=None,
+            by_bot=True,
+        )
+        solo = create_room_snapshot(
+            "history-permanent-bot",
+            (alice_id,),
+            mode=RoomMode.SOLO_BOT,
+            permanent_bot_count=1,
+            now=now,
+            seat_picker=lambda _count: 1,
+        )
+        permanent_bot_record = replace(
+            other_record,
+            seat_index=1,
+            actor_user_id=None,
+            by_bot=True,
+        )
+
+        labels = (
+            _history_actor_label(active, own_record, alice_id, names),
+            _history_actor_label(active, other_record, alice_id, names),
+            _history_actor_label(active, proxy_record, alice_id, names),
+            _history_actor_label(
+                solo, permanent_bot_record, alice_id, names
+            ),
+        )
+
+        self.assertEqual(
+            labels,
+            ("あなた（ありす）", "ボブ", "ボブの代行Bot", "Bot 2"),
+        )
+        self.assertFalse(any("private-" in label for label in labels))
+
     def test_life_labels_and_loss_reasons_use_display_names(self) -> None:
         now = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
         alice_id = "private-alice-id"
@@ -644,15 +713,20 @@ class GameResultUiHelperTests(unittest.TestCase):
             end_reason="timeout",
             deadline_at=None,
         )
+        names = {
+            "secret-alice-id": "ありす",
+            "secret-bob-id": "ボブ",
+            "secret-watcher-id": "わかば",
+        }
 
         winner = _match_result_presentation(
-            finished, "secret-alice-id"
+            finished, "secret-alice-id", names
         )
         loser = _match_result_presentation(
-            finished, "secret-bob-id"
+            finished, "secret-bob-id", names
         )
         spectator = _match_result_presentation(
-            finished, "secret-watcher-id"
+            finished, "secret-watcher-id", names
         )
 
         self.assertEqual(
@@ -660,7 +734,7 @@ class GameResultUiHelperTests(unittest.TestCase):
             _MatchResultPresentation(
                 title="勝利！",
                 tone="victory",
-                outcome="あなたが最後まで勝ち残りました。",
+                outcome="あなた（ありす）が最後まで勝ち残りました。",
                 accepted_word_count=1,
                 end_reason="時間切れ",
                 round_summary="2人で開始・1人脱落",
@@ -669,17 +743,67 @@ class GameResultUiHelperTests(unittest.TestCase):
         )
         self.assertEqual(loser.title, "今回は敗北")
         self.assertEqual(loser.tone, "defeat")
-        self.assertEqual(loser.outcome, "プレイヤー1の勝ちです。")
+        self.assertEqual(loser.outcome, "ありすの勝ちです。")
         self.assertEqual(spectator.title, "対局終了")
         self.assertEqual(spectator.tone, "neutral")
         self.assertEqual(
             spectator.outcome,
-            "プレイヤー1の勝ちです。",
+            "ありすの勝ちです。",
         )
         combined = f"{winner!r}{loser!r}{spectator!r}"
         self.assertNotIn("secret-alice-id", combined)
         self.assertNotIn("secret-bob-id", combined)
         self.assertNotIn("secret-watcher-id", combined)
+        self.assertNotRegex(combined, r"プレイヤー[1-9]\d*")
+
+    def test_finished_feedback_names_winner_and_surrendering_player(
+        self,
+    ) -> None:
+        active = create_room_snapshot(
+            "finished-feedback",
+            ("private-alice-id", "private-bob-id"),
+            mode=RoomMode.PVP,
+            spectators=("private-watcher-id",),
+            seat_picker=lambda _count: 0,
+        )
+        finished = replace(
+            active,
+            status=RoomStatus.FINISHED,
+            current_turn=0,
+            eliminated_seats=(1,),
+            remaining_lives=(1, 0),
+            losing_seat=1,
+            end_reason="surrender",
+            deadline_at=None,
+        )
+        names = {
+            "private-alice-id": "ありす",
+            "private-bob-id": "ボブ",
+            "private-watcher-id": "わかば",
+        }
+
+        messages = (
+            _finished_feedback_text(
+                finished, "private-watcher-id", names
+            ),
+            _finished_feedback_text(
+                finished, "private-bob-id", names
+            ),
+            _finished_feedback_text(
+                finished, "private-alice-id", names
+            ),
+        )
+
+        self.assertEqual(
+            messages,
+            (
+                "ボブが降参しました。ありすの勝ちです。",
+                "あなた（ボブ）は降参しました。ありすの勝ちです。",
+                "ボブが降参しました。あなた（ありす）の勝ちです！",
+            ),
+        )
+        self.assertNotRegex("".join(messages), r"プレイヤー[1-9]\d*")
+        self.assertFalse(any("private-" in message for message in messages))
 
     def test_result_count_excludes_losing_word_ending_with_n(self) -> None:
         now = datetime(2026, 7, 26, 1, 0, tzinfo=timezone.utc)
@@ -1007,27 +1131,42 @@ class GameResultUiHelperTests(unittest.TestCase):
             losing_seat=0,
             end_reason="surrender",
         )
+        names = {
+            "private-alice-id": "ありす",
+            "private-bob-id": "ボブ",
+            "private-watcher-id": "わかば",
+        }
 
         labels = (
             _reaction_sender_label(
-                active, player_reaction, "private-alice-id"
+                active, player_reaction, "private-alice-id", names
             ),
             _reaction_sender_label(
-                active, player_reaction, "private-bob-id"
+                active, player_reaction, "private-bob-id", names
             ),
             _reaction_sender_label(
-                active, watcher_reaction, "private-bob-id"
+                active, watcher_reaction, "private-bob-id", names
             ),
             _reaction_sender_label(
-                finished, eliminated_reaction, "private-bob-id"
+                finished, eliminated_reaction, "private-bob-id", names
+            ),
+            _reaction_sender_label(
+                active, watcher_reaction, "private-bob-id", {}
             ),
         )
 
         self.assertEqual(
             labels,
-            ("あなた", "プレイヤー1", "観戦者", "プレイヤー1（観戦中）"),
+            (
+                "あなた（ありす）",
+                "ありす",
+                "わかば（観戦中）",
+                "ありす（観戦中）",
+                "観戦者",
+            ),
         )
         self.assertFalse(any("private-" in label for label in labels))
+        self.assertNotRegex("".join(labels[:4]), r"プレイヤー[1-9]\d*")
 
     def test_sound_cues_are_generated_and_fail_closed(self) -> None:
         script = _sound_cue_script("accepted")
@@ -1088,6 +1227,10 @@ class GameResultUiHelperTests(unittest.TestCase):
             waiting_source,
         )
         self.assertIn("lives_per_player=lives_per_player", waiting_source)
+        self.assertIn(
+            "await refresh_waiting_display_names(room)", waiting_source
+        )
+        self.assertIn("waiting_display_names", waiting_source)
 
         self.assertIn('"dashboard-card game-turn-card"', play_source)
         self.assertIn(
@@ -1108,6 +1251,16 @@ class GameResultUiHelperTests(unittest.TestCase):
         self.assertIn("life_event_label", play_source)
         self.assertIn("_seat_life_text(", play_source)
         self.assertIn("_life_loss_event_text(", play_source)
+        self.assertIn("_history_actor_label(", play_source)
+        self.assertIn("_finished_feedback_text(", play_source)
+        self.assertIn("_reaction_sender_label(", play_source)
+        self.assertIn(
+            "(event.reaction.sender_user_id,)", play_source
+        )
+        self.assertNotIn(
+            'actor = f"プレイヤー', play_source
+        )
+        self.assertNotIn('else f"プレイヤー', play_source)
         self.assertIn("result_life_loss_box", play_source)
         self.assertIn("ライフ損失履歴", play_source)
         self.assertIn(".game-turn-card--mine", css)
@@ -1293,7 +1446,9 @@ class GameResultUiHelperTests(unittest.TestCase):
             source.index("async def release_reaction_buttons(")
         ]
 
-        self.assertIn("aria-label='{sender}が", reaction_source)
+        self.assertIn(
+            "aria-label='{escape(sender, quote=True)}が", reaction_source
+        )
         self.assertNotIn("role='status'", reaction_source)
 
 
