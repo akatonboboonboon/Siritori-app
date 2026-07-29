@@ -426,6 +426,116 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
             all(result.receipt.snapshot == next_snapshot for result in results)
         )
 
+    async def test_inactive_pvp_listing_requires_both_room_and_game_cutoffs(
+        self,
+    ) -> None:
+        await self.repository.initialize(self.initial)
+        cutoff = NOW
+        old = cutoff - timedelta(seconds=1)
+        fresh = cutoff + timedelta(seconds=1)
+
+        with self.database.transaction() as session:
+            session.get(Room, self.lobby_id).updated_at = old
+            session.get(Game, self.game_id).updated_at = old
+        self.assertEqual(
+            await self.repository.list_inactive_pvp_rooms(cutoff),
+            ((self.game_id, self.initial.state_version),),
+        )
+
+        # A move updates Game.updated_at even though the lobby Room timestamp
+        # remains old, so the active match must be retained.
+        with self.database.transaction() as session:
+            session.get(Game, self.game_id).updated_at = fresh
+        self.assertEqual(
+            await self.repository.list_inactive_pvp_rooms(cutoff),
+            (),
+        )
+
+        with self.database.transaction() as session:
+            session.get(Game, self.game_id).updated_at = old
+            session.get(Room, self.lobby_id).updated_at = fresh
+        self.assertEqual(
+            await self.repository.list_inactive_pvp_rooms(cutoff),
+            (),
+        )
+
+        # The cutoff is inclusive for both authoritative timestamps.
+        with self.database.transaction() as session:
+            session.get(Game, self.game_id).updated_at = cutoff
+            session.get(Room, self.lobby_id).updated_at = cutoff
+        self.assertEqual(
+            await self.repository.list_inactive_pvp_rooms(cutoff),
+            ((self.game_id, self.initial.state_version),),
+        )
+
+    async def test_inactive_pvp_listing_excludes_noncurrent_and_unmarked_games(
+        self,
+    ) -> None:
+        await self.repository.initialize(self.initial)
+        games = GameRepository(self.database)
+        historical = games.create_game(
+            created_by_user_id=self.owner.id,
+            mode=GameMode.MULTIPLAYER.value,
+            room_id=self.lobby_id,
+        )
+        historical_snapshot = replace(self.initial, room_id=historical.id)
+        await self.repository.initialize(historical_snapshot)
+
+        unmarked_lobby = games.create_room(
+            owner_user_id=self.owner.id,
+            room_code="UNMK42",
+            name="Unmarked active room",
+        )
+        unmarked_game = games.create_game(
+            created_by_user_id=self.owner.id,
+            mode=GameMode.MULTIPLAYER.value,
+            room_id=unmarked_lobby.id,
+            state={"legacy": True},
+        )
+        cutoff = NOW
+        old = cutoff - timedelta(seconds=1)
+        fresh = cutoff + timedelta(seconds=1)
+        with self.database.transaction() as session:
+            # Keep the valid current game fresh so only invalid candidates are
+            # under consideration in this assertion.
+            session.get(Room, self.lobby_id).updated_at = fresh
+            session.get(Game, self.game_id).updated_at = fresh
+            session.get(Game, historical.id).updated_at = old
+            room = session.get(Room, unmarked_lobby.id)
+            room.status = "active"
+            room.current_game_id = unmarked_game.id
+            room.updated_at = old
+            session.get(Game, unmarked_game.id).updated_at = old
+
+        self.assertEqual(
+            await self.repository.list_inactive_pvp_rooms(cutoff),
+            (),
+        )
+
+    async def test_inactive_pvp_listing_skips_corrupt_marked_state(self) -> None:
+        await self.repository.initialize(self.initial)
+        cutoff = NOW
+        with self.database.transaction() as session:
+            session.get(Room, self.lobby_id).updated_at = cutoff
+            game = session.get(Game, self.game_id)
+            game.updated_at = cutoff
+            game.state_json = {
+                "room_repository_schema": SNAPSHOT_SCHEMA_VERSION,
+                "deleted": False,
+                "snapshot": {},
+            }
+
+        self.assertEqual(
+            await self.repository.list_inactive_pvp_rooms(cutoff),
+            (),
+        )
+
+    async def test_inactive_pvp_listing_validates_arguments(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.repository.list_inactive_pvp_rooms(NOW.replace(tzinfo=None))
+        with self.assertRaises(ValueError):
+            await self.repository.list_inactive_pvp_rooms(NOW, limit=0)
+
     async def test_list_active_room_ids_is_sorted_and_validates_state(self) -> None:
         await self.repository.initialize(self.initial)
         games = GameRepository(self.database)

@@ -868,6 +868,17 @@ def _can_surrender(snapshot: RoomSnapshot, user_id: str) -> bool:
     )
 
 
+def _room_closed_message(reason: str | None) -> str:
+    """Explain why an active room closed without exposing private state."""
+
+    if reason == "inactive":
+        return (
+            "30分間動きがなかったため、部屋を自動削除しました。"
+            "ロビーへ戻ります。"
+        )
+    return "部屋が終了しました。ロビーへ戻ります。"
+
+
 def _post_match_lobby_destination(
     lobby: LobbyService,
     user_id: str,
@@ -3549,7 +3560,8 @@ def register_auth_pages(
             except (LobbyError, ValueError):
                 poll_timer.deactivate()
                 message_label.set_text(
-                    "部屋が終了しました。ロビーへ戻ってください。"
+                    "部屋が終了したか、30分間動きがなかったため削除されました。"
+                    "ロビーへ戻ってください。"
                 )
             except Exception:
                 LOGGER.exception("failed to refresh waiting room")
@@ -3943,6 +3955,7 @@ def register_auth_pages(
         post_match_task: asyncio.Task[None] | None = None
         post_match_auto_return_cancelled = False
         polling = False
+        room_closed = False
         session_invalidated = False
 
         async def refresh_seat_display_names(
@@ -4050,6 +4063,7 @@ def register_auth_pages(
         def sync_reaction_buttons() -> None:
             allowed = (
                 not session_invalidated
+                and not room_closed
                 and not reaction_sending
                 and current_snapshot is not None
                 and current_snapshot.role_for_user(user_id) is not None
@@ -4122,6 +4136,7 @@ def register_auth_pages(
                 or emoji not in SUPPORTED_REACTIONS
                 or snapshot is None
                 or snapshot.role_for_user(user_id) is None
+                or room_closed
                 or session_invalidated
             ):
                 return
@@ -4166,6 +4181,7 @@ def register_auth_pages(
             seat = snapshot.seat_for_user(user_id)
             return (
                 not session_invalidated
+                and not room_closed
                 and snapshot.status is RoomStatus.ACTIVE
                 and seat is not None
                 and snapshot.current_turn == seat.index
@@ -4191,7 +4207,7 @@ def register_auth_pages(
 
         def render(snapshot: RoomSnapshot) -> None:
             nonlocal current_snapshot, rendered_history, transient_feedback
-            if session_invalidated:
+            if session_invalidated or room_closed:
                 return
             if (
                 current_snapshot is not None
@@ -4399,6 +4415,7 @@ def register_auth_pages(
 
             surrender_allowed = (
                 not session_invalidated
+                and not room_closed
                 and _can_surrender(snapshot, user_id)
             )
             surrender_button.set_visibility(surrender_allowed)
@@ -4608,10 +4625,52 @@ def register_auth_pages(
                 delayed_return_to_waiting_room()
             )
 
+        async def delayed_room_closed_redirect() -> None:
+            await asyncio.sleep(2.0)
+            if client.is_deleted or session_invalidated:
+                return
+            with client:
+                ui.navigate.to("/lobby")
+
+        def handle_closed_room(reason: str | None) -> None:
+            nonlocal pending_submission, post_match_task, room_closed
+            if room_closed or client.is_deleted:
+                return
+            room_closed = True
+            pending_submission = None
+            scheduled = post_match_task
+            post_match_task = None
+            if scheduled is not None and not scheduled.done():
+                scheduled.cancel()
+            poll_timer.deactivate()
+            reading_dialog.close()
+            surrender_dialog.close()
+            word_input.disable()
+            submit_button.disable()
+            surrender_button.disable()
+            surrender_button.set_visibility(False)
+            turn_card.classes(remove="game-turn-card--mine")
+            status_label.set_text("部屋終了")
+            turn_label.set_text("この部屋での対局は終了しました")
+            feedback_label.set_text(_room_closed_message(reason))
+            reaction_feedback_label.set_text(
+                "部屋が終了したため、リアクションは送れません。"
+            )
+            post_match_panel.set_visibility(False)
+            for button in reaction_buttons:
+                button.disable()
+            task = asyncio.create_task(delayed_room_closed_redirect())
+            animation_tasks.add(task)
+            task.add_done_callback(animation_tasks.discard)
+
         async def on_room_event(event: RoomEvent) -> None:
-            if session_invalidated or client.is_deleted:
+            if session_invalidated or room_closed or client.is_deleted:
                 return
             try:
+                if event.kind is RoomEventKind.CLOSED:
+                    with client:
+                        handle_closed_room(event.reason)
+                    return
                 if event.kind is RoomEventKind.REACTION:
                     if event.reaction is not None:
                         with client:
@@ -4706,7 +4765,12 @@ def register_auth_pages(
             """Keep clients in sync even across multiple server workers."""
 
             nonlocal polling
-            if polling or client.is_deleted or session_invalidated:
+            if (
+                polling
+                or client.is_deleted
+                or session_invalidated
+                or room_closed
+            ):
                 return
             polling = True
             try:
@@ -4728,11 +4792,7 @@ def register_auth_pages(
                 ):
                     schedule_return_to_waiting_room()
             except RoomError:
-                feedback_label.set_text(
-                    "対局が終了しました。"
-                )
-                word_input.disable()
-                submit_button.disable()
+                handle_closed_room(None)
             except Exception:
                 LOGGER.exception(
                     "failed to refresh game snapshot"
@@ -4879,6 +4939,7 @@ def register_auth_pages(
             snapshot = current_snapshot
             if (
                 snapshot is None
+                or room_closed
                 or surrendering
                 or not _can_surrender(snapshot, user_id)
             ):
@@ -4890,6 +4951,7 @@ def register_auth_pages(
             snapshot = current_snapshot
             if (
                 snapshot is None
+                or room_closed
                 or surrendering
                 or not _can_surrender(snapshot, user_id)
             ):

@@ -49,9 +49,13 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_is_idempotent_without_active_rooms(self) -> None:
         await self.services.start()
+        cleanup_task = self.services.room_cleanup._task
         await self.services.start()
 
         self.assertEqual(self.services.runtime.active_room_ids, frozenset())
+        self.assertTrue(self.services.room_cleanup.running)
+        self.assertIsNotNone(cleanup_task)
+        self.assertIs(self.services.room_cleanup._task, cleanup_task)
 
     async def test_word_suggestions_share_application_database(self) -> None:
         self.assertIs(

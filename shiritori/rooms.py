@@ -1074,6 +1074,92 @@ class RoomCoordinator:
             raise RoomNotFound(f"room {room_id!r} does not exist")
         return snapshot
 
+    async def expire_inactive_pvp_room(
+        self,
+        room_id: str,
+        expected_version: int,
+    ) -> CommandOutcome | None:
+        """Delete one still-inactive PvP room without racing newer activity.
+
+        The cleanup query supplies the state version it observed alongside the
+        room ID. A turn, timeout, reconnect transition, or another cleanup
+        which wins before this method simply makes that observation stale; in
+        that case ``None`` is returned and the newer state is left untouched.
+
+        The operation identity and fingerprint deliberately depend only on
+        ``room_id`` and ``expected_version``. Two Render workers therefore
+        replay the same durable delete receipt instead of disagreeing because
+        their sweep clocks differ.
+        """
+
+        if not isinstance(room_id, str) or not room_id or len(room_id) > 36:
+            raise ValueError("room_id must contain 1-36 characters")
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("expected_version must be a non-negative integer")
+
+        operation_digest = sha256(
+            f"{room_id}\0{expected_version}".encode("utf-8")
+        ).hexdigest()[:32]
+        operation_id = f"system:inactive:{operation_digest}"
+        _validate_internal_operation_id(operation_id, "system:")
+        fingerprint = _command_fingerprint(
+            action="expire_inactive_pvp_room",
+            room_id=room_id,
+            expected_version=expected_version,
+            actor={"kind": "system"},
+            inputs={},
+        )
+
+        async with self._lock_for(room_id):
+            duplicate = await self._duplicate_outcome(
+                room_id,
+                operation_id,
+                fingerprint,
+                expected_version,
+                allowed_command_kinds=("delete",),
+            )
+            if duplicate is not None:
+                outcome = duplicate
+            else:
+                snapshot = await self.repository.load(room_id)
+                if (
+                    snapshot is None
+                    or snapshot.state_version != expected_version
+                    or snapshot.mode is not RoomMode.PVP
+                ):
+                    return None
+                result = await self.repository.delete_if_version(
+                    room_id,
+                    expected_version,
+                    operation_id,
+                    command_fingerprint=fingerprint,
+                )
+                if result.status in (
+                    RepositoryStatus.NOT_FOUND,
+                    RepositoryStatus.VERSION_CONFLICT,
+                ):
+                    return None
+                outcome = self._outcome_from_repository(
+                    result,
+                    operation_id,
+                    room_id=room_id,
+                    command_kind="delete",
+                    fingerprint=fingerprint,
+                    expected_version=expected_version,
+                )
+            if not outcome.deleted:
+                raise RuntimeError(
+                    "inactive PvP cleanup returned a non-delete receipt"
+                )
+            self._cancel_room_disconnects(room_id)
+
+        await self._publish_outcome(
+            room_id,
+            outcome,
+            closed_reason="inactive",
+        )
+        return outcome
+
     async def send_reaction(
         self,
         room_id: str,
@@ -2287,14 +2373,18 @@ class RoomCoordinator:
                 task.cancel()
 
     async def _publish_outcome(
-        self, room_id: str, outcome: CommandOutcome
+        self,
+        room_id: str,
+        outcome: CommandOutcome,
+        *,
+        closed_reason: str = "empty",
     ) -> None:
         if outcome.deleted:
             event = RoomEvent(
                 RoomEventKind.CLOSED,
                 room_id,
                 None,
-                reason="empty",
+                reason=closed_reason,
             )
         elif outcome.snapshot is not None:
             event = RoomEvent(

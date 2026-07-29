@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from dataclasses import replace
+from datetime import datetime, timezone
 from threading import Lock, RLock
 from typing import Any
 
@@ -80,6 +81,68 @@ class SQLAlchemyLobbyRepository:
             key = str(database.engine.url)
             with _SQLITE_LOCKS_GUARD:
                 self._sqlite_lock = _SQLITE_LOCKS.setdefault(key, RLock())
+
+    def expire_inactive_waiting_rooms(
+        self,
+        inactive_before: datetime,
+        now: datetime | None = None,
+        limit: int = 100,
+    ) -> tuple[str, ...]:
+        """Soft-delete waiting rooms with no persisted activity by ``cutoff``."""
+
+        cutoff = _aware_utc(inactive_before, "inactive_before")
+        expired_at = _aware_utc(
+            utc_now() if now is None else now,
+            "now",
+        )
+        if cutoff > expired_at:
+            raise ValueError("inactive_before must not be later than now")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+
+        with self._guard(), self.database.transaction() as session:
+            rooms = tuple(
+                session.scalars(
+                    select(Room)
+                    .where(
+                        Room.status == StoredRoomStatus.WAITING.value,
+                        Room.current_game_id.is_(None),
+                        Room.deleted_at.is_(None),
+                        Room.updated_at <= cutoff,
+                    )
+                    .order_by(Room.updated_at.asc(), Room.id.asc())
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            expired_ids: list[str] = []
+            for room in rooms:
+                # Keep the predicate explicit after the lock. This protects the
+                # cleanup contract if a backend had to wait for another writer.
+                if (
+                    room.status != StoredRoomStatus.WAITING.value
+                    or room.current_game_id is not None
+                    or room.deleted_at is not None
+                    or _stored_utc(room.updated_at) > cutoff
+                ):
+                    continue
+                memberships = _active_memberships(session, room.id, lock=True)
+                for membership in memberships:
+                    membership.seat_index = None
+                    membership.ready = False
+                    membership.presence = PresenceState.OFFLINE.value
+                    membership.connected_count = 0
+                    membership.is_bot_substituting = False
+                    membership.presence_expires_at = None
+                    membership.last_seen_at = expired_at
+                    membership.left_at = expired_at
+                room.status = StoredRoomStatus.CLOSED.value
+                room.revision += 1
+                room.updated_at = expired_at
+                room.deleted_at = expired_at
+                expired_ids.append(room.id)
+            session.flush()
+            return tuple(expired_ids)
 
     def create_waiting_room(
         self,
@@ -1028,6 +1091,20 @@ class _NullLock:
 
     def __exit__(self, *_: object) -> None:
         return None
+
+
+def _aware_utc(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _stored_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _waiting_room(session: Session, room_id: str) -> Room:
