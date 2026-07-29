@@ -192,22 +192,38 @@ _YOUR_TURN_SOUND_PEAK = _DEFAULT_SOUND_PEAK * 1.5
 
 
 
-def _public_seat_label(
+def _account_display_label(
+    account_user_id: str,
+    user_id: str,
+    display_names: Mapping[str, str],
+    *,
+    fallback: str,
+) -> str:
+    """Return an account's public label without exposing its identifier."""
+
+    display_name = display_names.get(account_user_id)
+    if account_user_id == user_id:
+        return f"あなた（{display_name}）" if display_name else "あなた"
+    return display_name or fallback
+
+
+def _seat_owner_label(
     snapshot: RoomSnapshot,
     seat_index: int,
     user_id: str,
+    display_names: Mapping[str, str],
 ) -> str:
-    """Describe a seat without returning an account identifier."""
+    """Return the public owner label independently of the current controller."""
 
     seat = snapshot.players[seat_index]
-    if seat.owner_user_id == user_id:
-        return "あなた"
-    if (
-        seat.owner_user_id is None
-        and seat.controller is SeatController.BOT
-    ):
-        return f"Bot {seat_index + 1}"
-    return f"プレイヤー{seat_index + 1}"
+    if seat.owner_user_id is None:
+        return f"Bot {seat.index + 1}"
+    return _account_display_label(
+        seat.owner_user_id,
+        user_id,
+        display_names,
+        fallback=f"プレイヤー{seat.index + 1}",
+    )
 
 
 def _turn_seat_label(
@@ -234,24 +250,39 @@ def _seat_display_label(
     """Return one public seat label for turn, life, and result displays."""
 
     seat = snapshot.players[seat_index]
-    owner_id = seat.owner_user_id
-    display_name = (
-        display_names.get(owner_id)
-        if owner_id is not None
-        else None
+    owner_label = _seat_owner_label(
+        snapshot,
+        seat_index,
+        user_id,
+        display_names,
     )
     if seat.controller is SeatController.BOT:
-        if owner_id == user_id:
-            own_label = (
-                f"あなた（{display_name}）" if display_name else "あなた"
-            )
-            return f"{own_label}の代行Bot"
-        if display_name:
-            return f"{display_name}の代行Bot"
-        return f"Bot {seat.index + 1}"
-    if owner_id == user_id:
-        return f"あなた（{display_name}）" if display_name else "あなた"
-    return display_name or f"プレイヤー{seat.index + 1}"
+        if seat.owner_user_id is None:
+            return owner_label
+        return f"{owner_label}の代行Bot"
+    return owner_label
+
+
+def _history_actor_label(
+    snapshot: RoomSnapshot,
+    record: TurnRecord,
+    user_id: str,
+    display_names: Mapping[str, str],
+) -> str:
+    """Return the historical actor, preserving whether a Bot played the word."""
+
+    owner_label = _seat_owner_label(
+        snapshot,
+        record.seat_index,
+        user_id,
+        display_names,
+    )
+    if not record.by_bot:
+        return owner_label
+    seat = snapshot.players[record.seat_index]
+    if seat.owner_user_id is None:
+        return owner_label
+    return f"{owner_label}の代行Bot"
 
 
 def _seat_life_text(
@@ -342,17 +373,67 @@ def _reaction_sender_label(
     snapshot: RoomSnapshot,
     reaction: RoomReaction,
     user_id: str,
+    display_names: Mapping[str, str],
 ) -> str:
     """Return a public reaction sender label without leaking account IDs."""
 
-    if reaction.sender_user_id == user_id:
-        return "あなた"
     seat = snapshot.seat_for_user(reaction.sender_user_id)
     if seat is None:
-        return "観戦者"
+        label = _account_display_label(
+            reaction.sender_user_id,
+            user_id,
+            display_names,
+            fallback="観戦者",
+        )
+        return label if label == "観戦者" else f"{label}（観戦中）"
+    label = _seat_owner_label(
+        snapshot,
+        seat.index,
+        user_id,
+        display_names,
+    )
     if reaction.sender_role is Role.SPECTATOR:
-        return f"プレイヤー{seat.index + 1}（観戦中）"
-    return f"プレイヤー{seat.index + 1}"
+        return f"{label}（観戦中）"
+    return label
+
+
+def _finished_feedback_text(
+    snapshot: RoomSnapshot,
+    user_id: str,
+    display_names: Mapping[str, str],
+) -> str:
+    """Build the completed-match status using public display names."""
+
+    if snapshot.status is not RoomStatus.FINISHED:
+        raise ValueError("finished feedback requires a finished snapshot")
+    reasons = {
+        "ends_with_n": "「ん」で終わったため終了しました。",
+        "duplicate": "同じ読みを使ったため終了しました。",
+        "timeout": "時間切れで終了しました。",
+        "no_legal_move": "出せる単語がなく終了しました。",
+        "surrender": "降参により終了しました。",
+    }
+    winner_indexes = snapshot.active_seat_indexes
+    if len(winner_indexes) != 1:
+        return reasons.get(snapshot.end_reason, "対局が終了しました。")
+
+    winner_index = winner_indexes[0]
+    winner = _seat_owner_label(
+        snapshot, winner_index, user_id, display_names
+    )
+    own_seat = snapshot.seat_for_user(user_id)
+    own_won = own_seat is not None and own_seat.index == winner_index
+    winner_text = f"{winner}の勝ちです{'！' if own_won else '。'}"
+    if snapshot.end_reason != "surrender" or snapshot.losing_seat is None:
+        return winner_text
+
+    loser = _seat_owner_label(
+        snapshot, snapshot.losing_seat, user_id, display_names
+    )
+    own_lost = (
+        own_seat is not None and own_seat.index == snapshot.losing_seat
+    )
+    return f"{loser}{'は' if own_lost else 'が'}降参しました。{winner_text}"
 
 def _match_result_presentation(
     snapshot: RoomSnapshot,
@@ -365,14 +446,17 @@ def _match_result_presentation(
         raise ValueError("a match result requires a finished snapshot")
 
     own_seat = snapshot.seat_for_user(user_id)
+    public_names = display_names or {}
     winner_indexes = snapshot.active_seat_indexes
     if len(winner_indexes) == 1:
         winner_index = winner_indexes[0]
-        winner = _public_seat_label(snapshot, winner_index, user_id)
+        winner = _seat_owner_label(
+            snapshot, winner_index, user_id, public_names
+        )
         if own_seat is not None and own_seat.index == winner_index:
             title = "勝利！"
             tone = "victory"
-            outcome = "あなたが最後まで勝ち残りました。"
+            outcome = f"{winner}が最後まで勝ち残りました。"
         elif own_seat is not None:
             title = "今回は敗北"
             tone = "defeat"
@@ -401,7 +485,6 @@ def _match_result_presentation(
         if snapshot.history
         else "なし"
     )
-    public_names = display_names or {}
     return _MatchResultPresentation(
         title=title,
         tone=tone,
@@ -3418,9 +3501,38 @@ def register_auth_pages(
         refreshing = False
         settings_saving = False
         settings_edit_revision = initial_room.revision
+        waiting_display_names = {
+            user_id: principal.account.display_name
+        }
+        resolved_waiting_display_name_ids = {user_id}
 
-        def render_room(room) -> None:
+        async def refresh_waiting_display_names(
+            room: LobbyRoomSnapshot,
+        ) -> None:
+            member_user_ids = tuple(
+                dict.fromkeys(member.user_id for member in room.players)
+            )
+            unresolved = tuple(
+                member_user_id
+                for member_user_id in member_user_ids
+                if member_user_id not in resolved_waiting_display_name_ids
+            )
+            if not unresolved:
+                return
+            try:
+                resolved = await asyncio.to_thread(
+                    auth.display_names_for_user_ids,
+                    unresolved,
+                )
+            except Exception:
+                LOGGER.exception("failed to resolve waiting-room display names")
+                return
+            waiting_display_names.update(resolved)
+            resolved_waiting_display_name_ids.update(unresolved)
+
+        async def render_room(room: LobbyRoomSnapshot) -> None:
             nonlocal current_room
+            await refresh_waiting_display_names(room)
             current_room = room
             room_name_label.set_text(room.name)
             room_code_label.set_text(
@@ -3449,10 +3561,11 @@ def register_auth_pages(
             with members_box:
                 ui.label("対戦参加者").classes("aside-title")
                 for index, member in enumerate(room.players, start=1):
-                    name = (
-                        "あなた"
-                        if member.user_id == user_id
-                        else f"参加者 {index}"
+                    name = _account_display_label(
+                        member.user_id,
+                        user_id,
+                        waiting_display_names,
+                        fallback=f"参加者 {index}",
                     )
                     ready = "準備OK" if member.ready else "準備中"
                     with ui.row().classes(
@@ -3556,7 +3669,7 @@ def register_auth_pages(
                     poll_timer.deactivate()
                     ui.navigate.to("/lobby")
                     return
-                render_room(room)
+                await render_room(room)
             except (LobbyError, ValueError):
                 poll_timer.deactivate()
                 message_label.set_text(
@@ -3592,7 +3705,7 @@ def register_auth_pages(
             except LobbyRevisionConflict as error:
                 latest = error.current_room
                 if latest is not None:
-                    render_room(latest)
+                    await render_room(latest)
                 else:
                     await refresh_room()
                 message_label.set_text(
@@ -3604,7 +3717,7 @@ def register_auth_pages(
                     "準備状態を変更できませんでした。"
                 )
             else:
-                render_room(room)
+                await render_room(room)
 
         async def start_match() -> None:
             if not await waiting_session_is_valid():
@@ -3726,7 +3839,7 @@ def register_auth_pages(
             except LobbyRevisionConflict as error:
                 latest = error.current_room
                 if latest is not None:
-                    render_room(latest)
+                    await render_room(latest)
                     populate_settings_editor(latest)
                 else:
                     await refresh_room()
@@ -3756,7 +3869,7 @@ def register_auth_pages(
                     "設定を保存できませんでした。少し待ってお試しください。"
                 )
             else:
-                render_room(room)
+                await render_room(room)
                 settings_dialog.close()
                 message_label.set_text(
                     "設定を保存しました。対戦条件が変わったため、"
@@ -3909,7 +4022,7 @@ def register_auth_pages(
                     icon="save",
                     on_click=save_room_settings,
                 ).props("unelevated no-caps")
-        render_room(initial_room)
+        await render_room(initial_room)
         poll_timer = ui.timer(1.5, refresh_room)
 
     @ui.page("/play/{game_id}")
@@ -3940,7 +4053,7 @@ def register_auth_pages(
             reduced_motion = False
         current_snapshot: RoomSnapshot | None = None
         seat_display_names = {user_id: principal.account.display_name}
-        display_name_user_ids: tuple[str, ...] = ()
+        resolved_display_name_user_ids = {user_id}
         pending_submission: tuple[str, int, str] | None = None
         transient_feedback: _VersionedFeedback | None = None
         rendered_history: tuple[object, ...] | None = None
@@ -3958,30 +4071,39 @@ def register_auth_pages(
         room_closed = False
         session_invalidated = False
 
+        async def refresh_display_names(
+            account_user_ids: Sequence[str],
+        ) -> None:
+            unresolved = tuple(
+                account_user_id
+                for account_user_id in dict.fromkeys(account_user_ids)
+                if account_user_id not in resolved_display_name_user_ids
+            )
+            if not unresolved:
+                return
+            try:
+                resolved = await asyncio.to_thread(
+                    auth.display_names_for_user_ids,
+                    unresolved,
+                )
+            except Exception:
+                LOGGER.exception("failed to resolve room display names")
+                return
+            seat_display_names.update(resolved)
+            resolved_display_name_user_ids.update(unresolved)
+
         async def refresh_seat_display_names(
             snapshot: RoomSnapshot,
         ) -> None:
-            nonlocal seat_display_names, display_name_user_ids
-            player_user_ids = tuple(
-                dict.fromkeys(
+            await refresh_display_names(
+                tuple(
                     seat.owner_user_id
                     for seat in snapshot.players
                     if seat.owner_user_id is not None
                 )
             )
-            if player_user_ids == display_name_user_ids:
-                return
-            try:
-                resolved = await asyncio.to_thread(
-                    auth.display_names_for_user_ids,
-                    player_user_ids,
-                )
-            except Exception:
-                LOGGER.exception("failed to resolve room display names")
-                resolved = {}
-            resolved[user_id] = principal.account.display_name
-            seat_display_names = resolved
-            display_name_user_ids = player_user_ids
+
+
         def persist_game_preferences() -> None:
 
             if preference_storage is None:
@@ -4082,6 +4204,7 @@ def register_auth_pages(
                 snapshot,
                 reaction,
                 user_id,
+                seat_display_names,
             )
             token = uuid4().hex
             with reaction_feed_box:
@@ -4089,7 +4212,7 @@ def register_auth_pages(
                     "reaction-bubble reaction-bubble--enter "
                     "items-center gap-2"
                 ).props(
-                    f"aria-label='{sender}が"
+                    f"aria-label='{escape(sender, quote=True)}が"
                     f"{reaction.emoji}でリアクション'"
                 ) as bubble:
                     ui.label(reaction.emoji).classes(
@@ -4368,12 +4491,12 @@ def register_auth_pages(
                     for index, record in enumerate(
                         snapshot.history, start=1
                     ):
-                        if record.by_bot:
-                            actor = f"Bot {record.seat_index + 1}"
-                        elif record.actor_user_id == user_id:
-                            actor = "あなた"
-                        else:
-                            actor = f"プレイヤー{record.seat_index + 1}"
+                        actor = _history_actor_label(
+                            snapshot,
+                            record,
+                            user_id,
+                            seat_display_names,
+                        )
                         with ui.row().classes(
                             "game-history-row w-full items-center "
                             "justify-between gap-3 "
@@ -4482,53 +4605,13 @@ def register_auth_pages(
 
 
             if snapshot.status is RoomStatus.FINISHED:
-                reasons = {
-                    "ends_with_n": "「ん」で終わったため終了しました。",
-                    "duplicate": "同じ読みを使ったため終了しました。",
-                    "timeout": "時間切れで終了しました。",
-                    "no_legal_move": "出せる単語がなく終了しました。",
-                    "surrender": "降参により終了しました。",
-                }
                 feedback_label.set_text(
-                    reasons.get(
-                        snapshot.end_reason,
-                        "対局が終了しました。",
+                    _finished_feedback_text(
+                        snapshot,
+                        user_id,
+                        seat_display_names,
                     )
                 )
-                winner_indexes = snapshot.active_seat_indexes
-                if len(winner_indexes) == 1:
-                    winner_index = winner_indexes[0]
-                    own_seat = snapshot.seat_for_user(user_id)
-                    winner_text = (
-                        "あなたの勝ちです！"
-                        if (
-                            own_seat is not None
-                            and own_seat.index == winner_index
-                        )
-                        else f"プレイヤー{winner_index + 1}の勝ちです。"
-                    )
-                    if (
-                        snapshot.end_reason == "surrender"
-                        and snapshot.losing_seat is not None
-                    ):
-                        surrender_text = (
-                            "あなたは降参しました。"
-                            if (
-                                own_seat is not None
-                                and own_seat.index
-                                == snapshot.losing_seat
-                            )
-                            else (
-                                f"プレイヤー"
-                                f"{snapshot.losing_seat + 1}が"
-                                "降参しました。"
-                            )
-                        )
-                        feedback_label.set_text(
-                            f"{surrender_text}{winner_text}"
-                        )
-                    else:
-                        feedback_label.set_text(winner_text)
             elif transient_message is not None:
                 feedback_label.set_text(transient_message)
             elif snapshot.role_for_user(user_id) is Role.SPECTATOR:
@@ -4673,6 +4756,9 @@ def register_auth_pages(
                     return
                 if event.kind is RoomEventKind.REACTION:
                     if event.reaction is not None:
+                        await refresh_display_names(
+                            (event.reaction.sender_user_id,)
+                        )
                         with client:
                             show_room_reaction(event.reaction)
                     return
