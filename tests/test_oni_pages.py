@@ -74,7 +74,7 @@ class OniPageIntegrationTests(unittest.TestCase):
         )
         challenge = SimpleNamespace(
             constraints=constraints,
-            candidate_count=4,
+            candidate_count=5,
             relaxed_seal_count=1,
             candidates=("秘密の答え",),
         )
@@ -90,7 +90,7 @@ class OniPageIntegrationTests(unittest.TestCase):
             ("読みは4音", "「ぽ」を含む"),
         )
         self.assertEqual(presentation.sealed_endings, ("り", "ご"))
-        self.assertEqual(presentation.candidate_count, 4)
+        self.assertEqual(presentation.candidate_count, 5)
         self.assertEqual(presentation.relaxed_seal_count, 1)
         self.assertNotIn("秘密の答え", repr(presentation))
         self.assertEqual(service.snapshots, [snapshot])
@@ -135,6 +135,9 @@ class OniPageIntegrationTests(unittest.TestCase):
         self.assertIn("bot_difficulty=ONI_BOT_DIFFICULTY", page_source)
         self.assertIn('ui.label("登場する7種類の命令")', page_source)
         self.assertIn('"禁止かな：', page_source)
+        self.assertIn(
+            "既知の正解候補が5語以上", page_source
+        )
         self.assertIn('"末尾封印：', page_source)
         self.assertIn('"鬼しりとり", "/oni-shiritori"', web_source)
         self.assertIn("register_oni_pages(", main_source)
