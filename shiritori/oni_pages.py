@@ -94,7 +94,7 @@ def register_oni_pages(
                         "5手目以降は最大2個まで同時に適用されます。"
                     ).classes("platform-muted")
                     ui.label(
-                        "既知の正解候補が3語以上残る組み合わせだけを出題。"
+                        "既知の正解候補が5語以上残る組み合わせだけを出題。"
                         "足りない場合は古い末尾封印から自動で解除します。"
                     ).classes("platform-muted")
 

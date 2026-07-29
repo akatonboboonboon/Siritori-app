@@ -8,6 +8,7 @@ from unittest.mock import patch
 from shiritori.bots import BotContext, HardBot, WordIndex, WordOption, final_kana
 from shiritori.oni_room import (
     MAX_GENERATION_OPTIONS,
+    ONI_ROOM_MINIMUM_CANDIDATES,
     OniRoomChallenge,
     OniRoomRuleService,
 )
@@ -106,19 +107,21 @@ class OniRoomRuleServiceTests(unittest.TestCase):
             return WordIndex(options)
 
         received_sizes: list[int] = []
+        received_minimums: list[object] = []
 
         def fake_generate(
             candidates: tuple[WordOption, ...],
             **_kwargs: object,
         ) -> GeneratedOniChallenge:
             received_sizes.append(len(candidates))
-            selected = tuple(candidates[:3])
+            received_minimums.append(_kwargs["minimum_candidates"])
+            selected = tuple(candidates[:ONI_ROOM_MINIMUM_CANDIDATES])
             return GeneratedOniChallenge(
                 constraints=OniConstraintSet(
                     forbidden_kana="さ",
                 ),
                 candidates=selected,
-                minimum_candidates=3,
+                minimum_candidates=ONI_ROOM_MINIMUM_CANDIDATES,
             )
 
         service = OniRoomRuleService(resolve)
@@ -137,6 +140,9 @@ class OniRoomRuleServiceTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(received_sizes, [MAX_GENERATION_OPTIONS])
+        self.assertEqual(
+            received_minimums, [ONI_ROOM_MINIMUM_CANDIDATES]
+        )
         self.assertEqual(resolver_calls, 1)
 
     def test_seal_uses_last_ten_successes_and_timeout_does_not_advance_it(
@@ -164,6 +170,8 @@ class OniRoomRuleServiceTests(unittest.TestCase):
                 word("たかき", key="one"),
                 word("たさき", key="two"),
                 word("たなき", key="three"),
+                word("たはき", key="four"),
+                word("たまき", key="five"),
             )
         )
         captured: list[dict[str, object]] = []
@@ -179,8 +187,10 @@ class OniRoomRuleServiceTests(unittest.TestCase):
                     forbidden_kana="ぬ",
                     required_kana="た",
                 ),
-                candidates=index.all_options(limit=3),
-                minimum_candidates=3,
+                candidates=index.all_options(
+                    limit=ONI_ROOM_MINIMUM_CANDIDATES
+                ),
+                minimum_candidates=ONI_ROOM_MINIMUM_CANDIDATES,
             )
 
         snapshot = oni_room(
@@ -234,6 +244,9 @@ class OniRoomRuleServiceTests(unittest.TestCase):
         self.assertTrue(challenge.degraded)
         self.assertEqual(challenge.candidates, ())
         self.assertEqual(challenge.constraints, OniConstraintSet())
+        self.assertEqual(
+            challenge.minimum_candidates, ONI_ROOM_MINIMUM_CANDIDATES
+        )
 
     def test_seal_filter_runs_before_the_ranked_generation_cap(self) -> None:
         sealed = tuple(
@@ -250,7 +263,7 @@ class OniRoomRuleServiceTests(unittest.TestCase):
                 key=f"unsealed-{index}",
                 rank=MAX_GENERATION_OPTIONS + index,
             )
-            for index in range(3)
+            for index in range(ONI_ROOM_MINIMUM_CANDIDATES)
         )
         snapshot = oni_room(
             history=(turn("かき", 0),),
@@ -264,7 +277,10 @@ class OniRoomRuleServiceTests(unittest.TestCase):
 
         self.assertEqual(challenge.relaxed_seal_count, 0)
         self.assertIn("き", challenge.constraints.sealed_endings)
-        self.assertGreaterEqual(challenge.candidate_count, 3)
+        self.assertGreaterEqual(
+            challenge.candidate_count,
+            ONI_ROOM_MINIMUM_CANDIDATES,
+        )
         self.assertTrue(
             all(option.last_kana == "く" for option in challenge.candidates)
         )
@@ -284,7 +300,7 @@ class OniRoomRuleServiceTests(unittest.TestCase):
                 key=f"rare-{index}",
                 rank=MAX_GENERATION_OPTIONS + index,
             )
-            for index in range(3)
+            for index in range(ONI_ROOM_MINIMUM_CANDIDATES)
         )
         service = OniRoomRuleService(
             lambda _snapshot: WordIndex((*common, *rare))
@@ -300,7 +316,10 @@ class OniRoomRuleServiceTests(unittest.TestCase):
             challenge.constraints.forbidden_kana,
             "\u305f",
         )
-        self.assertGreaterEqual(challenge.candidate_count, 3)
+        self.assertGreaterEqual(
+            challenge.candidate_count,
+            ONI_ROOM_MINIMUM_CANDIDATES,
+        )
 
     def test_mora_failure_retries_after_dropping_the_oldest_seal(self) -> None:
         options = (
@@ -310,6 +329,7 @@ class OniRoomRuleServiceTests(unittest.TestCase):
             word("あかき", key="sealed-a", rank=4),
             word("あさき", key="sealed-b", rank=5),
             word("あたき", key="sealed-c", rank=6),
+            word("あなき", key="sealed-d", rank=7),
         )
         snapshot = oni_room(
             history=(turn("かき", 0),),
@@ -322,7 +342,11 @@ class OniRoomRuleServiceTests(unittest.TestCase):
         self.assertEqual(challenge.relaxed_seal_count, 1)
         self.assertEqual(challenge.constraints.sealed_endings, ())
         self.assertEqual(challenge.constraints.mora_count_required, 3)
-        self.assertGreaterEqual(challenge.candidate_count, 3)
+        self.assertFalse(challenge.degraded)
+        self.assertGreaterEqual(
+            challenge.candidate_count,
+            ONI_ROOM_MINIMUM_CANDIDATES,
+        )
 
 
 class OniFixedSettingsTests(unittest.TestCase):

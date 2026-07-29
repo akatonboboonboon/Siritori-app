@@ -19,7 +19,6 @@ from .oni_rules import (
     EndingSealWindow,
     GeneratedOniChallenge,
     InsufficientCandidates,
-    MINIMUM_FEASIBLE_CANDIDATES,
     OniConstraintSet,
     generate_oni_challenge,
     mora_count,
@@ -30,6 +29,7 @@ from .rooms import RoomRuleSet, RoomSnapshot
 EARLY_TURN_LIMIT: Final = 4
 EARLY_EXTRA_CONSTRAINTS: Final = 1
 LATE_EXTRA_CONSTRAINTS: Final = 2
+ONI_ROOM_MINIMUM_CANDIDATES: Final = 5
 MAX_GENERATION_OPTIONS: Final = 96
 MAX_CHALLENGE_CACHE_SIZE: Final = 128
 
@@ -41,13 +41,13 @@ class OniRoomChallenge:
     """The effective command and known server candidates for one room turn.
 
     ``degraded`` is true only when the current chain contains fewer than the
-    promised three known safe Bot answers.  The room remains playable and the
+    promised five known safe Bot answers.  The room remains playable and the
     runtime remains safe in that rare exhaustion state.
     """
 
     constraints: OniConstraintSet
     candidates: tuple[WordOption, ...]
-    minimum_candidates: int = MINIMUM_FEASIBLE_CANDIDATES
+    minimum_candidates: int = ONI_ROOM_MINIMUM_CANDIDATES
     relaxed_seal_count: int = 0
     degraded: bool = False
 
@@ -228,7 +228,7 @@ class OniRoomRuleService:
             key=lambda item: (-len(item[1]), item[0]),
         )
         for _length, group in ordered_groups:
-            if len(group) < MINIMUM_FEASIBLE_CANDIDATES:
+            if len(group) < ONI_ROOM_MINIMUM_CANDIDATES:
                 continue
             generated = self._try_generate(
                 tuple(group),
@@ -278,7 +278,7 @@ class OniRoomRuleService:
                 turn_number=turn_number,
                 extra_constraint_count=extra_constraint_count,
                 include_mora_count=True,
-                minimum_candidates=MINIMUM_FEASIBLE_CANDIDATES,
+                minimum_candidates=ONI_ROOM_MINIMUM_CANDIDATES,
             )
         except InsufficientCandidates:
             return None
@@ -419,6 +419,7 @@ __all__ = [
     "LATE_EXTRA_CONSTRAINTS",
     "MAX_CHALLENGE_CACHE_SIZE",
     "MAX_GENERATION_OPTIONS",
+    "ONI_ROOM_MINIMUM_CANDIDATES",
     "OniRoomChallenge",
     "OniRoomRuleService",
     "WordIndexResolver",
