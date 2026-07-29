@@ -101,7 +101,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
             lives_per_player=3,
             bot_difficulty="hard",
             rule_set=RoomRuleSet.ONI,
-            turn_seconds=10,
+            turn_seconds=30,
             now=NOW,
         )
         self.assertEqual(len(snapshot.players), 2)
@@ -126,7 +126,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(paused[0].bot_count, 1)
         self.assertEqual(paused[0].lives_per_player, 3)
         self.assertIs(paused[0].rule_set, RoomRuleSet.ONI)
-        self.assertEqual(paused[0].paused_remaining_seconds, 10)
+        self.assertEqual(paused[0].paused_remaining_seconds, 30)
 
         resumed = await self.service.connect(
             self.owner.id,
@@ -307,7 +307,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
             bot_difficulty="hard",
             rule_set=RoomRuleSet.ONI,
             lives_per_player=3,
-            turn_seconds=10,
+            turn_seconds=30,
             now=NOW,
         )
         finished_outcome = await self.coordinator.surrender(
@@ -329,7 +329,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried.bot_difficulty, "hard")
         self.assertEqual(retried.lives_per_player, 3)
         self.assertEqual(retried.remaining_lives, (3, 3))
-        self.assertEqual(retried.turn_seconds, 10)
+        self.assertEqual(retried.turn_seconds, 30)
 
     async def test_paused_listing_rejects_projection_drift(self) -> None:
         snapshot = await self.service.create(self.owner.id, now=NOW)

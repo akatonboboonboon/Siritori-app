@@ -38,6 +38,7 @@ from shiritori.web_auth import (
     _auth_rate_limit_keys,
     _invite_rate_limit_keys,
     _can_surrender,
+    _room_closed_message,
     _deadline_presentation,
     _feedback_for_version,
     _history_scroll_script,
@@ -558,6 +559,17 @@ class GameUiHelperTests(unittest.TestCase):
             end_reason="surrender",
         )
         self.assertFalse(_can_surrender(finished, "alice"))
+
+    def test_room_closed_message_distinguishes_idle_cleanup(self) -> None:
+        inactive = _room_closed_message("inactive")
+        generic = _room_closed_message("empty")
+
+        self.assertIn("30分間", inactive)
+        self.assertIn("自動削除", inactive)
+        self.assertIn("ロビー", inactive)
+        self.assertNotIn("30分", generic)
+        self.assertIn("部屋が終了", generic)
+        self.assertIn("ロビー", generic)
 
     def test_post_match_destination_follows_newer_active_round(self) -> None:
         room = SimpleNamespace(room_code="ABC234")

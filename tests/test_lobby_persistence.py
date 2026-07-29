@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from threading import Barrier
@@ -844,6 +845,89 @@ class LobbyPersistenceTests(unittest.TestCase):
             self.assertIsNotNone(old.deleted_at)
             self.assertIsNone(new.deleted_at)
             self.assertEqual(old.name_key, new.name_key)
+
+    def test_inactive_waiting_room_expires_at_exact_cutoff(self) -> None:
+        now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+        cutoff = now - timedelta(minutes=30)
+        original = self.create_room(name="Idle reusable room")
+        joined = self.service.join_as_spectator(
+            self.watcher.id,
+            original.room_code,
+        )
+        with self.database.transaction() as session:
+            room = session.get(Room, original.id)
+            room.updated_at = cutoff
+            owner = session.get(
+                RoomMembership,
+                {"room_id": original.id, "user_id": self.owner.id},
+            )
+            owner.ready = True
+
+        expired = self.repository.expire_inactive_waiting_rooms(
+            cutoff,
+            now=now,
+        )
+
+        self.assertEqual(expired, (original.id,))
+        with self.database.read_session() as session:
+            room = session.get(Room, original.id)
+            self.assertEqual(room.status, StoredRoomStatus.CLOSED.value)
+            self.assertIsNone(room.current_game_id)
+            self.assertIsNotNone(room.deleted_at)
+            self.assertEqual(room.revision, joined.revision + 1)
+            memberships = tuple(
+                session.scalars(
+                    select(RoomMembership).where(
+                        RoomMembership.room_id == original.id
+                    )
+                )
+            )
+            self.assertEqual(len(memberships), 2)
+            self.assertTrue(
+                all(
+                    membership.presence == "offline"
+                    and membership.connected_count == 0
+                    and membership.seat_index is None
+                    and not membership.ready
+                    and membership.presence_expires_at is None
+                    and membership.left_at is not None
+                    for membership in memberships
+                )
+            )
+        with self.assertRaises(LobbyRoomNotFound):
+            self.service.get_room(original.room_code)
+
+        replacement_service = LobbyService(
+            self.repository,
+            code_factory=lambda: "IDLE23",
+        )
+        replacement = replacement_service.create_pvp_room(
+            self.guest.id,
+            name="  IDLE   REUSABLE ROOM  ",
+        )
+        self.assertNotEqual(replacement.id, original.id)
+
+    def test_inactive_waiting_room_cleanup_keeps_recent_room(self) -> None:
+        now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+        cutoff = now - timedelta(minutes=30)
+        room = self.create_room(name="Recent room")
+        with self.database.transaction() as session:
+            session.get(Room, room.id).updated_at = cutoff + timedelta(seconds=1)
+
+        self.assertEqual(
+            self.repository.expire_inactive_waiting_rooms(cutoff, now=now),
+            (),
+        )
+        self.assertEqual(self.service.get_room(room.room_code).id, room.id)
+
+    def test_inactive_waiting_room_cleanup_validates_arguments(self) -> None:
+        now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ValueError):
+            self.repository.expire_inactive_waiting_rooms(now + timedelta(1), now)
+        with self.assertRaises(ValueError):
+            self.repository.expire_inactive_waiting_rooms(now, now, limit=0)
+        with self.assertRaises(ValueError):
+            self.repository.expire_inactive_waiting_rooms(now.replace(tzinfo=None))
 
     def test_public_waiting_listing_filters_and_keeps_creation_order(self) -> None:
         def create(

@@ -1425,6 +1425,123 @@ class RoomCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RoomNotFound):
             await coordinator.load_snapshot("pvp")
 
+    async def test_inactive_cleanup_deletes_pvp_and_publishes_reason(self) -> None:
+        repository = InMemoryRoomRepository([pvp_room()])
+        coordinator = RoomCoordinator(repository)
+        events = []
+        notifications: list[str] = []
+        coordinator.set_activity_notifier(notifications.append)
+        await coordinator.connect_client(
+            "pvp",
+            "alice",
+            "alice-tab",
+            events.append,
+        )
+        events.clear()
+
+        outcome = await coordinator.expire_inactive_pvp_room("pvp", 0)
+
+        self.assertIsNotNone(outcome)
+        assert outcome is not None
+        self.assertTrue(outcome.deleted)
+        self.assertFalse(outcome.duplicate)
+        self.assertTrue(outcome.operation_id.startswith("system:inactive:"))
+        self.assertIsNone(await repository.load("pvp"))
+        self.assertEqual(len(events), 1)
+        self.assertIs(events[0].kind, RoomEventKind.CLOSED)
+        self.assertEqual(events[0].reason, "inactive")
+        self.assertEqual(notifications[-1], "pvp")
+
+    async def test_inactive_cleanup_is_deterministic_and_idempotent(self) -> None:
+        repository = InMemoryRoomRepository([pvp_room()])
+        coordinator = RoomCoordinator(repository)
+
+        first = await coordinator.expire_inactive_pvp_room("pvp", 0)
+        replayed = await coordinator.expire_inactive_pvp_room("pvp", 0)
+
+        assert first is not None and replayed is not None
+        self.assertEqual(first.operation_id, replayed.operation_id)
+        self.assertFalse(first.duplicate)
+        self.assertTrue(replayed.duplicate)
+        self.assertTrue(replayed.deleted)
+
+    async def test_inactive_cleanup_ignores_stale_observation(self) -> None:
+        current = pvp_room(version=1)
+        repository = InMemoryRoomRepository([current])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.expire_inactive_pvp_room("pvp", 0)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(await repository.load("pvp"), current)
+
+    async def test_inactive_cleanup_loses_safely_to_racing_turn(self) -> None:
+        class RacingRepository(InMemoryRoomRepository):
+            async def delete_if_version(
+                self,
+                room_id: str,
+                expected_version: int,
+                operation_id: str,
+                *,
+                command_fingerprint: str,
+            ):
+                current = await self.load(room_id)
+                assert current is not None
+                advanced = replace(
+                    current,
+                    state_version=current.state_version + 1,
+                )
+                await self.compare_and_swap(
+                    room_id,
+                    expected_version,
+                    "racing-turn",
+                    advanced,
+                    command_fingerprint="a" * 64,
+                )
+                return await super().delete_if_version(
+                    room_id,
+                    expected_version,
+                    operation_id,
+                    command_fingerprint=command_fingerprint,
+                )
+
+        initial = pvp_room()
+        repository = RacingRepository([initial])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.expire_inactive_pvp_room("pvp", 0)
+
+        self.assertIsNone(outcome)
+        current = await repository.load("pvp")
+        assert current is not None
+        self.assertEqual(current.state_version, 1)
+
+    async def test_inactive_cleanup_defensively_excludes_solo_room(self) -> None:
+        current = solo_room()
+        repository = InMemoryRoomRepository([current])
+        coordinator = RoomCoordinator(repository)
+
+        outcome = await coordinator.expire_inactive_pvp_room("solo", 0)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(await repository.load("solo"), current)
+
+    async def test_inactive_cleanup_validates_candidate_identity(self) -> None:
+        coordinator = RoomCoordinator(InMemoryRoomRepository())
+
+        for invalid_room_id in ("", "x" * 37):
+            with self.subTest(room_id=invalid_room_id):
+                with self.assertRaises(ValueError):
+                    await coordinator.expire_inactive_pvp_room(
+                        invalid_room_id, 0
+                    )
+        for invalid_version in (-1, True, 1.5):
+            with self.subTest(version=invalid_version):
+                with self.assertRaises(ValueError):
+                    await coordinator.expire_inactive_pvp_room(
+                        "pvp", invalid_version
+                    )
+
     async def test_restart_recovery_rearms_absence_without_duplicate_tasks(self) -> None:
         repository = InMemoryRoomRepository([pvp_room()])
         coordinator = RoomCoordinator(

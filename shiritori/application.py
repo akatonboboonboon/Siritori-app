@@ -20,6 +20,7 @@ from .lobby import LobbyService
 from .lobby_persistence import SQLAlchemyLobbyRepository
 from .oni_room import OniRoomRuleService
 from .room_persistence import SQLAlchemyRoomRepository
+from .room_cleanup import RoomCleanupService
 from .room_runtime import (
     RoomRuntime,
     RoomRuntimeCapabilityError,
@@ -67,6 +68,7 @@ class ApplicationServices:
     lobby_repository: SQLAlchemyLobbyRepository
     lobby: LobbyService
     room_repository: SQLAlchemyRoomRepository
+    room_cleanup: RoomCleanupService
     room_hub: RoomHub
     oni_rules: OniRoomRuleService
     rooms: RoomCoordinator
@@ -118,6 +120,11 @@ class ApplicationServices:
             room_repository,
             hub=room_hub,
             oni_constraint_resolver=oni_rules.constraints_for,
+        )
+        room_cleanup = RoomCleanupService(
+            lobby_repository,
+            room_repository,
+            rooms,
         )
         strategies: dict[str, BotStrategy] = {
             "easy": EasyBot(seed="server-easy"),
@@ -180,6 +187,7 @@ class ApplicationServices:
             lobby_repository=lobby_repository,
             lobby=lobby,
             room_repository=room_repository,
+            room_cleanup=room_cleanup,
             room_hub=room_hub,
             oni_rules=oni_rules,
             rooms=rooms,
@@ -268,6 +276,7 @@ class ApplicationServices:
             )
             if len(finalized) < 100:
                 break
+        await self.room_cleanup.start()
         recoverable_room_ids = (
             await self.room_repository.list_recoverable_room_ids()
         )
@@ -282,6 +291,7 @@ class ApplicationServices:
     async def close(self) -> None:
         """Stop background tasks and release pooled database connections."""
 
+        await self.room_cleanup.close()
         await self.runtime.close()
         self.database.dispose()
 

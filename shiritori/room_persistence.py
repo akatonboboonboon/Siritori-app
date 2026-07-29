@@ -368,6 +368,22 @@ class SQLAlchemyRoomRepository:
         """
         return await asyncio.to_thread(self._list_recoverable_room_ids_sync)
 
+    async def list_inactive_pvp_rooms(
+        self,
+        inactive_before: datetime,
+        limit: int = 100,
+    ) -> tuple[tuple[str, int], ...]:
+        """Return stale current PvP games for a later version-checked delete."""
+
+        cutoff = _aware_utc(inactive_before, "inactive_before")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        return await asyncio.to_thread(
+            self._list_inactive_pvp_rooms_sync,
+            cutoff,
+            limit,
+        )
+
     async def find_operation(
         self, room_id: str, operation_id: str
     ) -> CommandReceipt | None:
@@ -540,6 +556,44 @@ class SQLAlchemyRoomRepository:
                     )
                 room_ids.append(game.id)
             return tuple(room_ids)
+
+    def _list_inactive_pvp_rooms_sync(
+        self,
+        inactive_before: datetime,
+        limit: int,
+    ) -> tuple[tuple[str, int], ...]:
+        with self.database.read_session() as session:
+            statement = (
+                select(Game)
+                .join(Room, Game.room_id == Room.id)
+                .where(
+                    Game.mode == GameMode.MULTIPLAYER.value,
+                    Game.status == StoredGameStatus.ACTIVE.value,
+                    Game.updated_at <= inactive_before,
+                    Room.status == StoredRoomStatus.ACTIVE.value,
+                    Room.current_game_id == Game.id,
+                    Room.deleted_at.is_(None),
+                    Room.updated_at <= inactive_before,
+                )
+                .order_by(Game.updated_at.asc(), Game.id.asc())
+            )
+            inactive: list[tuple[str, int]] = []
+            for game in session.scalars(statement).yield_per(max(100, limit)):
+                try:
+                    snapshot = _snapshot_from_game(game)
+                except RoomSnapshotCorruptError:
+                    # Unmarked/legacy/malformed state belongs to no current
+                    # coordinator cleanup contract and must fail closed.
+                    continue
+                if (
+                    snapshot.mode is not RoomMode.PVP
+                    or snapshot.status is not RoomStatus.ACTIVE
+                ):
+                    continue
+                inactive.append((game.id, snapshot.state_version))
+                if len(inactive) >= limit:
+                    break
+            return tuple(inactive)
 
     def _find_operation_sync(
         self, room_id: str, operation_id: str
@@ -1451,6 +1505,14 @@ def _pvp_game_is_current(
         and room.status == StoredRoomStatus.ACTIVE.value
         and room.current_game_id == game.id
     )
+
+
+def _aware_utc(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
 
 
 def _stored_utc(value: datetime) -> datetime:
