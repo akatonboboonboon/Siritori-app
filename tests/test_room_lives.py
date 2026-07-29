@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 
 from shiritori.room_persistence import (
+    SNAPSHOT_SCHEMA_VERSION,
     RoomSnapshotCorruptError,
     deserialize_room_snapshot,
     serialize_room_snapshot,
@@ -281,7 +282,7 @@ class LifeSystemTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LifePersistenceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_schema_four_round_trips_life_loss_event(self) -> None:
+    async def test_current_schema_round_trips_life_loss_event(self) -> None:
         room = pvp_with_lives(room_id="persist")
         coordinator = RoomCoordinator(InMemoryRoomRepository([room]))
         outcome = await coordinator.submit_user_turn(
@@ -298,7 +299,10 @@ class LifePersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         document = serialize_room_snapshot(outcome.snapshot)
 
-        self.assertEqual(document["room_repository_schema"], 4)
+        self.assertEqual(
+            document["room_repository_schema"],
+            SNAPSHOT_SCHEMA_VERSION,
+        )
         self.assertEqual(document["snapshot"]["lives_per_player"], 3)
         self.assertEqual(document["snapshot"]["remaining_lives"], [2, 3])
         self.assertEqual(
@@ -312,6 +316,7 @@ class LifePersistenceTests(unittest.IsolatedAsyncioTestCase):
         document = deepcopy(serialize_room_snapshot(room))
         document["room_repository_schema"] = 3
         for field in (
+            "rule_set",
             "lives_per_player",
             "remaining_lives",
             "life_loss_events",

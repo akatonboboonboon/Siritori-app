@@ -47,6 +47,37 @@ class WordIndexTests(unittest.TestCase):
             (),
         )
 
+    def test_all_options_limit_applies_after_safety_filters(self) -> None:
+        first = word("林檎", "りんご", rank=1)
+        terminal = word("蜜柑", "みかん", rank=2)
+        second = word("寿司", "すし", rank=3)
+        third = word("猫", "ねこ", rank=4)
+        index = WordIndex((first, terminal, second, third))
+
+        self.assertEqual(
+            index.all_options(
+                frozenset({first.canonical_key}),
+                avoid_n=True,
+                limit=2,
+            ),
+            (second, third),
+        )
+        self.assertEqual(
+            index.all_options(
+                avoid_n=True,
+                excluded_endings={"ご"},
+                limit=1,
+            ),
+            (second,),
+        )
+        self.assertEqual(index.all_options(limit=1), (first,))
+        for invalid in (0, -1, True):
+            with (
+                self.subTest(limit=invalid),
+                self.assertRaises(ValueError),
+            ):
+                index.all_options(limit=invalid)
+
     def test_strategy_protocol_is_easy_to_implement(self) -> None:
         class FirstLegal:
             def choose(

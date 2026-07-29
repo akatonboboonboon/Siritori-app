@@ -63,12 +63,26 @@ class ApplicationServicesTests(unittest.IsolatedAsyncioTestCase):
             self.services.approved_validator,
         )
 
-    async def test_ranked_modes_keep_a_fixed_official_lexicon(self) -> None:
+    async def test_ranked_mode_keeps_a_fixed_official_lexicon(self) -> None:
         self.assertIsNone(self.services.score_attack.validator)
-        self.assertIsNone(self.services.daily_challenge.validator)
         self.assertIs(
             self.services.room_words.validator,
             self.services.approved_validator,
+        )
+
+    async def test_oni_rules_are_shared_by_coordinator_and_runtime(self) -> None:
+        coordinator_resolver = self.services.rooms._oni_constraint_resolver
+        runtime_resolver = self.services.runtime._oni_challenge_resolver
+
+        self.assertIsNotNone(coordinator_resolver)
+        self.assertIsNotNone(runtime_resolver)
+        self.assertIs(
+            getattr(coordinator_resolver, "__self__", None),
+            self.services.oni_rules,
+        )
+        self.assertIs(
+            getattr(runtime_resolver, "__self__", None),
+            self.services.oni_rules,
         )
 
     async def test_start_drains_all_expired_score_attack_batches(self) -> None:

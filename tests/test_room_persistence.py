@@ -39,6 +39,7 @@ from shiritori.rooms import (
     PlayerSeat,
     RepositoryStatus,
     RoomMode,
+    RoomRuleSet,
     RoomSnapshot,
     RoomStatus,
     SeatController,
@@ -194,6 +195,23 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(document["snapshot"]["theme_key"], "food")
         self.assertEqual(document["snapshot"]["bot_difficulty"], "hard")
+        self.assertEqual(document["snapshot"]["rule_set"], "standard")
+
+        version_four_source = replace(
+            paused,
+            lives_per_player=3,
+            remaining_lives=(3, 3),
+        )
+        version_four = serialize_room_snapshot(version_four_source)
+        version_four["room_repository_schema"] = 4
+        version_four_payload = dict(version_four["snapshot"])
+        version_four_payload.pop("rule_set")
+        version_four["snapshot"] = version_four_payload
+        restored_version_four = deserialize_room_snapshot(version_four)
+        self.assertIs(restored_version_four.rule_set, RoomRuleSet.STANDARD)
+        self.assertEqual(restored_version_four.lives_per_player, 3)
+        self.assertEqual(restored_version_four.remaining_lives, (3, 3))
+
 
         corrupted = dict(document)
         corrupted["room_repository_schema"] = SNAPSHOT_SCHEMA_VERSION - 1
@@ -203,6 +221,7 @@ class RoomPersistenceTests(unittest.IsolatedAsyncioTestCase):
         for field, value in (
             ("theme_key", "../food"),
             ("bot_difficulty", "expert"),
+            ("rule_set", "impossible"),
         ):
             with self.subTest(field=field):
                 bad_payload = dict(document["snapshot"])

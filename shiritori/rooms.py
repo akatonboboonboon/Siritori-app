@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from .bots import canonical_kana, final_kana, first_kana
 from .lexicon import LexiconResult, get_default_validator
+from .oni_rules import OniConstraintSet
 from .themes import ALL_THEME_ID, ThemeCatalog
 
 
@@ -42,6 +43,12 @@ SUPPORTED_REACTIONS: Final[tuple[str, ...]] = ("👍", "👏", "😮", "😂", "
 REACTION_COOLDOWN_SECONDS: Final = 1.0
 REACTION_RATE_LIMIT_CAPACITY: Final = 2048
 REACTION_DELIVERY_TIMEOUT_SECONDS: Final = 0.25
+ONI_BOT_COUNT: Final = 1
+ONI_BOT_DIFFICULTY: Final = "hard"
+ONI_LIVES: Final = 3
+ONI_TURN_SECONDS: Final = 10
+
+OniConstraintResolver = Callable[["RoomSnapshot"], OniConstraintSet]
 
 
 class Role(str, Enum):
@@ -52,6 +59,11 @@ class Role(str, Enum):
 class RoomMode(str, Enum):
     PVP = "pvp"
     SOLO_BOT = "solo_bot"
+
+
+class RoomRuleSet(str, Enum):
+    STANDARD = "standard"
+    ONI = "oni"
 
 
 class RoomStatus(str, Enum):
@@ -161,6 +173,7 @@ class RoomSnapshot:
     players: tuple[PlayerSeat, ...]
     current_turn: int
     state_version: int = 0
+    rule_set: RoomRuleSet = RoomRuleSet.STANDARD
     theme_key: str = "all"
     bot_difficulty: str = "normal"
     spectators: tuple[str, ...] = ()
@@ -190,6 +203,8 @@ class RoomSnapshot:
             raise ValueError("current_turn is outside the player list")
         if self.state_version < 0:
             raise ValueError("state_version must be non-negative")
+        if not isinstance(self.rule_set, RoomRuleSet):
+            raise ValueError("rule_set must be 'standard' or 'oni'")
         if (
             type(self.theme_key) is not str
             or not _THEME_KEY_PATTERN.fullmatch(self.theme_key)
@@ -240,6 +255,23 @@ class RoomSnapshot:
             or not 1 <= self.lives_per_player <= 5
         ):
             raise ValueError("lives_per_player must be from 1 to 5")
+        if self.rule_set is RoomRuleSet.ONI:
+            permanent_bot_count = sum(
+                seat.owner_user_id is None for seat in self.players
+            )
+            if (
+                self.mode is not RoomMode.SOLO_BOT
+                or len(self.players) != ONI_BOT_COUNT + 1
+                or permanent_bot_count != ONI_BOT_COUNT
+                or self.bot_difficulty != ONI_BOT_DIFFICULTY
+                or self.lives_per_player != ONI_LIVES
+                or self.turn_seconds != ONI_TURN_SECONDS
+                or self.theme_key != ALL_THEME_ID
+            ):
+                raise ValueError(
+                    "Oni rooms require one Hard Bot, three lives, "
+                    "a 10-second turn, and the complete word catalog"
+                )
         if not self.remaining_lives:
             object.__setattr__(
                 self,
@@ -778,6 +810,7 @@ def create_room_snapshot(
     mode: RoomMode,
     permanent_bot_count: int = 0,
     spectators: Iterable[str] = (),
+    rule_set: RoomRuleSet = RoomRuleSet.STANDARD,
     turn_seconds: int | None = None,
     theme_key: str = "all",
     bot_difficulty: str = "normal",
@@ -842,6 +875,7 @@ def create_room_snapshot(
         mode=mode,
         status=RoomStatus.ACTIVE,
         players=seats,
+        rule_set=rule_set,
         spectators=tuple(spectators),
         lives_per_player=lives_per_player,
         remaining_lives=(lives_per_player,) * len(seats),
@@ -980,6 +1014,7 @@ class RoomCoordinator:
         reaction_cooldown_seconds: float = REACTION_COOLDOWN_SECONDS,
         reaction_rate_limit_capacity: int = REACTION_RATE_LIMIT_CAPACITY,
         reaction_delivery_timeout_seconds: float = REACTION_DELIVERY_TIMEOUT_SECONDS,
+        oni_constraint_resolver: OniConstraintResolver | None = None,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -994,12 +1029,17 @@ class RoomCoordinator:
             raise ValueError("reaction rate-limit capacity must be positive")
         if reaction_delivery_timeout_seconds <= 0:
             raise ValueError("reaction delivery timeout must be positive")
+        if oni_constraint_resolver is not None and not callable(
+            oni_constraint_resolver
+        ):
+            raise TypeError("oni_constraint_resolver must be callable")
         self.repository = repository
         self.hub = hub or RoomHub()
         self.disconnect_grace_seconds = disconnect_grace_seconds
         self.reaction_cooldown_seconds = reaction_cooldown_seconds
         self.reaction_rate_limit_capacity = reaction_rate_limit_capacity
         self.reaction_delivery_timeout_seconds = reaction_delivery_timeout_seconds
+        self._oni_constraint_resolver = oni_constraint_resolver
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._locks: dict[str, asyncio.Lock] = {}
@@ -1727,6 +1767,22 @@ class RoomCoordinator:
                 raise InvalidMove(
                     f"word must begin with {required_kana!r}"
                 )
+            if snapshot.rule_set is RoomRuleSet.ONI:
+                if self._oni_constraint_resolver is None:
+                    raise InvalidMove(
+                        "鬼しりとりのルール判定を利用できません"
+                    )
+                constraints = self._oni_constraint_resolver(snapshot)
+                if not isinstance(constraints, OniConstraintSet):
+                    raise TypeError(
+                        "oni_constraint_resolver must return OniConstraintSet"
+                    )
+                violations = constraints.violations(reading)
+                if violations:
+                    details = " / ".join(
+                        violation.message for violation in violations
+                    )
+                    raise InvalidMove(f"鬼ルール違反: {details}")
 
             next_players = self._complete_pending_handbacks(snapshot.players)
             if canonical_key in snapshot.used_canonical_keys:

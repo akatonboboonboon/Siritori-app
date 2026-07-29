@@ -40,6 +40,7 @@ from .rooms import (
     RepositoryStatus,
     RoomMode,
     RoomOperationConflictError,
+    RoomRuleSet,
     RoomSnapshot,
     RoomStatus,
     SeatController,
@@ -47,21 +48,22 @@ from .rooms import (
 )
 
 
-SNAPSHOT_SCHEMA_VERSION = 4
-_SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+SNAPSHOT_SCHEMA_VERSION = 5
+_SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 _SQLITE_LOCKS_GUARD = Lock()
 _SQLITE_LOCKS: dict[str, RLock] = {}
 _SCHEMA_KEY = "room_repository_schema"
 _ROOT_KEYS = {_SCHEMA_KEY, "deleted", "snapshot"}
 _SNAPSHOT_KEYS = {
     "room_id", "mode", "status", "players", "current_turn",
-    "state_version", "theme_key", "bot_difficulty", "spectators",
+    "state_version", "rule_set", "theme_key", "bot_difficulty", "spectators",
     "eliminated_seats", "history", "expected_kana",
     "lives_per_player", "remaining_lives", "life_loss_events",
     "turn_seconds", "deadline_at", "paused_remaining_seconds",
     "timed_out_seat", "losing_seat", "end_reason",
 }
-_SCHEMA_V3_SNAPSHOT_KEYS = _SNAPSHOT_KEYS - {
+_SCHEMA_V4_SNAPSHOT_KEYS = _SNAPSHOT_KEYS - {"rule_set"}
+_SCHEMA_V3_SNAPSHOT_KEYS = _SCHEMA_V4_SNAPSHOT_KEYS - {
     "lives_per_player",
     "remaining_lives",
     "life_loss_events",
@@ -115,6 +117,7 @@ def serialize_room_snapshot(snapshot: RoomSnapshot) -> dict[str, Any]:
         ],
         "current_turn": snapshot.current_turn,
         "state_version": snapshot.state_version,
+        "rule_set": snapshot.rule_set.value,
         "theme_key": snapshot.theme_key,
         "bot_difficulty": snapshot.bot_difficulty,
         "spectators": list(snapshot.spectators),
@@ -177,9 +180,11 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
         _exact_keys(payload, _SCHEMA_V2_SNAPSHOT_KEYS, "snapshot")
         eliminated_seats: tuple[int, ...] = ()
     else:
-        snapshot_keys = (
-            _SCHEMA_V3_SNAPSHOT_KEYS if schema_version == 3 else _SNAPSHOT_KEYS
-        )
+        snapshot_keys = {
+            3: _SCHEMA_V3_SNAPSHOT_KEYS,
+            4: _SCHEMA_V4_SNAPSHOT_KEYS,
+            5: _SNAPSHOT_KEYS,
+        }[schema_version]
         _exact_keys(payload, snapshot_keys, "snapshot")
         eliminated_seats = tuple(
             _integer(value, f"eliminated_seats[{index}]")
@@ -205,7 +210,7 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
             ),
         ))
 
-    if schema_version == SNAPSHOT_SCHEMA_VERSION:
+    if schema_version >= 4:
         lives_per_player = _integer(
             payload["lives_per_player"], "lives_per_player"
         )
@@ -256,6 +261,13 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
         )
         life_loss_events = []
 
+
+    rule_set = (
+        _enum(RoomRuleSet, payload["rule_set"], "rule_set")
+        if schema_version >= 5
+        else RoomRuleSet.STANDARD
+    )
+
     history = []
     for index, raw in enumerate(_array(payload["history"], "history")):
         value = _mapping(raw, f"history[{index}]")
@@ -289,6 +301,7 @@ def deserialize_room_snapshot(document: Mapping[str, Any]) -> RoomSnapshot:
             players=tuple(players),
             current_turn=_integer(payload["current_turn"], "current_turn"),
             state_version=_integer(payload["state_version"], "state_version"),
+            rule_set=rule_set,
             theme_key=_string(payload["theme_key"], "theme_key"),
             bot_difficulty=_string(
                 payload["bot_difficulty"], "bot_difficulty"

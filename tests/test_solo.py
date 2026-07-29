@@ -23,6 +23,7 @@ from shiritori.rooms import (
     InMemoryRoomRepository,
     RoomCoordinator,
     RoomMode,
+    RoomRuleSet,
     RoomStatus,
     create_room_snapshot,
 )
@@ -96,14 +97,16 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_disconnect_pause_list_and_reconnect(self) -> None:
         snapshot = await self.service.create(
             self.owner.id,
-            bot_count=2,
+            bot_count=1,
             lives_per_player=3,
             bot_difficulty="hard",
-            turn_seconds=30,
+            rule_set=RoomRuleSet.ONI,
+            turn_seconds=10,
             now=NOW,
         )
-        self.assertEqual(len(snapshot.players), 3)
-        self.assertEqual(snapshot.remaining_lives, (3, 3, 3))
+        self.assertEqual(len(snapshot.players), 2)
+        self.assertEqual(snapshot.remaining_lives, (3, 3))
+        self.assertIs(snapshot.rule_set, RoomRuleSet.ONI)
 
         connected = await self.service.connect(
             self.owner.id,
@@ -120,9 +123,10 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         paused = await self.service.list_paused(self.owner.id)
         self.assertEqual(len(paused), 1)
         self.assertEqual(paused[0].game_id, snapshot.room_id)
-        self.assertEqual(paused[0].bot_count, 2)
+        self.assertEqual(paused[0].bot_count, 1)
         self.assertEqual(paused[0].lives_per_player, 3)
-        self.assertEqual(paused[0].paused_remaining_seconds, 30)
+        self.assertIs(paused[0].rule_set, RoomRuleSet.ONI)
+        self.assertEqual(paused[0].paused_remaining_seconds, 10)
 
         resumed = await self.service.connect(
             self.owner.id,
@@ -133,6 +137,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         # Pause and reconnect are separate persisted transitions.
         self.assertEqual(connected.state_version + 2, resumed.state_version)
         self.assertEqual(resumed.status, RoomStatus.ACTIVE)
+        self.assertIs(resumed.rule_set, RoomRuleSet.ONI)
         self.assertIsNotNone(resumed.deadline_at)
         self.assertEqual(await self.service.list_paused(self.owner.id), ())
 
@@ -144,6 +149,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(snapshot.bot_difficulty, "easy")
+        self.assertIs(snapshot.rule_set, RoomRuleSet.STANDARD)
         self.assertEqual(len(snapshot.players), 2)
 
     async def test_create_rejects_invalid_life_counts(self) -> None:
@@ -258,6 +264,7 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried.history, ())
         self.assertIsNone(retried.expected_kana)
         self.assertEqual(retried.bot_difficulty, "hard")
+        self.assertIs(retried.rule_set, RoomRuleSet.STANDARD)
         self.assertEqual(retried.lives_per_player, 5)
         self.assertEqual(retried.remaining_lives, (5, 5, 5, 5))
         self.assertEqual(retried.turn_seconds, 45)
@@ -292,6 +299,37 @@ class SoloGameServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(rematches), 1)
         self.assertEqual(rematches[0].id, retried.room_id)
+
+    async def test_oni_rematch_preserves_fixed_settings(self) -> None:
+        source = await self.service.create(
+            self.owner.id,
+            bot_count=1,
+            bot_difficulty="hard",
+            rule_set=RoomRuleSet.ONI,
+            lives_per_player=3,
+            turn_seconds=10,
+            now=NOW,
+        )
+        finished_outcome = await self.coordinator.surrender(
+            source.room_id,
+            self.owner.id,
+            expected_version=source.state_version,
+            operation_id="finish-oni-for-rematch",
+            now=NOW,
+        )
+        self.assertEqual(finished_outcome.snapshot.status, RoomStatus.FINISHED)
+
+        retried = await self.service.rematch(
+            self.owner.id,
+            source.room_id,
+            now=NOW,
+        )
+
+        self.assertIs(retried.rule_set, RoomRuleSet.ONI)
+        self.assertEqual(retried.bot_difficulty, "hard")
+        self.assertEqual(retried.lives_per_player, 3)
+        self.assertEqual(retried.remaining_lives, (3, 3))
+        self.assertEqual(retried.turn_seconds, 10)
 
     async def test_paused_listing_rejects_projection_drift(self) -> None:
         snapshot = await self.service.create(self.owner.id, now=NOW)

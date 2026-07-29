@@ -189,6 +189,21 @@ class WordIndex:
         self._by_first: Mapping[str, tuple[WordOption, ...]] = MappingProxyType(
             frozen
         )
+        self._all_options: tuple[WordOption, ...] = tuple(
+            sorted(
+                (
+                    option
+                    for bucket in frozen.values()
+                    for option in bucket
+                ),
+                key=lambda option: (
+                    option.rank,
+                    option.reading,
+                    option.canonical_key,
+                    option.surface,
+                ),
+            )
+        )
         safe_counts: dict[str, int] = {}
         safe_counts_by_key: dict[str, dict[str, int]] = {}
         for kana, bucket in frozen.items():
@@ -212,6 +227,42 @@ class WordIndex:
 
     def starting_with(self, kana: str) -> tuple[WordOption, ...]:
         return self._by_first.get(canonical_kana(kana), ())
+
+    def all_options(
+        self,
+        used_canonical_keys: frozenset[str] | set[str] = frozenset(),
+        *,
+        avoid_n: bool = False,
+        excluded_endings: frozenset[str] | set[str] = frozenset(),
+        limit: int | None = None,
+    ) -> tuple[WordOption, ...]:
+        """Return every server-owned option after the common legal filters."""
+
+        if limit is not None and (
+            type(limit) is not int or limit < 1
+        ):
+            raise ValueError("limit must be a positive integer or None")
+        if any(
+            not isinstance(ending, str) or not ending
+            for ending in excluded_endings
+        ):
+            raise ValueError("excluded endings must be non-empty strings")
+        excluded = frozenset(
+            canonical_kana(ending) for ending in excluded_endings
+        )
+
+        selected: list[WordOption] = []
+        for option in self._all_options:
+            if option.canonical_key in used_canonical_keys:
+                continue
+            if avoid_n and option.ends_with_n:
+                continue
+            if option.last_kana in excluded:
+                continue
+            selected.append(option)
+            if limit is not None and len(selected) >= limit:
+                break
+        return tuple(selected)
 
     def legal_options(
         self,
@@ -349,6 +400,42 @@ class HardBot(_SeededStrategy):
         legal = words.legal_options(
             context.expected_kana,
             context.used_canonical_keys,
+        )
+        return self.choose_from_candidates(context, words, legal)
+
+    def choose_from_candidates(
+        self,
+        context: BotContext,
+        words: WordIndex,
+        allowed_candidates: Sequence[WordOption],
+    ) -> WordOption | None:
+        """Choose only from ``allowed_candidates`` using the full index ahead.
+
+        Oni mode uses this entry point: the current command restricts the
+        playable candidates, while opponent-reply evaluation still sees the
+        complete server dictionary for the next turn.
+        """
+
+        server_legal = frozenset(
+            words.legal_options(
+                context.expected_kana,
+                context.used_canonical_keys,
+            )
+        )
+        legal = tuple(
+            sorted(
+                (
+                    option
+                    for option in allowed_candidates
+                    if option in server_legal
+                ),
+                key=lambda option: (
+                    option.rank,
+                    option.reading,
+                    option.canonical_key,
+                    option.surface,
+                ),
+            )
         )
         if not legal:
             return None
