@@ -33,7 +33,7 @@ def oni_snapshot():
         rule_set=RoomRuleSet.ONI,
         bot_difficulty="hard",
         lives_per_player=3,
-        turn_seconds=10,
+        turn_seconds=30,
         seat_picker=lambda _seat_count: 0,
     )
 
@@ -53,7 +53,7 @@ class OniPageIntegrationTests(unittest.TestCase):
         self.assertEqual(ONI_BOT_COUNT, 1)
         self.assertEqual(ONI_BOT_DIFFICULTY, "hard")
         self.assertEqual(ONI_LIVES, 3)
-        self.assertEqual(ONI_TURN_SECONDS, 10)
+        self.assertEqual(ONI_TURN_SECONDS, 30)
         parameters = inspect.signature(register_oni_pages).parameters
         self.assertEqual(tuple(parameters), ("auth", "settings", "solo"))
         self.assertTrue(

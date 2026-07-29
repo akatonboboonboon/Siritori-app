@@ -70,7 +70,7 @@ def oni_room(
         history=history,
         expected_kana=expected_kana,
         bot_difficulty="hard",
-        turn_seconds=10,
+        turn_seconds=30,
         lives_per_player=3,
         remaining_lives=(
             3 - sum(event.seat_index == 0 for event in life_loss_events),
@@ -331,7 +331,7 @@ class OniFixedSettingsTests(unittest.TestCase):
             "mode": RoomMode.SOLO_BOT,
             "permanent_bot_count": 1,
             "rule_set": RoomRuleSet.ONI,
-            "turn_seconds": 10,
+            "turn_seconds": 30,
             "theme_key": "all",
             "bot_difficulty": "hard",
             "lives_per_player": 3,
@@ -347,7 +347,7 @@ class OniFixedSettingsTests(unittest.TestCase):
         self.assertEqual(valid.rule_set, RoomRuleSet.ONI)
         self.assertEqual(valid.bot_difficulty, "hard")
         self.assertEqual(valid.lives_per_player, 3)
-        self.assertEqual(valid.turn_seconds, 10)
+        self.assertEqual(valid.turn_seconds, 30)
         self.assertEqual(valid.theme_key, "all")
         self.assertEqual(len(valid.players), 2)
 
@@ -409,10 +409,10 @@ class HardBotCandidateTests(unittest.TestCase):
 
 class OniCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_constraint_violation_keeps_state_lives_and_deadline(self) -> None:
-        deadline = NOW + timedelta(seconds=10)
+        deadline = NOW + timedelta(seconds=30)
         snapshot = replace(
             oni_room(),
-            turn_seconds=10,
+            turn_seconds=30,
             deadline_at=deadline,
         )
         repository = InMemoryRoomRepository((snapshot,))

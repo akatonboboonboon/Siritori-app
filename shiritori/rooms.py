@@ -46,7 +46,7 @@ REACTION_DELIVERY_TIMEOUT_SECONDS: Final = 0.25
 ONI_BOT_COUNT: Final = 1
 ONI_BOT_DIFFICULTY: Final = "hard"
 ONI_LIVES: Final = 3
-ONI_TURN_SECONDS: Final = 10
+ONI_TURN_SECONDS: Final = 30
 
 OniConstraintResolver = Callable[["RoomSnapshot"], OniConstraintSet]
 
@@ -270,7 +270,7 @@ class RoomSnapshot:
             ):
                 raise ValueError(
                     "Oni rooms require one Hard Bot, three lives, "
-                    "a 10-second turn, and the complete word catalog"
+                    "a 30-second turn, and the complete word catalog"
                 )
         if not self.remaining_lives:
             object.__setattr__(

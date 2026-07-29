@@ -4220,7 +4220,7 @@ def register_auth_pages(
             )
             if snapshot.rule_set is RoomRuleSet.ONI:
                 game_title.set_text("鬼しりとり")
-                settings_label.set_text("Hard Bot 1体・10秒・ライフ3（固定）")
+                settings_label.set_text("Hard Bot 1体・30秒・ライフ3（固定）")
             elif snapshot.mode.value == "solo_bot":
                 game_title.set_text("1人でBot戦")
                 difficulty = _solo_difficulty_options().get(
