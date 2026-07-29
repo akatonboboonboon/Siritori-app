@@ -7,11 +7,12 @@ import os
 from fastapi import HTTPException, Request
 from nicegui import app, ui
 from sqlalchemy import text
+from starlette.responses import RedirectResponse
 
 from shiritori.admin_pages import register_admin_pages
 from shiritori.application import ApplicationServices
 from shiritori.customize import APP_TITLE
-from shiritori.daily_pages import register_daily_pages
+from shiritori.oni_pages import register_oni_pages
 from shiritori.page import register_pages
 from shiritori.settings import Settings
 from shiritori.web_auth import AuthWebServices, register_auth_pages
@@ -29,9 +30,9 @@ SOLO = SERVICES.solo
 STATISTICS = SERVICES.statistics
 SCORE_ATTACK = SERVICES.score_attack
 WORD_SUGGESTIONS = SERVICES.word_suggestions
-DAILY_CHALLENGE = SERVICES.daily_challenge
 ONBOARDING = SERVICES.onboarding
 WORD_REVIEW = SERVICES.word_review
+ONI_RULES = SERVICES.oni_rules
 
 
 @app.middleware("http")
@@ -56,6 +57,7 @@ async def security_headers(request: Request, call_next):
             "/word-suggestions",
             "/tutorial",
             "/daily-challenge",
+            "/oni-shiritori",
             "/admin/word-suggestions",
         )
     ):
@@ -88,6 +90,13 @@ def readyz() -> dict[str, str]:
     return {"status": "ready"}
 
 
+@app.get("/daily-challenge", include_in_schema=False)
+def retired_daily_challenge() -> RedirectResponse:
+    """Send old daily-challenge bookmarks to the replacement mode."""
+
+    return RedirectResponse("/oni-shiritori", status_code=303)
+
+
 register_pages(SERVICES.approved_validator)
 register_auth_pages(
     AuthWebServices(
@@ -103,6 +112,7 @@ register_auth_pages(
         word_suggestions=WORD_SUGGESTIONS,
         word_review=WORD_REVIEW,
         onboarding=ONBOARDING,
+        oni_rules=ONI_RULES,
     )
 )
 register_admin_pages(
@@ -110,10 +120,10 @@ register_admin_pages(
     settings=SETTINGS,
     word_review=WORD_REVIEW,
 )
-register_daily_pages(
+register_oni_pages(
     auth=AUTH,
     settings=SETTINGS,
-    daily_challenge=DAILY_CHALLENGE,
+    solo=SOLO,
 )
 app.on_startup(SERVICES.start)
 app.on_shutdown(SERVICES.close)

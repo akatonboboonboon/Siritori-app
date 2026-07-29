@@ -14,11 +14,11 @@ from typing import Final
 
 from .auth import AuthService
 from .bot_catalog import build_bot_catalog, get_default_word_index
-from .daily_challenge_persistence import SQLAlchemyDailyChallengeService
 from .bots import BotStrategy, EasyBot, HardBot, NormalBot, WordIndex
 from .database import Database, GameRepository
 from .lobby import LobbyService
 from .lobby_persistence import SQLAlchemyLobbyRepository
+from .oni_room import OniRoomRuleService
 from .room_persistence import SQLAlchemyRoomRepository
 from .room_runtime import (
     RoomRuntime,
@@ -60,7 +60,6 @@ class ApplicationServices:
     statistics: StatisticsRepository
     word_suggestions: WordSuggestionService
     score_attack: SQLAlchemyScoreAttackService
-    daily_challenge: SQLAlchemyDailyChallengeService
     onboarding: OnboardingService
     approved_words: ApprovedWordCatalog
     approved_validator: ApprovedLexiconValidator
@@ -69,6 +68,7 @@ class ApplicationServices:
     lobby: LobbyService
     room_repository: SQLAlchemyRoomRepository
     room_hub: RoomHub
+    oni_rules: OniRoomRuleService
     rooms: RoomCoordinator
     themes: ThemeCatalog
     room_words: LexiconRoomService
@@ -101,17 +101,24 @@ class ApplicationServices:
             approved_words,
         )
         onboarding = OnboardingService(database)
-        # Ranked modes deliberately retain the pinned Sudachi validator for
-        # the whole rules version.  A word approved during the day must not
-        # change the legal vocabulary between two leaderboard attempts.
+        # The ranked mode deliberately retains the pinned Sudachi validator
+        # for one rules version. A newly approved word must not change the
+        # legal vocabulary between two leaderboard attempts.
         score_attack = SQLAlchemyScoreAttackService(database)
-        daily_challenge = SQLAlchemyDailyChallengeService(database)
         themes = ThemeCatalog()
         lobby_repository = SQLAlchemyLobbyRepository(database)
         lobby = LobbyService(lobby_repository)
         room_repository = SQLAlchemyRoomRepository(database)
         room_hub = RoomHub()
-        rooms = RoomCoordinator(room_repository, hub=room_hub)
+        def word_index_resolver(_snapshot: RoomSnapshot) -> WordIndex:
+            return get_default_word_index()
+
+        oni_rules = OniRoomRuleService(word_index_resolver)
+        rooms = RoomCoordinator(
+            room_repository,
+            hub=room_hub,
+            oni_constraint_resolver=oni_rules.constraints_for,
+        )
         strategies: dict[str, BotStrategy] = {
             "easy": EasyBot(seed="server-easy"),
             "normal": NormalBot(seed="server-normal"),
@@ -130,13 +137,12 @@ class ApplicationServices:
                 snapshot.bot_difficulty
             )
 
-        def word_index_resolver(_snapshot: RoomSnapshot) -> WordIndex:
-            return get_default_word_index()
 
         runtime = RoomRuntime(
             rooms,
             strategy_resolver=strategy_resolver,
             word_index_resolver=word_index_resolver,
+            oni_challenge_resolver=oni_rules.challenge_for,
         )
 
         def notify_runtime(room_id: str) -> None:
@@ -167,7 +173,6 @@ class ApplicationServices:
             statistics=statistics,
             word_suggestions=word_suggestions,
             score_attack=score_attack,
-            daily_challenge=daily_challenge,
             onboarding=onboarding,
             approved_words=approved_words,
             approved_validator=approved_validator,
@@ -176,6 +181,7 @@ class ApplicationServices:
             lobby=lobby,
             room_repository=room_repository,
             room_hub=room_hub,
+            oni_rules=oni_rules,
             rooms=rooms,
             themes=themes,
             room_words=LexiconRoomService(
@@ -258,13 +264,6 @@ class ApplicationServices:
         while True:
             finalized = await asyncio.to_thread(
                 self.score_attack.finalize_expired_active_runs,
-                limit=100,
-            )
-            if len(finalized) < 100:
-                break
-        while True:
-            finalized = await asyncio.to_thread(
-                self.daily_challenge.finalize_expired_active_runs,
                 limit=100,
             )
             if len(finalized) < 100:

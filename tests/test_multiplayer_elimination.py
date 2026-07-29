@@ -187,6 +187,7 @@ class MultiplayerEliminationTests(unittest.IsolatedAsyncioTestCase):
         legacy = deepcopy(document)
         legacy["room_repository_schema"] = 2
         for field in (
+            "rule_set",
             "eliminated_seats",
             "lives_per_player",
             "remaining_lives",

@@ -65,6 +65,7 @@ from .rooms import (
     RoomEventKind,
     RoomSnapshot,
     RoomMode,
+    RoomRuleSet,
     RoomStatus,
     RoomVersionConflict,
     SeatController,
@@ -114,6 +115,7 @@ class AuthWebServices:
     word_suggestions: WordSuggestionService | None = None
     word_review: WordReviewService | None = None
     onboarding: OnboardingService | None = None
+    oni_rules: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +143,16 @@ class _MatchResultPresentation:
     round_summary: str
     last_word: str
     life_loss_history: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _OniChallengePresentation:
+    """Non-sensitive Oni command data safe to show in the game UI."""
+
+    commands: tuple[str, ...]
+    sealed_endings: tuple[str, ...]
+    candidate_count: int | None
+    relaxed_seal_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,6 +611,68 @@ def _latest_word_text(history: Sequence[TurnRecord]) -> str:
     if latest.surface == latest.reading:
         return latest.surface
     return f"{latest.surface}（よみ：{latest.reading}）"
+
+
+def _oni_challenge_presentation(
+    rule_service: object | None,
+    snapshot: RoomSnapshot,
+) -> _OniChallengePresentation | None:
+    """Return safe current commands without exposing candidate words."""
+
+    if (
+        snapshot.rule_set is not RoomRuleSet.ONI
+        or snapshot.status is RoomStatus.FINISHED
+    ):
+        return None
+    empty = _OniChallengePresentation((), (), None, 0)
+    if rule_service is None:
+        return empty
+    resolver = getattr(rule_service, "challenge_for", None)
+    if not callable(resolver):
+        return empty
+    try:
+        challenge = resolver(snapshot)
+        if challenge is None:
+            return empty
+        constraints = getattr(challenge, "constraints", None)
+        raw_descriptions = getattr(constraints, "descriptions", ())
+        commands = tuple(
+            label
+            for item in raw_descriptions
+            if (label := str(item).strip())
+            and not label.startswith("直近10手の末尾を封印中")
+        )
+        sealed_endings = tuple(
+            dict.fromkeys(
+                ending
+                for item in getattr(constraints, "sealed_endings", ())
+                if (ending := str(item).strip())
+            )
+        )
+        raw_count = getattr(challenge, "candidate_count", None)
+        candidate_count = (
+            raw_count
+            if type(raw_count) is int and raw_count >= 0
+            else None
+        )
+        raw_relaxed = getattr(challenge, "relaxed_seal_count", 0)
+        relaxed_seal_count = (
+            raw_relaxed
+            if type(raw_relaxed) is int and raw_relaxed >= 0
+            else 0
+        )
+    except Exception:
+        # A presentation failure must never block an authoritative game.
+        LOGGER.debug(
+            "failed to prepare Oni command presentation", exc_info=True
+        )
+        return empty
+    return _OniChallengePresentation(
+        commands=commands,
+        sealed_endings=sealed_endings,
+        candidate_count=candidate_count,
+        relaxed_seal_count=relaxed_seal_count,
+    )
 
 
 def _history_was_appended(
@@ -1213,6 +1287,7 @@ def register_auth_pages(
     word_suggestions = services.word_suggestions
     word_review = services.word_review
     onboarding = services.onboarding
+    oni_rules = services.oni_rules
     account_attempts = limiter or LoginAttemptLimiter()
     ip_attempts = ip_limiter or LoginAttemptLimiter(attempts=20)
     password_work = password_work_limiter or PasswordWorkLimiter()
@@ -1481,7 +1556,7 @@ def register_auth_pages(
                 "記録を楽しむ",
                 "遊んだ結果はアカウントに保存されます。",
                 (
-                    "戦績・ランキング・デイリーチャレンジを確認できます。",
+                    "戦績・ランキング・鬼しりとりを楽しめます。",
                     "結果は共有でき、同じ設定で再戦もできます。",
                     "辞書にない単語は追加リクエストから申請できます。",
                 ),
@@ -1732,7 +1807,7 @@ def register_auth_pages(
                         "platform-link"
                     )
                     ui.link(
-                        "デイリーチャレンジ", "/daily-challenge"
+                        "鬼しりとり", "/oni-shiritori"
                     ).classes("platform-link")
                     ui.link("単語追加リクエスト", "/word-suggestions").classes(
                         "platform-link"
@@ -4140,7 +4215,13 @@ def register_auth_pages(
                 if snapshot.turn_seconds is None
                 else f"{snapshot.turn_seconds}秒"
             )
-            if snapshot.mode.value == "solo_bot":
+            oni_presentation = _oni_challenge_presentation(
+                oni_rules, snapshot
+            )
+            if snapshot.rule_set is RoomRuleSet.ONI:
+                game_title.set_text("鬼しりとり")
+                settings_label.set_text("Hard Bot 1体・10秒・ライフ3（固定）")
+            elif snapshot.mode.value == "solo_bot":
                 game_title.set_text("1人でBot戦")
                 difficulty = _solo_difficulty_options().get(
                     snapshot.bot_difficulty,
@@ -4176,6 +4257,40 @@ def register_auth_pages(
             latest_word_label.set_text(
                 f"前の人の単語：{_latest_word_text(snapshot.history)}"
             )
+            if oni_presentation is None:
+                oni_command_panel.set_visibility(False)
+            else:
+                oni_command_panel.set_visibility(True)
+                commands_text = (
+                    " / ".join(oni_presentation.commands)
+                    if oni_presentation.commands
+                    else "準備中（入力はサーバーで判定されます）"
+                )
+                oni_commands_label.set_text(
+                    f"今回の鬼命令：{commands_text}"
+                )
+                sealed_text = (
+                    "・".join(oni_presentation.sealed_endings)
+                    if oni_presentation.sealed_endings
+                    else "なし"
+                )
+                oni_seals_label.set_text(f"末尾封印：{sealed_text}")
+                candidate_text = (
+                    "確認中"
+                    if oni_presentation.candidate_count is None
+                    else f"{oni_presentation.candidate_count}語"
+                )
+                oni_candidate_label.set_text(
+                    f"既知の正解候補：{candidate_text}"
+                )
+                oni_relaxed_label.set_text(
+                    "候補確保のため古い封印を"
+                    f"{oni_presentation.relaxed_seal_count}個解除しました。"
+                )
+                oni_relaxed_label.set_visibility(
+                    oni_presentation.relaxed_seal_count > 0
+                )
+
             turn_owner = _turn_seat_label(
                 snapshot, user_id, seat_display_names
             )
@@ -5002,6 +5117,21 @@ def register_auth_pages(
                             "role='status' aria-live='polite' "
                             "aria-atomic='true'"
                         )
+                        with ui.column().classes(
+                            "game-latest-word w-full gap-1"
+                        ).props(
+                            "role='status' aria-live='polite' "
+                            "aria-label='現在の鬼命令'"
+                        ) as oni_command_panel:
+                            ui.label("鬼モードの命令").classes("aside-title")
+                            oni_commands_label = ui.label("").classes("w-full")
+                            oni_seals_label = ui.label("").classes("w-full")
+                            oni_candidate_label = ui.label("").classes("w-full")
+                            oni_relaxed_label = ui.label("").classes(
+                                "platform-muted w-full"
+                            )
+                            oni_relaxed_label.set_visibility(False)
+                        oni_command_panel.set_visibility(False)
                         with ui.row().classes(
                             "w-full items-center gap-3"
                         ):
@@ -5269,7 +5399,12 @@ def register_auth_pages(
                                 f"状態バージョン: {save.saved_state_version}"
                             ).classes("platform-muted")
                         else:
-                            ui.label(save.bot_difficulty).classes("aside-title")
+                            save_title = (
+                                "鬼しりとり（Hard Bot）"
+                                if save.rule_set is RoomRuleSet.ONI
+                                else save.bot_difficulty
+                            )
+                            ui.label(save_title).classes("aside-title")
                             timer = (
                                 "無制限"
                                 if save.turn_seconds is None

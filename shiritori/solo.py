@@ -26,6 +26,7 @@ from .rooms import (
     RoomCallback,
     RoomCoordinator,
     RoomMode,
+    RoomRuleSet,
     RoomNotFound,
     RoomSnapshot,
     RoomStatus,
@@ -59,6 +60,7 @@ class PausedSoloGame:
     """Small server-derived row suitable for a saved-games list."""
 
     game_id: str
+    rule_set: RoomRuleSet
     theme_key: str
     bot_difficulty: str
     bot_count: int
@@ -94,6 +96,7 @@ class SoloGameService:
         *,
         bot_count: int = 1,
         bot_difficulty: str = "normal",
+        rule_set: RoomRuleSet = RoomRuleSet.STANDARD,
         theme_key: str | None = None,
         lives_per_player: int = 1,
         turn_seconds: int | None = None,
@@ -121,6 +124,7 @@ class SoloGameService:
             (owner,),
             mode=RoomMode.SOLO_BOT,
             permanent_bot_count=bot_count,
+            rule_set=rule_set,
             lives_per_player=lives_per_player,
             turn_seconds=turn_seconds,
             theme_key=theme.theme_id,
@@ -221,6 +225,7 @@ class SoloGameService:
             mode=RoomMode.SOLO_BOT,
             permanent_bot_count=permanent_bot_count,
             lives_per_player=finished.lives_per_player,
+            rule_set=finished.rule_set,
             turn_seconds=finished.turn_seconds,
             theme_key=theme.theme_id,
             bot_difficulty=finished.bot_difficulty,
@@ -273,6 +278,7 @@ class SoloGameService:
             or existing.seat_for_user(owner_user_id) is None
             or actual_bot_count != expected_bot_count
             or existing.lives_per_player != source.lives_per_player
+            or existing.rule_set is not source.rule_set
             or existing.bot_difficulty != source.bot_difficulty
             or existing.theme_key != source.theme_key
             or existing.turn_seconds != source.turn_seconds
@@ -379,6 +385,7 @@ class SoloGameService:
                 summaries.append(
                     PausedSoloGame(
                         game_id=game.id,
+                        rule_set=snapshot.rule_set,
                         theme_key=snapshot.theme_key,
                         bot_difficulty=snapshot.bot_difficulty,
                         bot_count=sum(

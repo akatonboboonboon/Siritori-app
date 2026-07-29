@@ -22,10 +22,12 @@ from typing import Protocol, runtime_checkable
 from .bots import (
     BotContext,
     BotStrategy,
+    HardBot,
     WordIndex,
     WordOption,
     canonical_kana,
 )
+from .oni_rules import OniConstraintSet
 from .rooms import (
     CommandOutcome,
     PlayerSeat,
@@ -33,6 +35,7 @@ from .rooms import (
     RoomCoordinator,
     RoomInactive,
     RoomNotFound,
+    RoomRuleSet,
     RoomSnapshot,
     RoomStatus,
     RoomVersionConflict,
@@ -87,6 +90,17 @@ class NoLegalMoveHandler(Protocol):
         """Finish the current Bot seat with ``end_reason='no_legal_move'``."""
 
 
+@runtime_checkable
+class OniChallenge(Protocol):
+    """Effective Oni command returned from the room rule service."""
+
+    constraints: OniConstraintSet
+    candidates: tuple[WordOption, ...]
+
+
+OniChallengeResolver = Callable[[RoomSnapshot], OniChallenge]
+
+
 class RoomRuntimeError(RuntimeError):
     """Base error recorded by a room supervisor."""
 
@@ -122,6 +136,7 @@ class RoomRuntime:
         clock: Clock | None = None,
         sleep: Sleep = asyncio.sleep,
         no_legal_move_handler: NoLegalMoveHandler | None = None,
+        oni_challenge_resolver: OniChallengeResolver | None = None,
         on_error: ErrorCallback | None = None,
         opening_kana: Sequence[str] = _OPENING_KANA,
     ) -> None:
@@ -135,6 +150,10 @@ class RoomRuntime:
             for kana in opening_kana
         ):
             raise ValueError("opening_kana must contain one-character strings")
+        if oni_challenge_resolver is not None and not callable(
+            oni_challenge_resolver
+        ):
+            raise TypeError("oni_challenge_resolver must be callable")
 
         self.coordinator = coordinator
         self._strategy_resolver = strategy_resolver
@@ -146,6 +165,7 @@ class RoomRuntime:
             no_legal_move_handler
             or getattr(coordinator, "finish_no_legal_move", None)
         )
+        self._oni_challenge_resolver = oni_challenge_resolver
         self._on_error = on_error
         self._opening_kana = tuple(
             dict.fromkeys(canonical_kana(kana) for kana in opening_kana)
@@ -410,6 +430,126 @@ class RoomRuntime:
         strategy: BotStrategy,
         index: WordIndex,
     ) -> WordOption | None:
+        if snapshot.rule_set is RoomRuleSet.ONI:
+            return self._choose_oni_option(snapshot, strategy, index)
+        return self._choose_from_index(snapshot, strategy, index)
+
+    def _choose_oni_option(
+        self,
+        snapshot: RoomSnapshot,
+        strategy: BotStrategy,
+        index: WordIndex,
+    ) -> WordOption | None:
+        resolver = self._oni_challenge_resolver
+        if resolver is None:
+            raise RoomRuntimeCapabilityError(
+                "Oni rooms require an oni_challenge_resolver"
+            )
+        challenge = resolver(snapshot)
+        if not isinstance(challenge.constraints, OniConstraintSet):
+            raise TypeError(
+                "oni_challenge_resolver must return Oni constraints"
+            )
+        if any(
+            not isinstance(option, WordOption)
+            for option in challenge.candidates
+        ):
+            raise TypeError(
+                "oni_challenge_resolver candidates must be WordOption values"
+            )
+
+        if isinstance(strategy, HardBot):
+            option = self._choose_hard_oni_option(
+                snapshot,
+                strategy,
+                index,
+                challenge.candidates,
+            )
+        else:
+            constrained_index = WordIndex(challenge.candidates)
+            option = self._choose_from_index(
+                snapshot,
+                strategy,
+                constrained_index,
+            )
+        if option is None:
+            return None
+        if (
+            option not in challenge.candidates
+            or not challenge.constraints.accepts_option(option)
+        ):
+            raise RoomRuntimeError(
+                "Oni Bot selected a word outside the active command"
+            )
+
+        used = snapshot.used_canonical_keys
+        if snapshot.expected_kana is None:
+            if option not in index.all_options(used):
+                raise RoomRuntimeError(
+                    "Oni Bot selected a word outside the server WordIndex"
+                )
+        else:
+            context = BotContext(snapshot.expected_kana, used)
+            self._require_server_legal(option, context, index)
+        return option
+
+    def _choose_hard_oni_option(
+        self,
+        snapshot: RoomSnapshot,
+        strategy: HardBot,
+        index: WordIndex,
+        candidates: tuple[WordOption, ...],
+    ) -> WordOption | None:
+        """Restrict this move while preserving HardBot's full-index search."""
+
+        used = snapshot.used_canonical_keys
+        if snapshot.expected_kana is not None:
+            context = BotContext(snapshot.expected_kana, used)
+            return strategy.choose_from_candidates(
+                context,
+                index,
+                candidates,
+            )
+
+        opening_candidates: list[WordOption] = []
+        for kana in self._opening_kana:
+            context = BotContext(kana, used)
+            allowed = tuple(
+                option
+                for option in candidates
+                if option.first_kana == context.expected_kana
+            )
+            if not allowed:
+                continue
+            option = strategy.choose_from_candidates(
+                context,
+                index,
+                allowed,
+            )
+            if option is not None:
+                opening_candidates.append(option)
+        if not opening_candidates:
+            return None
+        safe = [
+            option for option in opening_candidates
+            if not option.ends_with_n
+        ]
+        return min(
+            safe or opening_candidates,
+            key=lambda option: (
+                option.rank,
+                option.reading,
+                option.canonical_key,
+                option.surface,
+            ),
+        )
+
+    def _choose_from_index(
+        self,
+        snapshot: RoomSnapshot,
+        strategy: BotStrategy,
+        index: WordIndex,
+    ) -> WordOption | None:
         used = snapshot.used_canonical_keys
         if snapshot.expected_kana is not None:
             context = BotContext(snapshot.expected_kana, used)
@@ -544,6 +684,8 @@ def _runtime_operation_id(action: str, *semantic_parts: object) -> str:
 __all__ = [
     "MAX_BOT_DELAY_SECONDS",
     "NoLegalMoveHandler",
+    "OniChallenge",
+    "OniChallengeResolver",
     "RoomRuntime",
     "RoomRuntimeCapabilityError",
     "RoomRuntimeClosed",
