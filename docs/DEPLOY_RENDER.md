@@ -189,6 +189,30 @@ python -m alembic check
 
 発表や審査の直前は、一度公開URLへアクセスし、`/readyz`と主要操作を確認します。
 
+## 2026-10 eMudhra 証明書勧告への対応
+
+`requirements.txt` は HTTPX などが使用する CA バンドルを
+`certifi==2026.10.23` に固定しています。これは Render が指定する
+`2026.10.19` 以上です。依存更新だけでは稼働中のサービスは変わりません。
+
+1. この変更をレビューし、本人の承認後に `main` へマージします。
+   `render.yaml` は `autoDeployTrigger: checksPass` のため、設定どおりのサービスでは
+   マージ後のチェック成功を契機に自動デプロイが始まります。マージ承認時にこの影響も確認します。
+2. Render の対象サービスが新しい commit から再ビルドされたことを確認します。
+   Native Python ランタイムの OS CA ストアも、この再ビルドで更新されます。
+3. 稼働中のサービスで `python -c "import certifi; print(certifi.__version__)"`
+   を実行し、`2026.10.23` であることを確認します。
+4. 稼働中サービスの Python/HTTPX から下記の両 URL へアクセスし、
+   証明書検証エラーで拒否されることを確認します。HTTP エラー応答だけでは合格になりません。
+   - `https://dv-g3b-emudhra.we-have-a-problem.com/`
+   - `https://dv-g3b-aaa-emudhra.we-have-a-problem.com/`
+
+Docker を使用する場合は `docker build --pull --no-cache -t siritori-app:emudhra .` でベースイメージと
+`ca-certificates` を更新して再ビルドし、生成したイメージ内でも同じ確認を行います。
+実際のデプロイと本番での証明書拒否確認は、承認後の作業です。
+
+参照: [Render: eMudhra Certificate Compromise](https://render.com/docs/advisory-emudhra)
+
 ## 一次資料
 
 - [Render: Deploy for Free](https://render.com/docs/free)

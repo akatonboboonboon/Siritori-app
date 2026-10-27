@@ -16,6 +16,20 @@ README の説明は、この記録と GitHub の PR / commit 履歴をもとに�
 - 秘密情報や個人情報を記録しない
 - 「予定」「作業中」「完了」「不採用」の状態を明記する
 
+## 2026-10-27 Render eMudhra 証明書勧告への対応
+
+- 利用ツール・担当: OpenAI Codex。
+- 依頼: Render の最新セキュリティ勧告について、影響する設定を小さく修正し、テストしてレビュー可能にする。
+- 対象ファイル: `requirements.txt`、`Dockerfile`、`docs/DEPLOY_RENDER.md`、`AI_USAGE.md`。
+- 採用した変更: NiceGUI/HTTPX が使う CA バンドルを、公式 PyPI で配布を確認した `certifi==2026.10.23` に固定。Docker ビルドで OS の `ca-certificates` を更新する処理を追加。承認後の再ビルドと稼働環境での証明書拒否確認手順を記録。
+- 変更しない範囲: ゲーム機能、UI、DB スキーマ、その他の依存バージョン、本番環境変数。
+- 状態: ローカル修正・自動テスト完了、本人レビュー・マージ・本番反映は未実施。
+- 確認: Render 公式勧告、PyPI の certifi 2026.10.23 と NiceGUI 3.14.0 の依存情報、`git diff --check`。Python 3.13.18 の仮想環境で requirements を解決・インストールし、certifi 2026.10.23 と `uv pip check` による63依存の整合性を確認。ローカル SQLite の `alembic upgrade head` と `alembic check`、全592件の `unittest` が成功。
+- 検証環境: Windows sandbox では NiceGUI 非同期初期化が停止したため、その実行を中断し、同じローカル仮想環境・作業フォルダー内の一時ディレクトリ・テスト専用 SQLite とダミー値で sandbox 外から再実行した。本番 DB や本番の秘密値は使用していない。
+- 未実施: Docker エンジンが起動していないためイメージビルド、本番デプロイ、稼働サービスからの証明書拒否確認、本人の手動確認。
+- 関連ブランチ: `agent/render-emudhra-certificates`。
+- 参照: [Render eMudhra advisory](https://render.com/docs/advisory-emudhra)、[certifi 2026.10.23](https://pypi.org/project/certifi/2026.10.23/)。
+
 ## 初期作業の記録
 
 以下は、この文書を作成した 2026-07-24 時点の記録です。
