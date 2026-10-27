@@ -1,4 +1,5 @@
 nicegui==3.14.0
+certifi==2026.10.23
 sudachipy==0.6.11
 sudachidict-full==20260723
 SQLAlchemy==2.0.51
